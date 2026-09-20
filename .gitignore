@@ -3,6 +3,9 @@
 # dependencies
 node_modules/
 
+.vscode/
+.history/
+
 # Expo
 .expo/
 dist/
@@ -31,7 +34,11 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
 .env*.local
+
+# EAS credentials
+credentials.json
 
 # typescript
 *.tsbuildinfo
