@@ -16,18 +16,18 @@ export interface ThemeColors {
 
 export const darkColors: ThemeColors = {
   background: "#0C0D17",
-  surface: "#151724",
+  surface: "#191c2b",
   gradientStart: "#511EE8",
   gradientEnd: "#3E12C5",
-  accentPurple: "#8A42FF",
+  accentPurple: "#904cfd",
   accentPurpleBright: "#D17FFF",
   accentPurpleDeep: "#8139FF",
   accentGreen: "#2EFF80",
   accentGreenBright: "#12F95C",
   badgeBackground: "#181733",
   textPrimary: "#FFFFFF",
-  textMuted: "#434663",
-  iconInactive: "#27283B",
+  textMuted: "#8e93bb",
+  iconInactive: "#8e93bb",
 };
 
 export const lightColors: ThemeColors = {

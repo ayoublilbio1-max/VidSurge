@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "dependencies": {
     "@expo/ui": "~57.0.19",
+    "@expo/vector-icons": "^15.0.2",
     "@react-native-community/slider": "5.2.0",
     "@shopify/react-native-skia": "2.6.2",
     "expo": "~57.0.24",
@@ -32,7 +33,6 @@
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-native": "0.86.3",
-    "react-native-edge-to-edge": "^1.8.2",
     "react-native-gesture-handler": "~2.32.0",
     "react-native-reanimated": "4.5.1",
     "react-native-safe-area-context": "~5.7.0",

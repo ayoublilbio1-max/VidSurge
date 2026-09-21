@@ -1,17 +1,15 @@
-import { NavigationBar } from "expo-navigation-bar";
 import { router } from "expo-router";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import {
-    Dimensions,
-    NativeScrollEvent,
-    NativeSyntheticEvent,
-    Platform,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TouchableOpacity,
-    View,
+  Dimensions,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
+  ScrollView,
+  StyleSheet,
+  TouchableOpacity,
+  View,
 } from "react-native";
+import AppText from "../components/AppText";
 import { useTheme } from "../hooks/useTheme";
 import { saveOnboardingAnswers } from "../lib/onboardingStorage";
 
@@ -42,17 +40,6 @@ export default function Onboarding() {
   const [contentType, setContentType] = useState<string | null>(null);
   const [usage, setUsage] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (Platform.OS === "android") {
-      NavigationBar.setHidden(true);
-    }
-    return () => {
-      if (Platform.OS === "android") {
-        NavigationBar.setHidden(false);
-      }
-    };
-  }, []);
-
   const goToPage = (index: number) => {
     scrollRef.current?.scrollTo({ x: index * width, animated: true });
     setPage(index);
@@ -79,21 +66,23 @@ export default function Onboarding() {
           hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
         >
           {page === 1 && (
-            <Text style={[styles.backArrow, { color: colors.textMuted }]}>
+            <AppText style={[styles.backArrow, { color: colors.textMuted }]}>
               ‹
-            </Text>
+            </AppText>
           )}
         </TouchableOpacity>
 
-        <Text style={[styles.progressLabel, { color: colors.textMuted }]}>
+        <AppText style={[styles.progressLabel, { color: colors.textMuted }]}>
           {page + 1}/2
-        </Text>
+        </AppText>
 
         <TouchableOpacity
           onPress={finishOnboarding}
           hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
         >
-          <Text style={[styles.skip, { color: colors.textMuted }]}>Skip</Text>
+          <AppText style={[styles.skip, { color: colors.textMuted }]}>
+            Skip
+          </AppText>
         </TouchableOpacity>
       </View>
 
@@ -129,9 +118,9 @@ export default function Onboarding() {
           style={[styles.ctaButton, { backgroundColor: colors.accentPurple }]}
           onPress={() => (page === 0 ? goToPage(1) : finishOnboarding())}
         >
-          <Text style={styles.ctaText}>
+          <AppText style={styles.ctaText}>
             {page === 0 ? "Next" : "Start creating"}
-          </Text>
+          </AppText>
         </TouchableOpacity>
       </View>
     </View>
@@ -153,7 +142,9 @@ function OnboardingPage({
 }) {
   return (
     <View style={styles.page}>
-      <Text style={[styles.title, { color: colors.textPrimary }]}>{title}</Text>
+      <AppText style={[styles.title, { color: colors.textPrimary }]}>
+        {title}
+      </AppText>
 
       <View style={styles.optionsList}>
         {options.map((opt) => {
@@ -170,10 +161,12 @@ function OnboardingPage({
               ]}
               onPress={() => onSelect(opt.key)}
             >
-              <Text style={styles.optionEmoji}>{opt.emoji}</Text>
-              <Text style={[styles.optionLabel, { color: colors.textPrimary }]}>
+              <AppText style={styles.optionEmoji}>{opt.emoji}</AppText>
+              <AppText
+                style={[styles.optionLabel, { color: colors.textPrimary }]}
+              >
                 {opt.label}
-              </Text>
+              </AppText>
             </TouchableOpacity>
           );
         })}
@@ -192,11 +185,16 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   backButton: { width: 32 },
-  backArrow: { fontSize: 28, fontWeight: "400" },
-  progressLabel: { fontSize: 15, fontWeight: "500" },
+  backArrow: { fontSize: 28 },
+  progressLabel: { fontSize: 15, fontFamily: "Poppins-Medium" },
   skip: { fontSize: 15 },
   page: { paddingHorizontal: 24, paddingTop: 24 },
-  title: { fontSize: 28, fontWeight: "700", lineHeight: 34, marginBottom: 28 },
+  title: {
+    fontSize: 28,
+    fontFamily: "Poppins-Bold",
+    lineHeight: 34,
+    marginBottom: 28,
+  },
   optionsList: { gap: 14 },
   optionRow: {
     flexDirection: "row",
@@ -207,8 +205,8 @@ const styles = StyleSheet.create({
     borderWidth: 2,
   },
   optionEmoji: { fontSize: 20, marginRight: 14 },
-  optionLabel: { fontSize: 16, fontWeight: "500" },
+  optionLabel: { fontSize: 16, fontFamily: "Poppins-Medium" },
   bottomArea: { paddingHorizontal: 20, paddingBottom: 32, marginTop: "auto" },
   ctaButton: { paddingVertical: 18, borderRadius: 16, alignItems: "center" },
-  ctaText: { color: "#FFFFFF", fontSize: 16, fontWeight: "700" },
+  ctaText: { color: "#FFFFFF", fontSize: 16, fontFamily: "Poppins-Bold" },
 });
