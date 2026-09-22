@@ -6,6 +6,7 @@ import { StatusBar } from "expo-status-bar";
 import * as SystemUI from "expo-system-ui";
 import { useEffect, useState } from "react";
 import { Platform, useColorScheme } from "react-native";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
 import AppSplashOverlay from "../components/AppSplashOverlay";
 import { darkColors, lightColors } from "../constants/colors";
 
@@ -47,12 +48,12 @@ export default function RootLayout() {
   }
 
   return (
-    <>
+    <GestureHandlerRootView style={{ flex: 1 }}>
       <StatusBar style={scheme === "light" ? "dark" : "light"} />
       <Stack screenOptions={{ headerShown: false }} />
       {showOverlay && (
         <AppSplashOverlay onFinish={() => setShowOverlay(false)} />
       )}
-    </>
+    </GestureHandlerRootView>
   );
 }
