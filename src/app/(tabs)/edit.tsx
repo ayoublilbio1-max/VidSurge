@@ -1,16 +1,31 @@
 import { Ionicons } from "@expo/vector-icons";
 import * as ImagePicker from "expo-image-picker";
 import { router } from "expo-router";
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { StyleSheet, TouchableOpacity, View } from "react-native";
 import AppText from "../../components/AppText";
 import ComingSoonModal from "../../components/ComingSoonModal";
+import EditScreenSkeleton from "../../components/EditScreenSkeleton";
 import GradientActionCard from "../../components/GradientActionCard";
 import { useTheme } from "../../hooks/useTheme";
+import { loadProjects, ProjectItem } from "../../lib/projectsStorage";
 
 export default function EditScreen() {
   const colors = useTheme();
   const [comingSoonVisible, setComingSoonVisible] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [projects, setProjects] = useState<ProjectItem[]>([]);
+
+  const fetchProjects = useCallback(async () => {
+    setLoading(true);
+    const result = await loadProjects();
+    setProjects(result);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchProjects();
+  }, [fetchProjects]);
 
   const handleNewVideo = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -29,6 +44,10 @@ export default function EditScreen() {
       });
     }
   };
+
+  if (loading) {
+    return <EditScreenSkeleton />;
+  }
 
   return (
     <View style={[styles.root, { backgroundColor: colors.background }]}>
@@ -72,12 +91,27 @@ export default function EditScreen() {
         </TouchableOpacity>
       </View>
 
-      <View style={styles.emptyState}>
-        <Ionicons name="film-outline" size={40} color={colors.iconInactive} />
-        <AppText style={[styles.emptyText, { color: colors.textMuted }]}>
-          Your projects will appear here.{"\n"}Start creating now.
-        </AppText>
-      </View>
+      {projects.length === 0 ? (
+        <View style={styles.emptyState}>
+          <Ionicons name="film-outline" size={40} color={colors.iconInactive} />
+          <AppText style={[styles.emptyText, { color: colors.textMuted }]}>
+            Your projects will appear here.{"\n"}Start creating now.
+          </AppText>
+        </View>
+      ) : (
+        <View style={styles.projectsList}>
+          {projects.map((project) => (
+            <View
+              key={project.id}
+              style={[styles.projectRow, { backgroundColor: colors.surface }]}
+            >
+              <AppText style={{ color: colors.textPrimary }}>
+                {project.name}
+              </AppText>
+            </View>
+          ))}
+        </View>
+      )}
 
       <ComingSoonModal
         visible={comingSoonVisible}
@@ -110,4 +144,6 @@ const styles = StyleSheet.create({
   projectsTitle: { fontSize: 20, fontFamily: "Poppins-Bold" },
   emptyState: { alignItems: "center", paddingTop: 40, gap: 16 },
   emptyText: { fontSize: 14, textAlign: "center", lineHeight: 20 },
+  projectsList: { gap: 12 },
+  projectRow: { borderRadius: 16, padding: 16 },
 });
