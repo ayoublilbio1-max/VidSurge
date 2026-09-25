@@ -9,6 +9,18 @@ export interface EditorTool {
   label: string;
 }
 
+/**
+ * State of the Lock button, from the current selection:
+ *   none     — nothing selected: greyed out, closed lock, "Lock"
+ *   locked   — the selected clip is locked to its partner: active, tap to
+ *              unlock (one-way, there is no re-lock)
+ *   unlocked — the selected clip was already unlocked: greyed out, open
+ *              lock, "Unlocked"
+ */
+export type LockMode = "none" | "locked" | "unlocked";
+
+const DISABLED_OPACITY = 0.4;
+
 const TOOLS: EditorTool[] = [
   { key: "delete", icon: "trash-outline", label: "Delete" },
   { key: "crop", icon: "crop-outline", label: "Crop" },
@@ -20,17 +32,26 @@ const TOOLS: EditorTool[] = [
 ];
 
 interface EditorToolbarProps {
-  audioLocked: boolean;
-  onToggleAudioLock: () => void;
+  lockMode: LockMode;
+  onUnlock: () => void;
   onToolPress: (key: string) => void;
 }
 
 export default function EditorToolbar({
-  audioLocked,
-  onToggleAudioLock,
+  lockMode,
+  onUnlock,
   onToolPress,
 }: EditorToolbarProps) {
   const colors = useTheme();
+  const lockActive = lockMode === "locked";
+
+  const handleLockPress = () => {
+    if (__DEV__)
+      console.log(
+        `[EditorToolbar] lock button pressed (${lockMode}${lockActive ? " — unlocking" : " — disabled"})`,
+      );
+    if (lockActive) onUnlock();
+  };
 
   return (
     <ScrollView
@@ -38,25 +59,42 @@ export default function EditorToolbar({
       showsHorizontalScrollIndicator={false}
       contentContainerStyle={styles.row}
     >
-      <TouchableOpacity style={styles.item} onPress={onToggleAudioLock}>
+      <TouchableOpacity
+        style={[styles.item, !lockActive && { opacity: DISABLED_OPACITY }]}
+        onPress={handleLockPress}
+        disabled={!lockActive}
+        accessibilityRole="button"
+        accessibilityState={{ disabled: !lockActive }}
+        accessibilityLabel={
+          lockActive ? "Unlock audio from video" : "Lock (select a locked clip)"
+        }
+      >
         <View
           style={[
             styles.iconWrap,
             {
-              backgroundColor: audioLocked
+              backgroundColor: lockActive
                 ? colors.accentPurple
                 : colors.surface,
             },
           ]}
         >
           <Ionicons
-            name={audioLocked ? "lock-closed-outline" : "lock-open-outline"}
+            name={
+              lockMode === "unlocked"
+                ? "lock-open-outline"
+                : "lock-closed-outline"
+            }
             size={20}
-            color={audioLocked ? "#FFFFFF" : colors.textPrimary}
+            color={lockActive ? "#FFFFFF" : colors.textPrimary}
           />
         </View>
         <AppText style={[styles.label, { color: colors.textMuted }]}>
-          {audioLocked ? "Locked" : "Unlocked"}
+          {lockMode === "locked"
+            ? "Locked"
+            : lockMode === "unlocked"
+              ? "Unlocked"
+              : "Lock"}
         </AppText>
       </TouchableOpacity>
 
