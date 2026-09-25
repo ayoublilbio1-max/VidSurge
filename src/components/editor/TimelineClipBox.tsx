@@ -18,7 +18,7 @@ const HOLD_OPACITY = 0.6;
 // Presentational shell for a track's clip box: a fixed-height, normal-flow
 // "slot" (so it still takes up space in the video/audio row stack) with an
 // absolutely-positioned rounded box inside it that can sit anywhere on the
-// timeline and be any length (via `width`) — used for both the video and
+// timeline and be any length (via `lengthSeconds`) — used for both the video and
 // the audio clip so trimming/moving one doesn't duplicate this markup.
 // Purely presentational: EditorTimeline still owns all the trim/offset math
 // and gesture wiring. The box's timeline position is read from `offsetSV`
@@ -32,7 +32,11 @@ interface TimelineClipBoxProps {
   slotMarginTop: number;
   offsetSV: SharedValue<number>;
   pixelsPerSecondSV: SharedValue<number>;
-  width: number;
+  // Clip length in seconds. The on-screen width is length × zoom, computed
+  // on the UI thread so it follows a pinch-zoom frame by frame (a plain
+  // pixel-width prop only updated when React re-rendered, so the boxes
+  // lagged behind the ruler while zooming).
+  lengthSeconds: number;
   selected: boolean;
   backgroundColor: string;
   selectedBorderColor: string;
@@ -56,7 +60,7 @@ export default function TimelineClipBox({
   slotMarginTop,
   offsetSV,
   pixelsPerSecondSV,
-  width,
+  lengthSeconds,
   selected,
   backgroundColor,
   selectedBorderColor,
@@ -70,6 +74,7 @@ export default function TimelineClipBox({
 }: TimelineClipBoxProps) {
   const positionStyle = useAnimatedStyle(() => ({
     left: offsetSV.value * pixelsPerSecondSV.value,
+    width: Math.max(lengthSeconds * pixelsPerSecondSV.value, 2),
   }));
 
   // Held look is a plain dim/fade (like muting a track) — no scale change.
@@ -89,7 +94,6 @@ export default function TimelineClipBox({
         positionStyle,
         holdStyle,
         {
-          width: Math.max(width, 2),
           height: slotHeight,
           backgroundColor,
           borderColor: selected ? selectedBorderColor : inactiveBorderColor,

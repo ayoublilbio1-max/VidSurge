@@ -1,5 +1,4 @@
 import { Ionicons } from "@expo/vector-icons";
-import { useEvent } from "expo";
 import { router, useLocalSearchParams } from "expo-router";
 import { useVideoPlayer, VideoView } from "expo-video";
 import * as VideoThumbnails from "expo-video-thumbnails";
@@ -35,6 +34,10 @@ export default function EditorScreen() {
   const { videoUri } = useLocalSearchParams<{ videoUri: string }>();
   const [comingSoonVisible, setComingSoonVisible] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  // True while the user is dragging/flinging the timeline. The audio
+  // player's seeks are held back during this (see useTrackTimelineSync's
+  // `holdSeeks`) and done once, exactly, on release.
+  const [isScrubbing, setIsScrubbing] = useState(false);
   const [duration, setDuration] = useState(0);
   const [thumbnails, setThumbnails] = useState<(string | null)[]>([]);
   const [thumbnailsReady, setThumbnailsReady] = useState(false);
@@ -70,19 +73,11 @@ export default function EditorScreen() {
     p.timeUpdateEventInterval = 0.2;
   });
 
-  useEvent(player, "timeUpdate", {
-    currentTime: 0,
-    currentLiveTimestamp: null,
-    currentOffsetFromLive: null,
-    bufferedPosition: 0,
-  });
-
-  useEvent(audioPlayer, "timeUpdate", {
-    currentTime: 0,
-    currentLiveTimestamp: null,
-    currentOffsetFromLive: null,
-    bufferedPosition: 0,
-  });
+  // Note: there used to be two `useEvent(player, "timeUpdate")`
+  // subscriptions here. Their values were never read (the timeline clock
+  // reads `player.currentTime` directly every frame), but each event still
+  // re-rendered this whole screen ~5x/s per player — 10 wasted full
+  // re-renders per second during playback. Removed for smoother playback.
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -181,16 +176,17 @@ export default function EditorScreen() {
     },
   ];
 
-  const { timelineTime, seekVersion, seekTo } = useTimelineClock({
-    isPlaying,
-    timelineDuration,
-    tracks: clockTracks,
-    onReachEnd: () => {
-      if (__DEV__)
-        console.log("[editor] timeline reached end, stopping playback");
-      setIsPlaying(false);
-    },
-  });
+  const { timelineTime, seekVersion, seekTo, playhead, halt } =
+    useTimelineClock({
+      isPlaying,
+      timelineDuration,
+      tracks: clockTracks,
+      onReachEnd: () => {
+        if (__DEV__)
+          console.log("[editor] timeline reached end, stopping playback");
+        setIsPlaying(false);
+      },
+    });
 
   useTrackTimelineSync({
     label: "video",
@@ -214,6 +210,7 @@ export default function EditorScreen() {
     clipEnd: audioClipEnd,
     trimStart: audioTrim.start,
     trimEnd: audioTrim.end,
+    holdSeeks: isScrubbing,
   });
 
   const isVoidNow =
@@ -231,6 +228,14 @@ export default function EditorScreen() {
 
     if (timelineTime >= timelineDuration - 0.001) {
       seekTo(0);
+    }
+
+    // Safety net: if a scrub-end was somehow missed, never keep the audio
+    // seek on hold once playback starts.
+    if (isScrubbing) {
+      if (__DEV__)
+        console.log("[editor] play pressed while scrub flag set — clearing it");
+      setIsScrubbing(false);
     }
 
     setIsPlaying(true);
@@ -251,11 +256,23 @@ export default function EditorScreen() {
     if (isPlaying) {
       if (__DEV__)
         console.log(`[editor] ${reason} started while playing — pausing`);
+      // Freeze the playhead immediately (see the clock's `halt`), then let
+      // React catch up with the paused state.
+      halt();
       setIsPlaying(false);
     }
   };
 
-  const handleScrubStart = () => pauseForGesture("scrub");
+  const handleScrubStart = () => {
+    pauseForGesture("scrub");
+    if (__DEV__) console.log("[editor] scrub start — holding audio seeks");
+    setIsScrubbing(true);
+  };
+
+  const handleScrubEnd = () => {
+    if (__DEV__) console.log("[editor] scrub end — releasing audio seek");
+    setIsScrubbing(false);
+  };
 
   const handleClipGestureStart = (kind: "move" | "trim") =>
     pauseForGesture(`clip ${kind}`);
@@ -310,6 +327,17 @@ export default function EditorScreen() {
     const trimChanged =
       update.trim.start !== prevTrim.start || update.trim.end !== prevTrim.end;
 
+    // What both tracks will look like after this change (locked = both
+    // get the same trim/offset).
+    const nextVideoTrim =
+      audioLocked || which === "video" ? update.trim : videoTrim;
+    const nextVideoOffset =
+      audioLocked || which === "video" ? update.offset : videoOffset;
+    const nextAudioTrim =
+      audioLocked || which === "audio" ? update.trim : audioTrim;
+    const nextAudioOffset =
+      audioLocked || which === "audio" ? update.offset : audioOffset;
+
     if (audioLocked) {
       setVideoTrim(update.trim);
       setAudioTrim(update.trim);
@@ -323,13 +351,26 @@ export default function EditorScreen() {
       setAudioOffset(update.offset);
     }
 
-    if (trimChanged) {
-      const clipStart = update.offset;
-      const clipEnd = update.offset + (update.trim.end - update.trim.start);
-      const clamped = clampJS(timelineTime, clipStart, clipEnd);
-      if (clamped !== timelineTime) {
-        seekTo(clamped);
-      }
+    // The playhead STAYS where it is after a trim or move (it used to jump
+    // to the start of the trimmed clip whenever it ended up outside it). If
+    // the cut leaves it over empty space, the preview just shows the gap,
+    // like any other gap. The only time it has to move: the timeline got
+    // shorter than where the playhead sits.
+    const nextTimelineDuration = Math.max(
+      duration,
+      nextVideoOffset + (nextVideoTrim.end - nextVideoTrim.start),
+      nextAudioOffset + (nextAudioTrim.end - nextAudioTrim.start),
+    );
+    if (timelineTime > nextTimelineDuration) {
+      if (__DEV__)
+        console.log(
+          `[editor] ${which} ${trimChanged ? "trim" : "move"} — timeline now ${nextTimelineDuration.toFixed(2)}s, playhead ${timelineTime.toFixed(2)}s was past the end → moved to end`,
+        );
+      seekTo(nextTimelineDuration);
+    } else if (__DEV__) {
+      console.log(
+        `[editor] ${which} ${trimChanged ? "trim" : "move"} — playhead stays @ ${timelineTime.toFixed(2)}s`,
+      );
     }
   };
 
@@ -426,6 +467,8 @@ export default function EditorScreen() {
             <EditorTimeline
               clipLabel={clipLabel}
               currentTime={timelineTime}
+              isPlaying={isPlaying}
+              playhead={playhead}
               duration={duration}
               thumbnails={thumbnails}
               selection={selection}
@@ -439,6 +482,7 @@ export default function EditorScreen() {
               onAddTextPress={() => setComingSoonVisible(true)}
               onScrub={handleScrub}
               onScrubStart={handleScrubStart}
+              onScrubEnd={handleScrubEnd}
               onClipGestureStart={handleClipGestureStart}
               onZoomButtonPress={handleZoomButtonPress}
               onPinchZoomStart={handlePinchZoomStart}

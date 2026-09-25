@@ -27,6 +27,15 @@ type UseTrackTimelineSyncParams = {
   /** This track's trim-in/out points inside the *source* file. */
   trimStart: number;
   trimEnd: number;
+  /**
+   * While true, this track does NOT seek its player — it only remembers
+   * that a seek is owed, and does it (once, to the exact position) as soon
+   * as this goes back to false. Used for the audio track while the user
+   * scrubs: seeking a second player on every scrub update was extra main
+   * thread work that made fast timeline scrolling stutter, and nobody hears
+   * a paused audio player anyway.
+   */
+  holdSeeks?: boolean;
 };
 
 /**
@@ -60,6 +69,7 @@ export function useTrackTimelineSync({
   clipEnd,
   trimStart,
   trimEnd,
+  holdSeeks = false,
 }: UseTrackTimelineSyncParams) {
   // Whether the playhead is currently inside this track's clip bounds.
   const insideRef = useRef(false);
@@ -70,6 +80,8 @@ export function useTrackTimelineSync({
   // Last timeline->source mapping applied to the player.
   const lastClipStartRef = useRef(clipStart);
   const lastTrimStartRef = useRef(trimStart);
+  // A seek that was skipped because of `holdSeeks`, still to be done.
+  const pendingSeekRef = useRef(false);
 
   useEffect(() => {
     if (!player) return;
@@ -114,7 +126,43 @@ export function useTrackTimelineSync({
       trimEnd,
     );
 
-    if (justEntered || explicitSeek || mappingChanged || resuming) {
+    const wantsSeek = justEntered || explicitSeek || mappingChanged || resuming;
+
+    if (holdSeeks && !isPlaying) {
+      // Scrubbing always pauses playback first — make sure this player is
+      // actually paused too (the pause and the hold arrive in the same
+      // render, and we return early below).
+      if (playingRef.current) {
+        player.pause();
+        playingRef.current = false;
+        if (__DEV__)
+          console.log(
+            `[trackSync:${label}] pause @ ${timelineTime.toFixed(2)}s`,
+          );
+      }
+      if (wantsSeek && !pendingSeekRef.current) {
+        pendingSeekRef.current = true;
+        if (__DEV__) {
+          console.log(
+            `[trackSync:${label}] scrubbing — seek deferred until release`,
+          );
+        }
+      }
+      return;
+    }
+
+    if (pendingSeekRef.current && !wantsSeek) {
+      pendingSeekRef.current = false;
+      player.currentTime = targetTime;
+      if (__DEV__) {
+        console.log(
+          `[trackSync:${label}] deferred seek (scrub released), seek to ${targetTime.toFixed(2)}s`,
+        );
+      }
+    }
+
+    if (wantsSeek) {
+      pendingSeekRef.current = false;
       player.currentTime = targetTime;
       if (__DEV__) {
         const reason = justEntered
@@ -158,5 +206,6 @@ export function useTrackTimelineSync({
     trimEnd,
     player,
     label,
+    holdSeeks,
   ]);
 }

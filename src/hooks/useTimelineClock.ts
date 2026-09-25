@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSharedValue, type SharedValue } from "react-native-reanimated";
 
 // How close (in seconds) the playhead has to be to a clip's edge to still
 // count as "inside" it. Guards against float rounding at the boundary.
@@ -20,6 +21,41 @@ const MAX_HOLD_MS = 1200;
 // Cap on how far a single frame can advance the wall clock (protects
 // against huge jumps after a long JS stall or the app being backgrounded).
 const MAX_WALL_CLOCK_STEP = 0.25;
+// While playing, React state (`timelineTime`) is only committed this often
+// (plus immediately whenever the playhead crosses a clip edge, so players
+// still start/stop exactly on time). The smooth visual movement of the
+// timeline no longer depends on React at all — it runs on the UI thread
+// from `playhead` below — so re-rendering the whole editor 60x/s was pure
+// waste and was what made playback choppy.
+const JS_COMMIT_INTERVAL_MS = 50;
+// When playback is paused, the playhead the user SEES (drawn by the UI
+// thread, which predicts between the decoder's coarse time reports) is
+// usually a little ahead of the clock's last decoder report — up to ~0.2s.
+// Committing the older clock value made the timeline jump BACK a bit on
+// every pause (very visible when zoomed in). If the drawn playhead is ahead
+// by no more than this, the pause keeps the drawn position instead, and the
+// players are seeked there so the preview frame matches it.
+const PAUSE_ALIGN_MAX_AHEAD = 0.4;
+
+/**
+ * Shared values the UI thread reads every frame to move the timeline
+ * smoothly while playing (see EditorTimeline's frame callback):
+ *   - targetSV:  the clock's latest authoritative time (seconds)
+ *   - rateSV:    1 while time is advancing, 0 while holding for a decoder
+ *   - snapSV:    bumped on every explicit jump / playback start; tells the
+ *                UI thread to jump straight to targetSV instead of easing
+ *   - playingSV: whether the clock loop is running
+ *   - uiTimeSV:  written BY the UI thread (EditorTimeline) — the playhead
+ *                time it's actually drawing. Read back on pause so the
+ *                playhead stays exactly where the user saw it stop.
+ */
+export type PlayheadSync = {
+  targetSV: SharedValue<number>;
+  rateSV: SharedValue<number>;
+  snapSV: SharedValue<number>;
+  playingSV: SharedValue<boolean>;
+  uiTimeSV: SharedValue<number>;
+};
 
 export type ClockTrack = {
   /** Just for debug logs, e.g. "video" / "audio". */
@@ -72,9 +108,11 @@ type UseTimelineClockParams = {
  *     follows the decoder so everything lines up again.
  *
  * The authoritative current time lives in `timeRef`. React state is just a
- * mirror of it for rendering. `seekTo` is for explicit jumps (scrub,
- * restart, trim clamp); it bumps `seekVersion`, which `useTrackTimelineSync`
- * watches to force-seek each player.
+ * (throttled) mirror of it for rendering, and `playhead` is the per-frame
+ * mirror for the UI thread, which is what actually moves the timeline.
+ * `seekTo` is for explicit jumps (scrub, restart, trim clamp); it bumps
+ * `seekVersion`, which `useTrackTimelineSync` watches to force-seek each
+ * player.
  */
 export function useTimelineClock({
   isPlaying,
@@ -86,6 +124,10 @@ export function useTimelineClock({
   const [seekVersion, setSeekVersion] = useState(0);
 
   const timeRef = useRef(0);
+  // Set by `halt()`: a gesture (scrub, pinch, clip move/trim...) interrupted
+  // playback. The loop must stop on the spot — not a few frames later when
+  // React gets around to the isPlaying=false render.
+  const haltedRef = useRef(false);
 
   const tracksRef = useRef(tracks);
   tracksRef.current = tracks;
@@ -96,8 +138,19 @@ export function useTimelineClock({
   const onReachEndRef = useRef(onReachEnd);
   onReachEndRef.current = onReachEnd;
 
+  const targetSV = useSharedValue(0);
+  const rateSV = useSharedValue(0);
+  const snapSV = useSharedValue(0);
+  const playingSV = useSharedValue(false);
+  const uiTimeSV = useSharedValue(0);
+  const playhead = useMemo<PlayheadSync>(
+    () => ({ targetSV, rateSV, snapSV, playingSV, uiTimeSV }),
+    [targetSV, rateSV, snapSV, playingSV, uiTimeSV],
+  );
+
   useEffect(() => {
     if (!isPlaying) return;
+    haltedRef.current = false;
 
     let rafId: number | null = null;
     let lastTs = Date.now();
@@ -107,6 +160,25 @@ export function useTimelineClock({
     let nudged = false;
     let lastGroundTruthLabel = "";
     let lastSource = "";
+    // Performance counters, logged once per second while playing (dev only).
+    // `ticks` = animation frames the loop ran, `updates` = how many of those
+    // actually moved the playhead (React re-renders), `decoderChanges` = how
+    // many times the ground-truth decoder reported a NEW time. These tell us
+    // where choppiness comes from: few ticks = JS thread overloaded; many
+    // ticks but few decoder changes = decoder time is coarse.
+    let perfWindowStart = Date.now();
+    let perfTicks = 0;
+    let perfUpdates = 0;
+    let perfDecoderChanges = 0;
+    let lastDecoderValue = NaN;
+    let lastCommitTs = 0;
+
+    // Hand the UI thread its starting point: jump (snap) to the current
+    // time, not moving yet (rate 0) until the first tick decides.
+    targetSV.value = timeRef.current;
+    rateSV.value = 0;
+    snapSV.value = snapSV.value + 1;
+    playingSV.value = true;
 
     if (__DEV__) {
       console.log(
@@ -115,12 +187,29 @@ export function useTimelineClock({
     }
 
     const tick = () => {
+      if (haltedRef.current) {
+        rafId = null;
+        return;
+      }
       const now = Date.now();
       const rawDt = (now - lastTs) / 1000;
       lastTs = now;
 
       const prev = timeRef.current;
       const duration = durationRef.current;
+
+      if (__DEV__) {
+        perfTicks += 1;
+        if (now - perfWindowStart >= 1000) {
+          console.log(
+            `[timelineClock] perf (last ${now - perfWindowStart}ms): ${perfTicks} JS frames, ${perfUpdates} React commits, decoder time changed ${perfDecoderChanges}x @ ${prev.toFixed(2)}s`,
+          );
+          perfWindowStart = now;
+          perfTicks = 0;
+          perfUpdates = 0;
+          perfDecoderChanges = 0;
+        }
+      }
 
       const active = tracksRef.current
         .filter(
@@ -142,7 +231,12 @@ export function useTimelineClock({
           lastGroundTruthLabel = gt.label;
         }
 
-        const candidate = gt.clipStart + (gt.getCurrentTime() - gt.trimStart);
+        const decoderTime = gt.getCurrentTime();
+        if (__DEV__ && decoderTime !== lastDecoderValue) {
+          perfDecoderChanges += 1;
+          lastDecoderValue = decoderTime;
+        }
+        const candidate = gt.clipStart + (decoderTime - gt.trimStart);
         const gap = candidate - prev;
 
         if (gap >= 0 && gap <= MAX_FOLLOW_AHEAD) {
@@ -210,8 +304,14 @@ export function useTimelineClock({
 
       next = Math.max(0, next);
 
+      // Feed the UI thread every tick (cheap: no React involved).
+      targetSV.value = next;
+      rateSV.value = source.startsWith("holding") ? 0 : 1;
+
       if (next >= duration - END_EPSILON) {
         timeRef.current = duration;
+        targetSV.value = duration;
+        rateSV.value = 0;
         setTimelineTime(duration);
         rafId = null;
         if (__DEV__) {
@@ -225,7 +325,18 @@ export function useTimelineClock({
 
       if (next !== prev) {
         timeRef.current = next;
-        setTimelineTime(next);
+        // Commit to React at a reduced rate — except when a clip edge was
+        // crossed, so the track sync starts/stops players right on time.
+        const crossedClipEdge = tracksRef.current.some(
+          (t) =>
+            prev < t.clipStart !== next < t.clipStart ||
+            prev < t.clipEnd !== next < t.clipEnd,
+        );
+        if (crossedClipEdge || now - lastCommitTs >= JS_COMMIT_INTERVAL_MS) {
+          setTimelineTime(next);
+          lastCommitTs = now;
+          if (__DEV__) perfUpdates += 1;
+        }
       }
       rafId = requestAnimationFrame(tick);
     };
@@ -233,10 +344,45 @@ export function useTimelineClock({
     rafId = requestAnimationFrame(tick);
 
     return () => {
+      // rafId is only null here if the loop already stopped by itself (end
+      // of the timeline, or halted by a gesture) — then there's nothing to
+      // align: the end position is exact, and after a halt the gesture
+      // (e.g. the scrub's seekTo) owns the playhead.
+      const halted = haltedRef.current;
+      const pausedMidway = rafId !== null && !halted;
       if (rafId !== null) cancelAnimationFrame(rafId);
+      playingSV.value = false;
+      rateSV.value = 0;
+
+      // Keep the playhead where the user saw it stop (see
+      // PAUSE_ALIGN_MAX_AHEAD) instead of snapping back to the last,
+      // slightly stale decoder report.
+      const clockTime = timeRef.current;
+      const drawnTime = uiTimeSV.value;
+      const ahead = drawnTime - clockTime;
+      const alignToDrawn =
+        pausedMidway &&
+        ahead > 0.001 &&
+        ahead <= PAUSE_ALIGN_MAX_AHEAD &&
+        drawnTime < durationRef.current - END_EPSILON;
+      if (alignToDrawn) {
+        timeRef.current = drawnTime;
+      }
+
+      targetSV.value = timeRef.current;
+      // Commit the exact final position (the last few ticks may not have
+      // been committed because of the reduced commit rate).
+      setTimelineTime(timeRef.current);
+      // Players are paused at roughly the clock time — move them to the
+      // drawn position so the preview frame matches the playhead.
+      if (alignToDrawn) setSeekVersion((v) => v + 1);
       if (__DEV__) {
         console.log(
-          `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s`,
+          alignToDrawn
+            ? `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s (kept drawn playhead; clock was ${clockTime.toFixed(2)}s, ${ahead.toFixed(2)}s behind)`
+            : halted
+              ? `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s (halted by gesture)`
+              : `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s`,
         );
       }
     };
@@ -247,14 +393,40 @@ export function useTimelineClock({
    * Updates the authoritative time immediately and bumps `seekVersion` so
    * every track's sync hook force-seeks its player to match.
    */
-  const seekTo = useCallback((time: number) => {
-    if (__DEV__) {
-      console.log(`[timelineClock] seekTo -> ${time.toFixed(2)}s`);
-    }
-    timeRef.current = time;
-    setTimelineTime(time);
-    setSeekVersion((v) => v + 1);
-  }, []);
+  const seekTo = useCallback(
+    (time: number) => {
+      if (__DEV__) {
+        console.log(`[timelineClock] seekTo -> ${time.toFixed(2)}s`);
+      }
+      timeRef.current = time;
+      targetSV.value = time;
+      snapSV.value = snapSV.value + 1;
+      setTimelineTime(time);
+      setSeekVersion((v) => v + 1);
+    },
+    [targetSV, snapSV],
+  );
 
-  return { timelineTime, seekVersion, seekTo };
+  /**
+   * Stop the playhead RIGHT NOW because a gesture took over (scrub, pinch,
+   * clip move/trim, zoom...). Call it together with setIsPlaying(false).
+   * Without it, the loop kept following the still-playing video for a few
+   * more frames (many more when the JS thread is busy) and overwrote the
+   * position the user had just scrubbed to — in one log the playhead ran
+   * from 1.07s to 1.77s after the user had scrubbed to 1.07s.
+   */
+  const halt = useCallback(() => {
+    if (haltedRef.current) return;
+    haltedRef.current = true;
+    playingSV.value = false;
+    rateSV.value = 0;
+    targetSV.value = timeRef.current;
+    if (__DEV__) {
+      console.log(
+        `[timelineClock] halted by gesture @ ${timeRef.current.toFixed(2)}s`,
+      );
+    }
+  }, [playingSV, rateSV, targetSV]);
+
+  return { timelineTime, seekVersion, seekTo, playhead, halt };
 }

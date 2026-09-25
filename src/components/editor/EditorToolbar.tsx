@@ -10,11 +10,11 @@ export interface EditorTool {
 }
 
 const TOOLS: EditorTool[] = [
-  { key: "voiceRecord", icon: "mic-outline", label: "Voice record" },
+  { key: "delete", icon: "trash-outline", label: "Delete" },
   { key: "crop", icon: "crop-outline", label: "Crop" },
   { key: "addText", icon: "text-outline", label: "Add text" },
   { key: "split", icon: "cut-outline", label: "Split" },
-  { key: "delete", icon: "trash-outline", label: "Delete" },
+  { key: "voiceRecord", icon: "mic-outline", label: "Voice record" },
   { key: "rotate", icon: "refresh-outline", label: "Rotate" },
   { key: "more", icon: "ellipsis-horizontal", label: "More" },
 ];

@@ -1,5 +1,5 @@
 import { Ionicons } from "@expo/vector-icons";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   Image,
   LayoutChangeEvent,
@@ -10,16 +10,22 @@ import {
 } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
+  Easing,
   runOnJS,
+  runOnUI,
   scrollTo,
+  useAnimatedReaction,
   useAnimatedRef,
   useAnimatedScrollHandler,
   useAnimatedStyle,
   useDerivedValue,
+  useFrameCallback,
   useSharedValue,
+  withTiming,
   type SharedValue,
 } from "react-native-reanimated";
 import { useTheme } from "../../hooks/useTheme";
+import type { PlayheadSync } from "../../hooks/useTimelineClock";
 import AppText from "../AppText";
 import TimelineClipBox from "./TimelineClipBox";
 
@@ -37,8 +43,9 @@ const RULER_HEIGHT = 16;
 const SUBDIVISION_THRESHOLD = 90;
 const SUBDIVISIONS_PER_SECOND = 5;
 
-const ZOOM_DISPATCH_INTERVAL_MS = 16;
 const BUTTON_ZOOM_FACTOR = 1.25;
+// The +/- buttons animate the zoom over this long instead of jumping.
+const BUTTON_ZOOM_DURATION_MS = 220;
 
 const MIN_RULER_LABEL_SPACING = 50;
 
@@ -57,6 +64,36 @@ const MIN_TRIM_DURATION = 0.5;
 // scrubbing continues until onMomentumEnd instead.
 const SCRUB_END_GRACE_MS = 120;
 
+// While the user scrubs (drags/flings the timeline), the new position is sent
+// to the parent at most this often. The parent seeks the video player on
+// each one, and on Android a player seek runs on the same main thread that
+// draws the scroll — seeking on every scroll frame (~60x/s, on two players)
+// is what made fast scrolling stutter and jump. ~12 updates/s is plenty for
+// the preview picture to follow the finger. The exact final position is
+// always sent when the scrub ends.
+const SCRUB_DISPATCH_INTERVAL_MS = 80;
+
+// Safety net for a fling whose onMomentumEnd never arrives (it can get lost
+// on Android when a fling is interrupted). If a fling produces no scroll
+// events for this long, it has stopped — end the scrub anyway, so
+// `isScrubbing` can never get stuck on.
+const MOMENTUM_IDLE_END_MS = 300;
+
+// Right after a scrub ends, React can still deliver a re-render with an
+// OLDER playhead time (a scrub update that was already on its way). The
+// paused scroll-follow effect used to scroll the timeline back to that
+// stale time — the "jump" after a fast fling. For this long after a scrub
+// ends, the follow effect only accepts the exact final scrub position.
+const POST_SCRUB_FOLLOW_GUARD_MS = 400;
+
+// UI-thread playhead smoothing (see the frame callback in the component).
+// If the UI-thread time drifts further than this from the clock's time, it
+// jumps straight to it (a real jump, e.g. after a seek); below it, it eases
+// back gently so the movement stays smooth.
+const UI_SNAP_THRESHOLD = 0.3;
+// Fraction of the remaining error corrected per frame.
+const UI_CORRECTION = 0.08;
+
 export type ClipSelection = "video" | "audio" | null;
 
 export interface TrimRange {
@@ -68,8 +105,12 @@ interface EditorTimelineProps {
   clipLabel: string;
   // Timeline-space playhead position (seconds from timeline 0), not raw
   // source-video time — the parent screen owns the play/void clock and
-  // passes this through every frame during playback.
+  // passes this through during playback (throttled — the smooth per-frame
+  // movement comes from `playhead` on the UI thread instead).
   currentTime: number;
+  isPlaying: boolean;
+  // Per-frame playhead info from useTimelineClock, read on the UI thread.
+  playhead: PlayheadSync;
   duration: number;
   thumbnails: (string | null)[];
   selection: ClipSelection;
@@ -86,6 +127,10 @@ interface EditorTimelineProps {
   // playhead — lets the parent pause playback (InShot-style) so the scrub
   // and the play clock aren't fighting over the same position.
   onScrubStart?: () => void;
+  // Fired once the scrub is completely over (finger lifted with no fling,
+  // or the fling settled) — right AFTER the exact final position was sent
+  // through onScrub. The parent uses it to do the deferred audio seek.
+  onScrubEnd?: () => void;
   // Fired when the user starts moving a clip (press-and-hold) or grabs a
   // trim handle — lets the parent pause playback, same as scrubbing.
   onClipGestureStart?: (kind: "move" | "trim") => void;
@@ -135,7 +180,7 @@ export function clampToTrim(value: number, trim: TrimRange): number {
   return Math.max(trim.start, Math.min(value, trim.end));
 }
 
-function RulerMark({
+const RulerMark = memo(function RulerMark({
   sec,
   pixelsPerSecondSV,
   showLabel,
@@ -184,7 +229,7 @@ function RulerMark({
         ))}
     </Animated.View>
   );
-}
+});
 
 function SubTick({
   frac,
@@ -226,7 +271,11 @@ function waveAmplitudeAtTime(t: number): number {
 // waveAmplitudeAtTime at that bar's real time position (derived from
 // pixelsPerSecond), so zooming in reveals finer detail within the same
 // waveform instead of just extending it.
-function WaveformBars({
+// Wrapped in memo: during playback the timeline re-renders on every clock
+// tick (currentTime changes), but the waveform only depends on zoom/width,
+// so it can skip all of those re-renders instead of rebuilding hundreds of
+// bar Views each time.
+const WaveformBars = memo(function WaveformBars({
   color,
   contentWidth,
   pixelsPerSecond,
@@ -263,9 +312,11 @@ function WaveformBars({
       ))}
     </View>
   );
-}
+});
 
-function ThumbnailTile({
+// memo for the same reason as WaveformBars — thumbnails never change during
+// playback.
+const ThumbnailTile = memo(function ThumbnailTile({
   uri,
   count,
   durationSV,
@@ -299,11 +350,13 @@ function ThumbnailTile({
       )}
     </Animated.View>
   );
-}
+});
 
 export default function EditorTimeline({
   clipLabel,
   currentTime,
+  isPlaying,
+  playhead,
   duration,
   thumbnails,
   selection,
@@ -317,6 +370,7 @@ export default function EditorTimeline({
   onAddTextPress,
   onScrub,
   onScrubStart,
+  onScrubEnd,
   onClipGestureStart,
   onZoomButtonPress,
   onPinchZoomStart,
@@ -334,12 +388,43 @@ export default function EditorTimeline({
     }
   }, []);
 
+  // Some events fire on every frame (scroll-follow during playback, raw
+  // scroll events while scrubbing). Logging each one floods Metro and was
+  // itself slowing the JS thread down (making playback look choppy in the
+  // dev build), so those go through this: at most one log per `intervalMs`
+  // per key.
+  const logThrottleRef = useRef<Record<string, number>>({});
+  const throttledLog = (
+    key: string,
+    intervalMs: number,
+    ...args: unknown[]
+  ) => {
+    if (!__DEV__) return;
+    const now = Date.now();
+    const last = logThrottleRef.current[key] ?? 0;
+    if (now - last < intervalMs) return;
+    logThrottleRef.current[key] = now;
+    console.log(...args);
+  };
+
   const [trackAreaWidth, setTrackAreaWidth] = useState(0);
   const [pixelsPerSecond, setPixelsPerSecond] = useState(
     INITIAL_PIXELS_PER_SECOND,
   );
   const [trimDragging, setTrimDragging] = useState(false);
   const [moveDragging, setMoveDragging] = useState(false);
+  // True while a two-finger pinch-zoom is active. Turns the ScrollView's
+  // own scrolling off so the fingers can't drag the timeline around while
+  // the pinch is zooming it (the two fought each other every frame).
+  const [pinchZooming, setPinchZooming] = useState(false);
+
+  useEffect(() => {
+    if (__DEV__) {
+      console.log(
+        `[EditorTimeline] timeline scrolling ${trimDragging || moveDragging || pinchZooming ? "LOCKED" : "enabled"} (trimDragging=${trimDragging}, moveDragging=${moveDragging}, pinchZooming=${pinchZooming})`,
+      );
+    }
+  }, [trimDragging, moveDragging, pinchZooming]);
 
   const isScrubbing = useRef(false);
   const isPinching = useRef(false);
@@ -349,10 +434,44 @@ export default function EditorTimeline({
   // about to trim.
   const trimTouchRef = useRef({ active: false, lastEnd: 0 });
   const scrubEndTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // True between onMomentumBegin and the fling settling. While true, a
+  // finger-lift / onEndDrag must NOT end the scrub: on Android the
+  // "finger lifted" signal often arrives AFTER the fling already started,
+  // and ending the scrub there made the rest of the fling ignored and the
+  // timeline snap back to an old position.
+  const inMomentumRef = useRef(false);
+  const momentumIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  // When the last scrub ended, and the exact time it ended on — used to
+  // ignore stale playhead values in the scroll-follow effect right after.
+  const scrubEndedAtRef = useRef(0);
+  const lastScrubSentTimeRef = useRef<number | null>(null);
 
   const pixelsPerSecondSV = useSharedValue(INITIAL_PIXELS_PER_SECOND);
   const gestureBasePPS = useSharedValue(INITIAL_PIXELS_PER_SECOND);
-  const lastDispatchTime = useSharedValue(0);
+  // Pinch-zoom state, all on the UI thread:
+  //   pinchActiveSV   — a real two-finger pinch is running (set in onStart;
+  //                     onBegin can fire for a plain one-finger touch)
+  //   pinchAnchorSV   — the playhead time when the pinch started; the zoom
+  //                     is centred on it, so it stays under the playhead
+  //   pinchTargetXSV  — the scroll position the pinch wants this frame; any
+  //                     other scroll during the pinch is forced back to it
+  const pinchActiveSV = useSharedValue(false);
+  const pinchAnchorSV = useSharedValue(0);
+  const pinchTargetXSV = useSharedValue(0);
+  const pinchStartMsSV = useSharedValue(0);
+  const pinchUpdatesSV = useSharedValue(0);
+  // +/- button zoom, animated on the UI thread:
+  //   zoomAnimatingSV — a button zoom animation is running; like a pinch,
+  //                     it owns the scroll position while it runs
+  //   zoomTargetPPSSV — where the running animation is heading, so quick
+  //                     repeated taps stack (3 taps = 3 steps)
+  //   zoomAnchorSV    — the playhead time the zoom is centred on
+  const zoomAnimatingSV = useSharedValue(false);
+  const zoomTargetPPSSV = useSharedValue(INITIAL_PIXELS_PER_SECOND);
+  const zoomAnchorSV = useSharedValue(0);
+  const playheadTimeSV = useSharedValue(0);
   const scrollX = useSharedValue(0);
   const durationSV = useSharedValue(0);
   const trackAreaWidthSV = useSharedValue(0);
@@ -382,6 +501,24 @@ export default function EditorTimeline({
   // nothing the ScrollView does can sneak the timeline out from under you.
   const isMovingSV = useSharedValue(false);
   const scrollLockXSV = useSharedValue(0);
+  // UI-thread mirrors of isScrubbing / isPinching, so the per-frame
+  // playhead callback (and onScroll) can check them without touching JS.
+  const isScrubbingSV = useSharedValue(false);
+  const isPinchingSV = useSharedValue(false);
+  // The playhead time as drawn by the UI thread while playing (owned by
+  // the clock, so it can keep this exact position on pause), plus
+  // bookkeeping for snaps and the once-per-second debug log.
+  const uiTimeSV = playhead.uiTimeSV;
+  const lastSnapSV = useSharedValue(-1);
+  // Last clock value seen, and how long ago (seconds) it last changed. The
+  // clock's time can arrive in steps (the video decoder reports its
+  // position a few times per second), so the UI thread predicts where the
+  // clock "really" is now (last value + time since it changed) instead of
+  // pulling back toward a stale value between steps.
+  const lastTargetSV = useSharedValue(0);
+  const targetAgeSV = useSharedValue(0);
+  const uiPerfWindowStartSV = useSharedValue(0);
+  const uiPerfFramesSV = useSharedValue(0);
 
   const contentWidthSV = useDerivedValue(() =>
     Math.max(timelineDurationSV.value * pixelsPerSecondSV.value, 200),
@@ -404,20 +541,20 @@ export default function EditorTimeline({
     audioOffset + (audioTrim.end - audioTrim.start),
   );
   const contentWidth = Math.max(safeDuration * pixelsPerSecond, 200);
-  // Same idea as contentWidthSV above, but as a plain JS number for the
-  // scroll-follow effect below (which isn't a worklet).
-  const timelineContentWidth = Math.max(
-    timelineDuration * pixelsPerSecond,
-    200,
-  );
   const secondMarks = Array.from(
     { length: Math.ceil(timelineDuration) + 1 },
     (_, i) => i,
   );
   const showSubdivisions = pixelsPerSecond >= SUBDIVISION_THRESHOLD;
-  const subdivisionOffsets = Array.from(
-    { length: SUBDIVISIONS_PER_SECOND - 1 },
-    (_, i) => (i + 1) / SUBDIVISIONS_PER_SECOND,
+  // Stable array (same reference every render) so the memoized RulerMarks
+  // don't re-render just because this got rebuilt.
+  const subdivisionOffsets = useMemo(
+    () =>
+      Array.from(
+        { length: SUBDIVISIONS_PER_SECOND - 1 },
+        (_, i) => (i + 1) / SUBDIVISIONS_PER_SECOND,
+      ),
+    [],
   );
   const rulerLabelInterval = Math.max(
     1,
@@ -433,9 +570,18 @@ export default function EditorTimeline({
   const isAudioSelected =
     selection === "audio" || (selection === "video" && audioLocked);
 
+  // NOTE: the zoom's source of truth is pixelsPerSecondSV (UI thread);
+  // `pixelsPerSecond` state is only its mirror for rendering, updated via
+  // commitZoom when a pinch/zoom ends. There used to be an effect here
+  // copying the state back into the shared value — with quick +/- taps, a
+  // late commit from an earlier tap overwrote the running zoom animation
+  // with an old zoom level (the timeline jumped and the playhead drifted).
+
+  // The playhead's committed time, mirrored to the UI thread (a JS write,
+  // so it's always current there). Zoom centres on this.
   useEffect(() => {
-    pixelsPerSecondSV.value = pixelsPerSecond;
-  }, [pixelsPerSecond]);
+    playheadTimeSV.value = currentTime;
+  }, [currentTime]);
 
   useEffect(() => {
     durationSV.value = safeDuration;
@@ -464,20 +610,178 @@ export default function EditorTimeline({
   // here is enough to keep the scroll position in sync whether playing,
   // paused, or scrubbed — skipped only while the user's own gesture
   // (scrub drag or pinch) is actively driving the scroll instead.
+  //
+  // While PLAYING this effect does nothing: the UI-thread frame callback
+  // below moves the timeline every frame instead (smooth, no React). This
+  // effect handles everything else: paused, after a seek/scrub, zoom, and
+  // the final position when playback stops.
+  const logFollow = (time: number, x: number) => {
+    throttledLog(
+      "scroll-follow",
+      1000,
+      "[EditorTimeline] scroll-follow (paused, max 1 log/s)",
+      {
+        currentTime: time,
+        x,
+      },
+    );
+  };
+
+  const followPlayhead = (time: number) => {
+    "worklet";
+    // A zoom owns the scroll position while it runs.
+    if (zoomAnimatingSV.value || pinchActiveSV.value) return;
+    const x = clampWorklet(
+      time * pixelsPerSecondSV.value,
+      0,
+      contentWidthSV.value,
+    );
+    // Already there (the normal case right after a scrub or zoom) — don't
+    // issue a redundant native scroll.
+    if (Math.abs(scrollX.value - x) < 0.5) return;
+    scrollTo(scrollRef, x, 0, false);
+    scrollX.value = x;
+    runOnJS(logFollow)(time, x);
+  };
+
+  // Was playback running on the previous run of the effect below? Used to
+  // spot the exact render where playback stops.
+  const wasPlayingRef = useRef(false);
+
   useEffect(() => {
-    if (trackAreaWidth > 0 && !isScrubbing.current && !isPinching.current) {
-      const x = clampJS(currentTime * pixelsPerSecond, 0, timelineContentWidth);
-      if (__DEV__) {
-        console.log("[EditorTimeline] scroll-follow", {
-          currentTime,
-          x,
-          isScrubbing: isScrubbing.current,
-        });
+    const justStopped = wasPlayingRef.current && !isPlaying;
+    wasPlayingRef.current = isPlaying;
+    if (isPlaying) return;
+    // The render where playback stops still carries the last THROTTLED
+    // playhead time (React only gets it every ~50ms, more when the JS
+    // thread is busy), which can be ~0.2s behind where the timeline really
+    // stopped. Scrolling to it made the timeline jump back and then forward
+    // again on every pause. The clock has already written the exact stop
+    // position to targetSV (its cleanup runs before this effect), and the
+    // timeline is already sitting there — so skip this stale value; the
+    // next render carries the exact time.
+    if (justStopped) {
+      const stopTime = playhead.targetSV.value;
+      if (Math.abs(currentTime - stopTime) > 0.01) {
+        if (__DEV__) {
+          console.log(
+            `[EditorTimeline] scroll-follow skipped — stale time ${currentTime.toFixed(2)}s on pause (stopped at ${stopTime.toFixed(2)}s)`,
+          );
+        }
+        return;
       }
-      scrollRef.current?.scrollTo({ x, y: 0, animated: false });
-      scrollX.value = x;
     }
-  }, [currentTime, trackAreaWidth, pixelsPerSecond, timelineContentWidth]);
+    if (
+      trackAreaWidth > 0 &&
+      !isScrubbing.current &&
+      !inMomentumRef.current &&
+      !isPinching.current
+    ) {
+      // Just after a scrub: the scroll position the finger/fling left is
+      // the truth. Ignore any playhead value that isn't the final scrub
+      // position (it's a stale update still arriving from React).
+      const sinceScrubEnd = Date.now() - scrubEndedAtRef.current;
+      const finalScrubTime = lastScrubSentTimeRef.current;
+      if (
+        sinceScrubEnd < POST_SCRUB_FOLLOW_GUARD_MS &&
+        finalScrubTime !== null &&
+        Math.abs(currentTime - finalScrubTime) > 0.01
+      ) {
+        if (__DEV__) {
+          console.log(
+            `[EditorTimeline] scroll-follow skipped — stale time ${currentTime.toFixed(2)}s right after scrub (final ${finalScrubTime.toFixed(2)}s)`,
+          );
+        }
+        return;
+      }
+      // Done on the UI thread, with the LIVE zoom level: the JS copy of the
+      // zoom lags behind during/after a zoom animation, and scrolling with
+      // it used to throw the timeline to the wrong place mid-zoom.
+      runOnUI(followPlayhead)(currentTime);
+    }
+  }, [currentTime, isPlaying, trackAreaWidth]);
+
+  const logUiPerf = (
+    frames: number,
+    windowMs: number,
+    uiTime: number,
+    target: number,
+  ) => {
+    if (__DEV__) {
+      console.log(
+        `[EditorTimeline] UI playhead (last ${Math.round(windowMs)}ms): ${frames} frames, ui ${uiTime.toFixed(2)}s vs clock ${target.toFixed(2)}s (diff ${(uiTime - target).toFixed(3)}s)`,
+      );
+    }
+  };
+
+  // Moves the timeline under the playhead on the UI thread, every screen
+  // frame, while playing. It advances its own time by the frame duration
+  // (when the clock says time is moving, rateSV = 1) and gently eases
+  // toward the clock's authoritative time, so the motion is smooth even
+  // when the JS thread or the video decoder only report time in steps.
+  // Skipped while the user is scrubbing, pinching, or moving a clip.
+  useFrameCallback((frame) => {
+    "worklet";
+    if (!playhead.playingSV.value) return;
+    if (isScrubbingSV.value || isPinchingSV.value || isMovingSV.value) return;
+    if (zoomAnimatingSV.value || pinchActiveSV.value) return;
+
+    const target = playhead.targetSV.value;
+    const rate = playhead.rateSV.value;
+    const dtMs = frame.timeSincePreviousFrame ?? 16;
+    const dt = Math.min(dtMs, 100) / 1000;
+    let t = uiTimeSV.value;
+
+    if (target !== lastTargetSV.value) {
+      lastTargetSV.value = target;
+      targetAgeSV.value = 0;
+    } else {
+      targetAgeSV.value = Math.min(targetAgeSV.value + dt, 0.5);
+    }
+
+    if (playhead.snapSV.value !== lastSnapSV.value) {
+      lastSnapSV.value = playhead.snapSV.value;
+      t = target;
+      targetAgeSV.value = 0;
+    } else {
+      t += dt * rate;
+      // Where the clock most likely is right now.
+      const predicted = target + targetAgeSV.value * rate;
+      const err = predicted - t;
+      if (Math.abs(err) > UI_SNAP_THRESHOLD) {
+        t = predicted;
+      } else {
+        t += err * UI_CORRECTION;
+      }
+    }
+    if (t < 0) t = 0;
+    uiTimeSV.value = t;
+
+    const x = clampWorklet(
+      t * pixelsPerSecondSV.value,
+      0,
+      contentWidthSV.value,
+    );
+    scrollTo(scrollRef, x, 0, false);
+    scrollX.value = x;
+
+    if (__DEV__) {
+      // Start a fresh 1s window after an idle period (first play, or
+      // resuming after a pause) so the log doesn't report a bogus
+      // multi-second window with only a few frames.
+      if (frame.timestamp - uiPerfWindowStartSV.value > 2000) {
+        uiPerfWindowStartSV.value = frame.timestamp;
+        uiPerfFramesSV.value = 0;
+      }
+      uiPerfFramesSV.value += 1;
+      const elapsed = frame.timestamp - uiPerfWindowStartSV.value;
+      if (elapsed >= 1000) {
+        runOnJS(logUiPerf)(uiPerfFramesSV.value, elapsed, t, target);
+        uiPerfWindowStartSV.value = frame.timestamp;
+        uiPerfFramesSV.value = 0;
+      }
+    }
+  });
 
   const onTrackAreaLayout = (e: LayoutChangeEvent) => {
     setTrackAreaWidth(e.nativeEvent.layout.width);
@@ -490,15 +794,54 @@ export default function EditorTimeline({
     }
   };
 
+  const clearMomentumIdleTimer = () => {
+    if (momentumIdleTimerRef.current !== null) {
+      clearTimeout(momentumIdleTimerRef.current);
+      momentumIdleTimerRef.current = null;
+    }
+  };
+
+  // The ONE place a scrub ends. Safe to call from any path (release timer,
+  // fling settled, fling watchdog): it only does anything if a scrub is
+  // actually active, so `finishScrub` (final seek + onScrubEnd) runs exactly
+  // once per scrub. Before, a fling could end the scrub twice — once too
+  // early (mid-fling) and again when it settled.
+  const endScrub = (reason: string) => {
+    clearScrubEndTimeout();
+    clearMomentumIdleTimer();
+    inMomentumRef.current = false;
+    if (!isScrubbing.current) {
+      if (__DEV__)
+        console.log(
+          `[EditorTimeline] scrub end ignored (${reason}) — no scrub active`,
+        );
+      return;
+    }
+    isScrubbing.current = false;
+    isScrubbingSV.value = false;
+    if (__DEV__) console.log(`[EditorTimeline] scrub end (${reason})`);
+    finishScrub();
+  };
+
   // Touch-down on the timeline: start scrubbing and tell the parent to
   // pause, so the play clock stops fighting the finger for the playhead
   // position (this is what "scrub to 0 then it snaps back" was — the
   // clock was still running and kept overwriting the scrub).
+  // Touching the timeline during a fling stops the fling, so any momentum
+  // state is cleared here too — a late onMomentumEnd from that interrupted
+  // fling must not end this new drag.
   const beginScrubbing = () => {
     clearScrubEndTimeout();
+    clearMomentumIdleTimer();
+    inMomentumRef.current = false;
+    const wasScrubbing = isScrubbing.current;
     isScrubbing.current = true;
-    if (__DEV__) console.log("[EditorTimeline] scrub begin (pausing playback)");
-    onScrubStart?.();
+    isScrubbingSV.value = true;
+    if (__DEV__)
+      console.log(
+        `[EditorTimeline] scrub begin (pausing playback)${wasScrubbing ? " — caught a running fling" : ""}`,
+      );
+    if (!wasScrubbing) onScrubStart?.();
   };
 
   // Finger lifted with no fling — onEndDrag fires for this case, but so
@@ -510,14 +853,32 @@ export default function EditorTimeline({
   // never fires without momentum) — that's the "playhead stops following
   // during playback" bug: the scroll-follow effect above skips every frame
   // while isScrubbing is true.
+  //
+  // If a fling is ALREADY running, do nothing: the fling ends the scrub
+  // itself when it settles.
   const scheduleScrubEnd = () => {
+    if (inMomentumRef.current) {
+      if (__DEV__)
+        console.log(
+          "[EditorTimeline] release during fling — scrub keeps going",
+        );
+      return;
+    }
     clearScrubEndTimeout();
     scrubEndTimeoutRef.current = setTimeout(() => {
       scrubEndTimeoutRef.current = null;
-      isScrubbing.current = false;
-      if (__DEV__)
-        console.log("[EditorTimeline] scrub end (release, no fling)");
+      if (inMomentumRef.current) return;
+      endScrub("release, no fling");
     }, SCRUB_END_GRACE_MS);
+  };
+
+  // Restarts the fling watchdog (see MOMENTUM_IDLE_END_MS).
+  const armMomentumIdleTimer = () => {
+    clearMomentumIdleTimer();
+    momentumIdleTimerRef.current = setTimeout(() => {
+      momentumIdleTimerRef.current = null;
+      if (inMomentumRef.current) endScrub("fling went quiet — watchdog");
+    }, MOMENTUM_IDLE_END_MS);
   };
 
   // A fling started. Scrubbing must be ON for the fling's scroll events to
@@ -525,8 +886,15 @@ export default function EditorTimeline({
   // fired (momentum can arrive a little late on some devices).
   const continueScrubbingIntoMomentum = () => {
     clearScrubEndTimeout();
+    inMomentumRef.current = true;
+    armMomentumIdleTimer();
+    const wasScrubbing = isScrubbing.current;
     isScrubbing.current = true;
+    isScrubbingSV.value = true;
     if (__DEV__) console.log("[EditorTimeline] scrub continues into fling");
+    // The release grace timer already ended the scrub (late fling) — tell
+    // the parent a scrub is active again.
+    if (!wasScrubbing) onScrubStart?.();
   };
 
   // Finger lifted, reported by the gesture handler wrapping the ScrollView.
@@ -535,65 +903,111 @@ export default function EditorTimeline({
   // so a drag released without a fling left `isScrubbing` stuck on and
   // the playhead would stop following the next time you pressed play.
   const handleFingerLifted = () => {
-    if (__DEV__) console.log("[EditorTimeline] finger lifted");
+    if (__DEV__)
+      console.log(
+        `[EditorTimeline] finger lifted${inMomentumRef.current ? " (fling running — ignored)" : ""}`,
+      );
+    if (inMomentumRef.current) return;
     if (isScrubbing.current) scheduleScrubEnd();
   };
 
   const endScrubbingAfterMomentum = () => {
-    clearScrubEndTimeout();
-    isScrubbing.current = false;
-    if (__DEV__) console.log("[EditorTimeline] scrub end (fling settled)");
+    if (!inMomentumRef.current) {
+      // Stale momentum-end from a fling that a new touch already stopped —
+      // the new drag owns the scrub now.
+      if (__DEV__)
+        console.log("[EditorTimeline] fling end ignored — not in a fling");
+      return;
+    }
+    endScrub("fling settled");
   };
 
   useEffect(() => {
-    return () => clearScrubEndTimeout();
+    return () => {
+      clearScrubEndTimeout();
+      clearMomentumIdleTimer();
+    };
   }, []);
 
   const setIsPinching = (value: boolean) => {
     isPinching.current = value;
   };
 
-  // Scrubbing dispatches onScroll (and thus a potential onScrub call) far
-  // more often than React can usefully keep up with — every native scroll
-  // frame, which during a fast drag can mean many calls in quick
-  // succession. Each onScrub ultimately fires TWO state updates in the
-  // parent (timelineTime + a seek-version bump) and a full effect cascade
-  // across the playback hooks, so firing one per raw scroll event let a
-  // backlog of stale, superseded updates pile up. Coalescing to at most
-  // one flush per animation frame keeps the parent's update rate sane no
-  // matter how fast raw scroll events arrive, without dropping the drag's
-  // final position (the latest value always wins).
+  // Scrub positions are throttled to one every SCRUB_DISPATCH_INTERVAL_MS
+  // (see that constant for why). The latest position always wins: anything
+  // held back is sent by the pending timer, and `finishScrub` sends the
+  // exact final position the moment the scrub ends.
   const pendingScrubTimeRef = useRef<number | null>(null);
-  const scrubRafRef = useRef<number | null>(null);
+  const scrubTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastScrubDispatchRef = useRef(0);
 
   const flushScrub = () => {
-    scrubRafRef.current = null;
+    if (scrubTimerRef.current !== null) {
+      clearTimeout(scrubTimerRef.current);
+      scrubTimerRef.current = null;
+    }
     const time = pendingScrubTimeRef.current;
     pendingScrubTimeRef.current = null;
     if (time === null) return;
-    if (__DEV__) {
-      console.log("[EditorTimeline] onScrub (flushed)", { time });
-    }
+    lastScrubDispatchRef.current = Date.now();
+    lastScrubSentTimeRef.current = time;
+    throttledLog(
+      "scrub-flush",
+      250,
+      "[EditorTimeline] onScrub (sent, max 4 logs/s)",
+      {
+        time,
+      },
+    );
     onScrub(time);
   };
 
+  // Scrub fully over: send the exact final position right now (no
+  // throttle), then tell the parent.
+  function finishScrub() {
+    const pending = pendingScrubTimeRef.current;
+    flushScrub();
+    // Start the post-scrub guard for the scroll-follow effect.
+    scrubEndedAtRef.current = Date.now();
+    if (__DEV__) {
+      console.log(
+        `[EditorTimeline] scrub finished${pending !== null ? ` — final position ${pending.toFixed(2)}s` : ""}`,
+      );
+    }
+    onScrubEnd?.();
+  }
+
   useEffect(() => {
     return () => {
-      if (scrubRafRef.current !== null) {
-        cancelAnimationFrame(scrubRafRef.current);
+      if (scrubTimerRef.current !== null) {
+        clearTimeout(scrubTimerRef.current);
       }
     };
   }, []);
 
-  const handleScrollUpdate = (offsetX: number) => {
+  const handleScrollUpdate = (offsetX: number, pps: number) => {
     if (!isScrubbing.current) return;
-    const time = clampJS(offsetX / pixelsPerSecond, 0, timelineDuration);
-    if (__DEV__) {
-      console.log("[EditorTimeline] onScrub (raw)", { offsetX, time });
-    }
+    // Every scroll event during a fling proves it's still moving.
+    if (inMomentumRef.current) armMomentumIdleTimer();
+    const time = clampJS(offsetX / pps, 0, timelineDuration);
+    throttledLog(
+      "scrub-raw",
+      250,
+      "[EditorTimeline] scroll (raw, max 4 logs/s)",
+      {
+        offsetX,
+        time,
+      },
+    );
     pendingScrubTimeRef.current = time;
-    if (scrubRafRef.current === null) {
-      scrubRafRef.current = requestAnimationFrame(flushScrub);
+    const since = Date.now() - lastScrubDispatchRef.current;
+    if (since >= SCRUB_DISPATCH_INTERVAL_MS) {
+      flushScrub();
+    } else if (scrubTimerRef.current === null) {
+      scrubTimerRef.current = setTimeout(
+        flushScrub,
+        SCRUB_DISPATCH_INTERVAL_MS - since,
+      );
     }
   };
 
@@ -607,16 +1021,40 @@ export default function EditorTimeline({
         scrollX.value = scrollLockXSV.value;
         return;
       }
+      if (pinchActiveSV.value || zoomAnimatingSV.value) {
+        // A zoom (pinch or +/- button) owns the scroll position: undo any
+        // drag the fingers add, and never treat it as a scrub (no seeking
+        // while zooming).
+        if (Math.abs(event.contentOffset.x - pinchTargetXSV.value) > 0.5) {
+          scrollTo(scrollRef, pinchTargetXSV.value, 0, false);
+        }
+        scrollX.value = pinchTargetXSV.value;
+        return;
+      }
       scrollX.value = event.contentOffset.x;
-      runOnJS(handleScrollUpdate)(event.contentOffset.x);
+      // Only bother the JS thread when the user is actually scrubbing.
+      // During playback the UI-thread callback scrolls every frame, and
+      // each of those scrolls fires onScroll too — forwarding them all to
+      // JS would just add work.
+      if (!isScrubbingSV.value) return;
+      // The zoom level goes along with the offset: the JS copy of the zoom
+      // can lag behind the UI thread right after a pinch.
+      runOnJS(handleScrollUpdate)(
+        event.contentOffset.x,
+        pixelsPerSecondSV.value,
+      );
     },
     onBeginDrag: () => {
+      // Set on the UI thread right away so the playhead callback stops
+      // moving the timeline under the finger on this very frame.
+      isScrubbingSV.value = true;
       runOnJS(beginScrubbing)();
     },
     onEndDrag: () => {
       runOnJS(scheduleScrubEnd)();
     },
     onMomentumBegin: () => {
+      isScrubbingSV.value = true;
       runOnJS(continueScrubbingIntoMomentum)();
     },
     onMomentumEnd: () => {
@@ -634,76 +1072,149 @@ export default function EditorTimeline({
     onPinchZoomStart?.();
   };
 
+  // The moment the zoom should stay centred on: the playhead itself.
+  //   - mid-scrub: where the finger has the timeline right now
+  //   - playing:   where the playhead is drawn
+  //   - paused:    the committed playhead time (NOT scrollX / zoom — the
+  //                scroll position is rounded to whole pixels, and deriving
+  //                the time from it drifted a little with every zoom step)
+  const currentAnchorTime = () => {
+    "worklet";
+    let t: number;
+    if (isScrubbingSV.value) {
+      t = scrollX.value / pixelsPerSecondSV.value;
+    } else if (playhead.playingSV.value) {
+      t = uiTimeSV.value;
+    } else {
+      t = playheadTimeSV.value;
+    }
+    return clampWorklet(t, 0, timelineDurationSV.value);
+  };
+
+  const logPinch = (
+    phase: "start" | "end",
+    anchor: number,
+    fromPPS: number,
+    toPPS: number,
+    updates: number,
+    ms: number,
+  ) => {
+    if (!__DEV__) return;
+    if (phase === "start") {
+      console.log(
+        `[EditorTimeline] pinch zoom start — centred on playhead @ ${anchor.toFixed(2)}s, ${fromPPS.toFixed(0)}px/s`,
+      );
+    } else {
+      const fps = ms > 0 ? (updates * 1000) / ms : 0;
+      console.log(
+        `[EditorTimeline] pinch zoom end — ${fromPPS.toFixed(0)} → ${toPPS.toFixed(0)}px/s, ${updates} updates in ${Math.round(ms)}ms (~${fps.toFixed(0)}/s), playhead still @ ${anchor.toFixed(2)}s`,
+      );
+    }
+  };
+
+  // Pinch-zoom, CapCut/InShot-style: the timeline stretches around the
+  // PLAYHEAD, which stays on the same moment the whole time — so nothing is
+  // seeked during a pinch. Everything runs on the UI thread: the zoom level
+  // (pixelsPerSecondSV) drives the ruler, clip boxes, thumbnails, waveform
+  // and handles directly, and React is told the new zoom only ONCE, when
+  // the fingers lift. Before, React re-rendered the whole timeline ~60x/s
+  // during a pinch (and clip widths lagged behind the ruler), which is what
+  // made it drop frames and jump.
   const pinchGesture = Gesture.Pinch()
     .onBegin(() => {
-      gestureBasePPS.value = pixelsPerSecondSV.value;
-      lastDispatchTime.value = 0;
+      isPinchingSV.value = true;
       runOnJS(setIsPinching)(true);
     })
     .onStart(() => {
       // onStart = two fingers really started pinching (onBegin above can
       // fire on a plain one-finger touch before the pinch is recognized,
       // and we don't want a normal tap/scroll to pause playback).
+      // A pinch takes over from a running +/- animation (writing the zoom
+      // below cancels it; its end callback then does nothing).
+      zoomAnimatingSV.value = false;
+      const basePPS = pixelsPerSecondSV.value;
+      gestureBasePPS.value = basePPS;
+      const anchor = currentAnchorTime();
+      pinchAnchorSV.value = anchor;
+      pinchTargetXSV.value = scrollX.value;
+      pinchActiveSV.value = true;
+      pinchStartMsSV.value = Date.now();
+      pinchUpdatesSV.value = 0;
+      runOnJS(setPinchZooming)(true);
       runOnJS(handlePinchZoomStart)();
+      runOnJS(logPinch)("start", anchor, basePPS, basePPS, 0, 0);
     })
     .onUpdate((event) => {
-      const basePPS = gestureBasePPS.value;
-      const minScale = MIN_PIXELS_PER_SECOND / basePPS;
-      const maxScale = MAX_PIXELS_PER_SECOND / basePPS;
-      const scale = clampWorklet(event.scale, minScale, maxScale);
+      if (!pinchActiveSV.value) return;
       const newPPS = clampWorklet(
-        basePPS * scale,
+        gestureBasePPS.value * event.scale,
         MIN_PIXELS_PER_SECOND,
         MAX_PIXELS_PER_SECOND,
       );
-
       pixelsPerSecondSV.value = newPPS;
 
-      const timelineX = scrollX.value + event.focalX - LEADING_WIDTH;
-      const anchorTime = clampWorklet(
-        timelineX / basePPS,
-        0,
-        timelineDurationSV.value,
-      );
-      const newTimelineX = anchorTime * newPPS;
-      const newScrollX = newTimelineX - event.focalX + LEADING_WIDTH;
-
-      const newContentWidth = Math.max(timelineDurationSV.value * newPPS, 200);
-      const newTotalScrollWidth =
-        LEADING_WIDTH + newContentWidth + trackAreaWidthSV.value;
-      const maxScrollX = Math.max(
-        0,
-        newTotalScrollWidth - trackAreaWidthSV.value,
-      );
-      const clampedScrollX = clampWorklet(newScrollX, 0, maxScrollX);
-
-      scrollTo(scrollRef, clampedScrollX, 0, false);
-      scrollX.value = clampedScrollX;
-
-      const now = Date.now();
-      if (now - lastDispatchTime.value >= ZOOM_DISPATCH_INTERVAL_MS) {
-        lastDispatchTime.value = now;
-        runOnJS(commitZoom)(newPPS);
-      }
-    })
-    .onEnd((event) => {
-      const basePPS = gestureBasePPS.value;
-      const minScale = MIN_PIXELS_PER_SECOND / basePPS;
-      const maxScale = MAX_PIXELS_PER_SECOND / basePPS;
-      const scale = clampWorklet(event.scale, minScale, maxScale);
-      const finalPPS = clampWorklet(
-        basePPS * scale,
-        MIN_PIXELS_PER_SECOND,
-        MAX_PIXELS_PER_SECOND,
-      );
-      pixelsPerSecondSV.value = finalPPS;
-      runOnJS(commitZoom)(finalPPS);
-      runOnJS(setIsPinching)(false);
+      const contentWidthNew = Math.max(timelineDurationSV.value * newPPS, 200);
+      const x = clampWorklet(pinchAnchorSV.value * newPPS, 0, contentWidthNew);
+      pinchTargetXSV.value = x;
+      scrollTo(scrollRef, x, 0, false);
+      scrollX.value = x;
+      pinchUpdatesSV.value += 1;
     })
     .onFinalize(() => {
+      // Runs for a finished pinch AND for a touch that never became one.
+      if (pinchActiveSV.value) {
+        pinchActiveSV.value = false;
+        const finalPPS = pixelsPerSecondSV.value;
+        runOnJS(commitZoom)(finalPPS);
+        runOnJS(setPinchZooming)(false);
+        runOnJS(logPinch)(
+          "end",
+          pinchAnchorSV.value,
+          gestureBasePPS.value,
+          finalPPS,
+          pinchUpdatesSV.value,
+          Date.now() - pinchStartMsSV.value,
+        );
+      }
+      isPinchingSV.value = false;
       runOnJS(setIsPinching)(false);
     });
 
+  const logButtonZoom = (
+    phase: "start" | "done",
+    fromPPS: number,
+    toPPS: number,
+    anchor: number,
+  ) => {
+    if (!__DEV__) return;
+    console.log(
+      phase === "start"
+        ? `[EditorTimeline] zoom button — animating ${fromPPS.toFixed(0)} → ${toPPS.toFixed(0)}px/s around playhead @ ${anchor.toFixed(2)}s`
+        : `[EditorTimeline] zoom button — done @ ${toPPS.toFixed(0)}px/s`,
+    );
+  };
+
+  // While a +/- zoom animates, keep the playhead's moment exactly under
+  // the playhead: every animation frame, scroll to anchor × current zoom.
+  // Runs on the UI thread, in the same frame as the zoom change itself.
+  useAnimatedReaction(
+    () => pixelsPerSecondSV.value,
+    (pps) => {
+      if (!zoomAnimatingSV.value) return;
+      const contentWidthNew = Math.max(timelineDurationSV.value * pps, 200);
+      const x = clampWorklet(zoomAnchorSV.value * pps, 0, contentWidthNew);
+      pinchTargetXSV.value = x;
+      scrollTo(scrollRef, x, 0, false);
+      scrollX.value = x;
+    },
+  );
+
+  // +/- buttons: a short, eased zoom animation centred on the playhead,
+  // same as a pinch — instead of jumping straight to the new zoom (React
+  // re-render first, scroll correction a frame later, which is what looked
+  // choppy). React is told the new zoom once, when the animation ends.
+  // Quick repeated taps stack: each tap zooms one more step from where the
+  // running animation is heading.
   const zoomWithButton = (direction: "in" | "out") => {
     if (__DEV__)
       console.log(
@@ -715,30 +1226,61 @@ export default function EditorTimeline({
 
     if (trackAreaWidth <= 0 || timelineDuration <= 0) return;
 
-    const oldPPS = pixelsPerSecond;
     const factor =
       direction === "in" ? BUTTON_ZOOM_FACTOR : 1 / BUTTON_ZOOM_FACTOR;
-    const newPPS = clampJS(
-      oldPPS * factor,
+    // Everything below runs on the UI thread. It has to: the scroll
+    // position (and so the playhead's moment) is written there by the
+    // scroll handler, and reading it from JS returned an OLD value — the
+    // first "+" after a scrub used to zoom around 0s instead of the
+    // playhead, then snap back.
+    runOnUI(startButtonZoom)(factor, direction);
+  };
+
+  const logZoomLimit = (direction: "in" | "out") => {
+    if (__DEV__)
+      console.log(
+        `[EditorTimeline] zoom button — already at ${direction === "in" ? "max" : "min"} zoom`,
+      );
+  };
+
+  const startButtonZoom = (factor: number, direction: "in" | "out") => {
+    "worklet";
+    const animating = zoomAnimatingSV.value;
+    const fromPPS = animating ? zoomTargetPPSSV.value : pixelsPerSecondSV.value;
+    const toPPS = clampWorklet(
+      fromPPS * factor,
       MIN_PIXELS_PER_SECOND,
       MAX_PIXELS_PER_SECOND,
     );
-    if (newPPS === oldPPS) return;
+    if (Math.abs(toPPS - fromPPS) < 0.001) {
+      runOnJS(logZoomLimit)(direction);
+      return;
+    }
 
-    const newTimelineX = currentTime * newPPS;
-    const newContentWidth = Math.max(timelineDuration * newPPS, 200);
-    const newTotalScrollWidth =
-      LEADING_WIDTH + newContentWidth + trackAreaWidth;
-    const maxScrollX = Math.max(0, newTotalScrollWidth - trackAreaWidth);
-    const targetScrollX = clampJS(newTimelineX, 0, maxScrollX);
+    if (!animating) {
+      // The moment under the playhead right now; it stays there.
+      zoomAnchorSV.value = currentAnchorTime();
+      pinchTargetXSV.value = scrollX.value;
+    }
+    zoomTargetPPSSV.value = toPPS;
+    zoomAnimatingSV.value = true;
+    runOnJS(logButtonZoom)("start", fromPPS, toPPS, zoomAnchorSV.value);
 
-    pixelsPerSecondSV.value = newPPS;
-    setPixelsPerSecond(newPPS);
-
-    requestAnimationFrame(() => {
-      scrollRef.current?.scrollTo({ x: targetScrollX, y: 0, animated: false });
-      scrollX.value = targetScrollX;
-    });
+    pixelsPerSecondSV.value = withTiming(
+      toPPS,
+      {
+        duration: BUTTON_ZOOM_DURATION_MS,
+        easing: Easing.out(Easing.cubic),
+      },
+      (finished) => {
+        // `finished` is false when a newer tap (or a pinch) took over —
+        // that one will commit instead.
+        if (!finished) return;
+        zoomAnimatingSV.value = false;
+        runOnJS(commitZoom)(toPPS);
+        runOnJS(logButtonZoom)("done", toPPS, toPPS, zoomAnchorSV.value);
+      },
+    );
   };
 
   const tracksBlockHeight = RULER_HEIGHT + TRACK_HEIGHT * 3 + TRACK_GAP * 3;
@@ -855,9 +1397,13 @@ export default function EditorTimeline({
     .onBegin(() => {
       trimDragBaseSV.value = trimStartSV.value;
       offsetDragBaseSV.value = offsetSV.value;
-      runOnJS(setTrimDragging)(true);
       runOnJS(markTrimTouch)(true);
       runOnJS(handleClipGestureStart)("trim");
+    })
+    .onStart(() => {
+      // Only lock the ScrollView once the handle is really being dragged
+      // (same reason as the clip move gesture's onStart).
+      runOnJS(setTrimDragging)(true);
     })
     .onUpdate((event) => {
       const next = clampWorklet(
@@ -887,9 +1433,11 @@ export default function EditorTimeline({
     .hitSlop({ left: 3, right: 16, top: 12, bottom: 12 })
     .onBegin(() => {
       trimDragBaseSV.value = trimEndSV.value;
-      runOnJS(setTrimDragging)(true);
       runOnJS(markTrimTouch)(true);
       runOnJS(handleClipGestureStart)("trim");
+    })
+    .onStart(() => {
+      runOnJS(setTrimDragging)(true);
     })
     .onUpdate((event) => {
       const next = clampWorklet(
@@ -963,11 +1511,17 @@ export default function EditorTimeline({
         // the drag can nudge it at all.
         isMovingSV.value = true;
         scrollLockXSV.value = scrollX.value;
-        runOnJS(setMoveDragging)(true);
+        // NOTE: `moveDragging` (which turns the ScrollView's scrolling OFF)
+        // is NOT set here any more. onBegin fires on every touch-down on a
+        // clip — including the start of a normal timeline scroll — and
+        // disabling the ScrollView there made it drop the scroll the user
+        // had just started ("stuck, doesn't move"). It's set in onStart
+        // below, once the long-press has really turned into a move.
       })
       .onStart(() => {
         // onStart = the long-press actually activated the move (onBegin
         // above fires on touch-down, even for a quick tap to select).
+        runOnJS(setMoveDragging)(true);
         runOnJS(handleClipGestureStart)("move");
       })
       .onUpdate((event) => {
@@ -1072,6 +1626,27 @@ export default function EditorTimeline({
     height: handleHeight,
   }));
 
+  // The full source video laid out behind each clip box (thumbnails /
+  // waveform), shifted left by the trim-in point. Driven by the UI-thread
+  // zoom so it keeps up with a pinch frame by frame.
+  const videoTrimStart = videoTrim.start;
+  const audioTrimStart = audioTrim.start;
+  const videoSourceWindowStyle = useAnimatedStyle(() => ({
+    left: -videoTrimStart * pixelsPerSecondSV.value,
+    width: Math.max(safeDuration * pixelsPerSecondSV.value, 200),
+  }));
+  const audioSourceWindowStyle = useAnimatedStyle(() => ({
+    left: -audioTrimStart * pixelsPerSecondSV.value,
+    width: Math.max(safeDuration * pixelsPerSecondSV.value, 200),
+  }));
+  // The waveform bars are built for the last zoom React knows about; during
+  // a pinch they're stretched to the live zoom (and rebuilt crisp once the
+  // fingers lift), instead of rebuilding hundreds of bars every frame.
+  const committedPPS = pixelsPerSecond;
+  const waveformStretchStyle = useAnimatedStyle(() => ({
+    transform: [{ scaleX: pixelsPerSecondSV.value / committedPPS }],
+  }));
+
   const outerRowStyle = useAnimatedStyle(() => ({
     width: totalScrollWidthSV.value,
   }));
@@ -1136,7 +1711,9 @@ export default function EditorTimeline({
                   showsHorizontalScrollIndicator={false}
                   scrollEventThrottle={16}
                   onScroll={scrollHandler}
-                  scrollEnabled={!trimDragging && !moveDragging}
+                  scrollEnabled={
+                    !trimDragging && !moveDragging && !pinchZooming
+                  }
                 >
                   <Pressable onPress={handleEmptyAreaPress}>
                     <Animated.View style={[styles.outerRow, outerRowStyle]}>
@@ -1198,9 +1775,7 @@ export default function EditorTimeline({
                           slotMarginTop={TRACK_GAP}
                           offsetSV={videoOffsetSV}
                           pixelsPerSecondSV={pixelsPerSecondSV}
-                          width={
-                            (videoTrim.end - videoTrim.start) * pixelsPerSecond
-                          }
+                          lengthSeconds={videoTrim.end - videoTrim.start}
                           selected={isVideoSelected}
                           backgroundColor={colors.background}
                           selectedBorderColor={colors.accentPurple}
@@ -1212,13 +1787,10 @@ export default function EditorTimeline({
                           movingSV={videoMovingSV}
                         >
                           {thumbnails.length > 0 && (
-                            <View
+                            <Animated.View
                               style={[
                                 styles.thumbLayer,
-                                {
-                                  left: -videoTrim.start * pixelsPerSecond,
-                                  width: contentWidth,
-                                },
+                                videoSourceWindowStyle,
                               ]}
                               pointerEvents="none"
                             >
@@ -1232,7 +1804,7 @@ export default function EditorTimeline({
                                   placeholderColor={colors.background}
                                 />
                               ))}
-                            </View>
+                            </Animated.View>
                           )}
                         </TimelineClipBox>
 
@@ -1241,9 +1813,7 @@ export default function EditorTimeline({
                           slotMarginTop={TRACK_GAP}
                           offsetSV={audioOffsetSV}
                           pixelsPerSecondSV={pixelsPerSecondSV}
-                          width={
-                            (audioTrim.end - audioTrim.start) * pixelsPerSecond
-                          }
+                          lengthSeconds={audioTrim.end - audioTrim.start}
                           selected={isAudioSelected}
                           backgroundColor={colors.background}
                           selectedBorderColor={colors.accentPurple}
@@ -1254,22 +1824,26 @@ export default function EditorTimeline({
                           moveGesture={audioMoveGesture}
                           movingSV={audioMovingSV}
                         >
-                          <View
+                          <Animated.View
                             style={[
                               styles.waveformWindow,
-                              {
-                                left: -audioTrim.start * pixelsPerSecond,
-                                width: contentWidth,
-                              },
+                              audioSourceWindowStyle,
                             ]}
                             pointerEvents="none"
                           >
-                            <WaveformBars
-                              color={colors.iconInactive}
-                              contentWidth={contentWidth}
-                              pixelsPerSecond={pixelsPerSecond}
-                            />
-                          </View>
+                            <Animated.View
+                              style={[
+                                styles.waveformStretch,
+                                waveformStretchStyle,
+                              ]}
+                            >
+                              <WaveformBars
+                                color={colors.iconInactive}
+                                contentWidth={contentWidth}
+                                pixelsPerSecond={pixelsPerSecond}
+                              />
+                            </Animated.View>
+                          </Animated.View>
                         </TimelineClipBox>
 
                         <Animated.View
@@ -1415,6 +1989,14 @@ const styles = StyleSheet.create({
     position: "absolute",
     top: 0,
     bottom: 0,
+  },
+  waveformStretch: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    transformOrigin: "left center",
   },
   waveformRow: {
     position: "absolute",
