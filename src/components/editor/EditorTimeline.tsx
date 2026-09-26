@@ -1,6 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Image,
   LayoutChangeEvent,
   Pressable,
@@ -133,6 +134,13 @@ interface EditorTimelineProps {
   onAddTextPress: () => void;
   /** The empty audio row was tapped: add music from the phone. */
   onAddAudioPress: () => void;
+  /** A picked song is being read: the "Add audio" row shows a spinner. */
+  addingAudio: boolean;
+  /**
+   * Clips to flash once ("it worked" feedback after an edit): bump `token`
+   * to flash the clips in `ids` again.
+   */
+  flash: { ids: string[]; token: number };
   /** The project's original video file (its audio clips say "Original audio"). */
   originalUri: string;
   onScrub: (time: number) => void;
@@ -452,6 +460,8 @@ export default function EditorTimeline({
   onSelectClip,
   onAddTextPress,
   onAddAudioPress,
+  addingAudio,
+  flash,
   originalUri,
   onScrub,
   onScrubStart,
@@ -1984,6 +1994,10 @@ export default function EditorTimeline({
                               labelText={clipLabel}
                               onPress={() => onSelectClip(clip.id)}
                               moveGesture={moveGestures[clip.id]}
+                              flashToken={
+                                flash.ids.includes(clip.id) ? flash.token : 0
+                              }
+                              flashColor={colors.accentPurple}
                             >
                               <ClipThumbnails
                                 clip={clip}
@@ -2003,6 +2017,7 @@ export default function EditorTimeline({
                           >
                             <TouchableOpacity
                               style={styles.trackRowTouchable}
+                              disabled={addingAudio}
                               onPress={() => {
                                 if (__DEV__)
                                   console.log(
@@ -2011,18 +2026,25 @@ export default function EditorTimeline({
                                 onAddAudioPress();
                               }}
                             >
-                              <Ionicons
-                                name="musical-notes-outline"
-                                size={16}
-                                color={colors.textMuted}
-                              />
+                              {addingAudio ? (
+                                <ActivityIndicator
+                                  size="small"
+                                  color={colors.accentPurple}
+                                />
+                              ) : (
+                                <Ionicons
+                                  name="musical-notes-outline"
+                                  size={16}
+                                  color={colors.textMuted}
+                                />
+                              )}
                               <AppText
                                 style={[
                                   styles.trackLabel,
                                   { color: colors.textMuted },
                                 ]}
                               >
-                                Add audio
+                                {addingAudio ? "Adding audio…" : "Add audio"}
                               </AppText>
                             </TouchableOpacity>
                           </Animated.View>
@@ -2045,6 +2067,10 @@ export default function EditorTimeline({
                                 labelText={audioClipLabel(clip, originalUri)}
                                 onPress={() => onSelectClip(clip.id)}
                                 moveGesture={moveGestures[clip.id]}
+                                flashToken={
+                                  flash.ids.includes(clip.id) ? flash.token : 0
+                                }
+                                flashColor={colors.accentPurple}
                               >
                                 <ClipWaveform
                                   clip={clip}

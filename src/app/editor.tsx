@@ -69,6 +69,15 @@ export default function EditorScreen() {
   const [comingSoonVisible, setComingSoonVisible] = useState(false);
   // The phone's file picker is open / the picked file is being read.
   const addingAudioRef = useRef(false);
+  // A picked song is being read (spinner on "Add audio" + the Music tool).
+  const [addingAudio, setAddingAudio] = useState(false);
+  // "It worked" flash on the clips an edit just made or changed.
+  const [flash, setFlash] = useState<{ ids: string[]; token: number }>({
+    ids: [],
+    token: 0,
+  });
+  const flashClips = (ids: string[]) =>
+    setFlash((f) => ({ ids, token: f.token + 1 }));
   const [isPlaying, setIsPlaying] = useState(false);
   // True while the user is dragging/flinging the timeline. The audio
   // player's seeks are held back during this (see useTrackTimelineSync's
@@ -442,6 +451,16 @@ export default function EditorScreen() {
       setIsScrubbing(false);
     }
 
+    // Play = watching, not editing: drop the clip selection (the toolbar
+    // goes back to the project tools, trim handles disappear).
+    if (selectedClip) {
+      if (__DEV__)
+        console.log(
+          `[editor] play pressed — deselecting ${selectedClip.track} (${selectedClip.id})`,
+        );
+      setSelectedClipId(null);
+    }
+
     setIsPlaying(true);
   };
 
@@ -540,6 +559,8 @@ export default function EditorScreen() {
       { type: "UNLINK_CLIP", clipId: selectedClip.id },
       `unlock ${selectedClip.track}`,
     );
+    // Both clips flash: they're now separate.
+    flashClips([selectedClip.id, selectedPartner.id]);
   };
 
   // Split the selected clip at the playhead. Locked: its partner is cut at
@@ -565,10 +586,23 @@ export default function EditorScreen() {
       console.log(
         `[editor] split ${selectedClip.id}${selectedPartner ? ` + locked ${selectedPartner.id}` : " (unlocked, alone)"} @ ${at.toFixed(2)}s`,
       );
-    commitProject(
-      splitClipAction(selectedClip.id, at),
+    const action = splitClipAction(selectedClip.id, at);
+    const next = commitProject(
+      action,
       `split ${selectedClip.track}${selectedPartner ? ", locked" : ""}`,
     );
+    if (next !== project && action.type === "SPLIT_CLIP") {
+      flashClips(
+        selectedPartner
+          ? [
+              selectedClip.id,
+              action.rightId,
+              selectedPartner.id,
+              action.partnerRightId,
+            ]
+          : [selectedClip.id, action.rightId],
+      );
+    }
   };
 
   // Delete the selected clip — and its locked partner (the reducer does
@@ -633,6 +667,7 @@ export default function EditorScreen() {
         console.log(
           `[editor] add audio — picked ${asset.name} (${asset.mimeType ?? "unknown type"})`,
         );
+      setAddingAudio(true);
       const duration = await probeDuration(asset.uri);
       if (duration <= 0) {
         Alert.alert(
@@ -642,10 +677,9 @@ export default function EditorScreen() {
         return;
       }
       const title = asset.name.replace(/\.[^.]+$/, "") || "Music";
-      const next = commitProject(
-        addAudioClipAction(asset.uri, duration, title, at),
-        "add audio",
-      );
+      const addAction = addAudioClipAction(asset.uri, duration, title, at);
+      const next = commitProject(addAction, "add audio");
+      if (addAction.type === "ADD_CLIP") flashClips([addAction.clip.id]);
       if (__DEV__) {
         const added = next.tracks.audio.find(
           (c) => c.sourceUri === asset.uri && !findClip(project, c.id),
@@ -662,6 +696,7 @@ export default function EditorScreen() {
       );
     } finally {
       addingAudioRef.current = false;
+      setAddingAudio(false);
     }
   };
 
@@ -867,6 +902,16 @@ export default function EditorScreen() {
           onUnlock={handleUnlock}
           onSplit={handleSplit}
           onDelete={handleDelete}
+          busyToolKey={addingAudio ? "music" : null}
+          onEditStart={(key) => {
+            // Freeze playback at the tap; the edit lands there after the
+            // button's short spinner.
+            if (isPlaying) {
+              const at = playhead.uiTimeSV.get();
+              pauseForGesture(key);
+              seekTo(at);
+            }
+          }}
           onToolPress={handleComingSoonTool}
         />
 
@@ -886,6 +931,8 @@ export default function EditorScreen() {
               onSelectClip={handleSelectClip}
               onAddTextPress={() => setComingSoonVisible(true)}
               onAddAudioPress={() => void handleAddAudio("empty audio row")}
+              addingAudio={addingAudio}
+              flash={flash}
               originalUri={videoUri ?? ""}
               onScrub={handleScrub}
               onScrubStart={handleScrubStart}

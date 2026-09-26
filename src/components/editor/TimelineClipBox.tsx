@@ -18,6 +18,10 @@ const HOLD_OPACITY = 0.6;
 // When a clip's committed position changes (dropped, pushed aside by a
 // drop, trimmed at the start), it slides to the new spot over this long.
 const SETTLE_DURATION_MS = 160;
+// "It worked" flash after an edit (split halves, added music, unlocked
+// pair): the box lights up in the accent colour and fades out.
+const FLASH_OPACITY = 0.45;
+const FLASH_DURATION_MS = 500;
 
 /**
  * Live move state shared by every clip box on the timeline. EditorTimeline
@@ -64,6 +68,12 @@ interface TimelineClipBoxProps {
   // through to the label's TouchableOpacity below (selection), since the
   // pan only activates after the hold delay set on the gesture itself.
   moveGesture?: GestureType;
+  /**
+   * Bump to flash this box once (see FLASH_DURATION_MS). 0 = never flashed.
+   * The editor bumps it for the clips an edit just made or changed.
+   */
+  flashToken?: number;
+  flashColor?: string;
   children?: ReactNode;
 }
 
@@ -82,8 +92,18 @@ export default function TimelineClipBox({
   labelText,
   onPress,
   moveGesture,
+  flashToken = 0,
+  flashColor = "#FFFFFF",
   children,
 }: TimelineClipBoxProps) {
+  const flashSV = useSharedValue(0);
+  useEffect(() => {
+    if (flashToken <= 0) return;
+    flashSV.set(FLASH_OPACITY);
+    flashSV.set(withTiming(0, { duration: FLASH_DURATION_MS }));
+  }, [flashToken, flashSV]);
+  const flashStyle = useAnimatedStyle(() => ({ opacity: flashSV.value }));
+
   // The committed start, mirrored to the UI thread, sliding to each new
   // value. This effect runs before EditorTimeline's (children first), so
   // when a dropped clip's new start arrives, the slide begins from where
@@ -140,6 +160,15 @@ export default function TimelineClipBox({
       ]}
     >
       {children}
+
+      <Animated.View
+        pointerEvents="none"
+        style={[
+          StyleSheet.absoluteFill,
+          { backgroundColor: flashColor },
+          flashStyle,
+        ]}
+      />
 
       <TouchableOpacity
         activeOpacity={0.8}

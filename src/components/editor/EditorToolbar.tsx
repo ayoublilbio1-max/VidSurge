@@ -1,6 +1,8 @@
 import { Ionicons } from "@expo/vector-icons";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  ActivityIndicator,
+  Pressable,
   ScrollView,
   StyleSheet,
   TouchableOpacity,
@@ -29,6 +31,16 @@ export interface EditorTool {
 export type LockMode = "none" | "locked" | "unlocked";
 
 const DISABLED_OPACITY = 0.4;
+// Split / Delete: the tapped button shows a spinner for this long, then the
+// edit is applied (the edit itself is instant — this is a short, deliberate
+// "working" moment so the tap reads as an action). Tune here; 0 = off.
+const EDIT_SPINNER_MS = 350;
+// What a busy tool says under its spinner.
+const BUSY_LABEL: Record<string, string> = {
+  split: "Splitting…",
+  delete: "Deleting…",
+  music: "Adding…",
+};
 
 // Selection-based toolbar (CapCut style).
 // Nothing selected → project tools (things you ADD to the project).
@@ -97,6 +109,16 @@ interface EditorToolbarProps {
   onUnlock: () => void;
   onSplit: () => void;
   onDelete: () => void;
+  /**
+   * A tool whose work is still running (e.g. "music" while a picked song is
+   * being read): it shows a spinner and can't be tapped again.
+   */
+  busyToolKey?: string | null;
+  /**
+   * Split / Delete tapped (before the spinner): lets the editor pause right
+   * away, so the edit happens where the playhead was at the tap.
+   */
+  onEditStart?: (key: string) => void;
   /** Any other tool (the ones not built yet). */
   onToolPress: (key: string) => void;
 }
@@ -110,6 +132,8 @@ export default function EditorToolbar({
   onSplit,
   onDelete,
   onToolPress,
+  busyToolKey = null,
+  onEditStart,
 }: EditorToolbarProps) {
   const colors = useTheme();
   const lockActive = lockMode === "locked";
@@ -136,13 +160,35 @@ export default function EditorToolbar({
     if (lockActive) onUnlock();
   };
 
+  // The Split / Delete button currently showing its spinner.
+  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (pendingTimerRef.current) clearTimeout(pendingTimerRef.current);
+    },
+    [],
+  );
+  // Spinner on `key` for EDIT_SPINNER_MS, then run the edit.
+  const runWithSpinner = (key: string, edit: () => void) => {
+    if (pendingKey) return; // one at a time
+    onEditStart?.(key);
+    setPendingKey(key);
+    pendingTimerRef.current = setTimeout(() => {
+      pendingTimerRef.current = null;
+      if (__DEV__) console.log(`[EditorToolbar] ${key} — applying`);
+      edit();
+      setPendingKey(null);
+    }, EDIT_SPINNER_MS);
+  };
+
   const handleToolPress = (key: string) => {
     if (key === "split") {
       if (__DEV__)
         console.log(
           `[EditorToolbar] split pressed${splitEnabled ? "" : " — disabled (playhead not inside the selected clip)"}`,
         );
-      if (splitEnabled) onSplit();
+      if (splitEnabled) runWithSpinner("split", onSplit);
       return;
     }
     if (key === "delete") {
@@ -150,7 +196,7 @@ export default function EditorToolbar({
         console.log(
           `[EditorToolbar] delete pressed${deleteEnabled ? "" : " — disabled (it's the last clip in the project)"}`,
         );
-      if (deleteEnabled) onDelete();
+      if (deleteEnabled) runWithSpinner("delete", onDelete);
       return;
     }
     if (__DEV__) console.log(`[EditorToolbar] ${key} pressed (coming soon)`);
@@ -214,28 +260,60 @@ export default function EditorToolbar({
       )}
 
       {tools.map((tool) => {
+        const busy = busyToolKey === tool.key || pendingKey === tool.key;
         const disabled =
+          busy ||
+          pendingKey !== null ||
           (tool.key === "split" && !splitEnabled) ||
           (tool.key === "delete" && !deleteEnabled);
         return (
-          <TouchableOpacity
+          // Pressed look: the icon tile turns accent-coloured and shrinks a
+          // little while the finger is down, so a tap always visibly
+          // registers — edits themselves are instant (no spinner needed).
+          <Pressable
             key={tool.key}
-            style={[styles.item, disabled && { opacity: DISABLED_OPACITY }]}
+            style={[
+              styles.item,
+              disabled && !busy && { opacity: DISABLED_OPACITY },
+            ]}
             onPress={() => handleToolPress(tool.key)}
             disabled={disabled}
             accessibilityRole="button"
-            accessibilityState={{ disabled }}
-            accessibilityLabel={tool.label}
+            accessibilityState={{ disabled, busy }}
+            accessibilityLabel={busy ? `${tool.label} (working)` : tool.label}
           >
-            <View
-              style={[styles.iconWrap, { backgroundColor: colors.surface }]}
-            >
-              <Ionicons name={tool.icon} size={20} color={colors.textPrimary} />
-            </View>
-            <AppText style={[styles.label, { color: colors.textMuted }]}>
-              {tool.label}
-            </AppText>
-          </TouchableOpacity>
+            {({ pressed }: { pressed: boolean }) => (
+              <>
+                <View
+                  style={[
+                    styles.iconWrap,
+                    {
+                      backgroundColor: pressed
+                        ? colors.accentPurple
+                        : colors.surface,
+                    },
+                    pressed && styles.iconWrapPressed,
+                  ]}
+                >
+                  {busy ? (
+                    <ActivityIndicator
+                      size="small"
+                      color={colors.accentPurple}
+                    />
+                  ) : (
+                    <Ionicons
+                      name={tool.icon}
+                      size={20}
+                      color={pressed ? "#FFFFFF" : colors.textPrimary}
+                    />
+                  )}
+                </View>
+                <AppText style={[styles.label, { color: colors.textMuted }]}>
+                  {busy ? (BUSY_LABEL[tool.key] ?? tool.label) : tool.label}
+                </AppText>
+              </>
+            )}
+          </Pressable>
         );
       })}
     </ScrollView>
@@ -252,5 +330,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+  iconWrapPressed: { transform: [{ scale: 0.92 }] },
   label: { fontSize: 10, textAlign: "center" },
 });
