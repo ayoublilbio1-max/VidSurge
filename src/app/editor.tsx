@@ -12,10 +12,7 @@ import {
 } from "react-native";
 import ComingSoonModal from "../components/ComingSoonModal";
 import EditorScreenSkeleton from "../components/EditorScreenSkeleton";
-import EditorTimeline, {
-  type ClipSelection,
-  type TrimRange,
-} from "../components/editor/EditorTimeline";
+import EditorTimeline from "../components/editor/EditorTimeline";
 import EditorToolbar, {
   type LockMode,
 } from "../components/editor/EditorToolbar";
@@ -28,6 +25,7 @@ import {
   findLinkedPartner,
   projectEnd,
   type Clip,
+  type ClipRange,
   type Project,
 } from "../editor/clipModel";
 import {
@@ -42,18 +40,8 @@ import { useTrackTimelineSync } from "../hooks/useTrackTimelineSync";
 const THUMBNAIL_COUNT = 20;
 const THUMBNAIL_CONCURRENCY = 3;
 
-const ZERO_TRIM: TrimRange = { start: 0, end: 0 };
-
 function clampJS(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(value, max));
-}
-
-// Step 1a bridge: EditorTimeline and the sync hooks still take one
-// trim range + offset per track. These turn a clip back into that shape.
-// (Speed is always 1 until the speed tool exists, so trim length and
-// timeline length are the same number here. 1b removes this bridge.)
-function clipTrim(clip: Clip | null): TrimRange {
-  return clip ? { start: clip.trimIn, end: clip.trimOut } : ZERO_TRIM;
 }
 
 function summarizeProject(project: Project): string {
@@ -81,11 +69,10 @@ export default function EditorScreen() {
   // The whole edit: a list of clips per track (see src/editor/clipModel.ts).
   // Every change goes through projectReducer as one action.
   const [project, dispatchProject] = useReducer(projectReducer, EMPTY_PROJECT);
-  // Selection is a clip id now. The timeline still thinks in "video" /
-  // "audio" until 1b, so `selection` below is derived from it.
+  // The selected clip's id (null = nothing selected).
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
-  // Lock is NOT editor state any more: it lives in the clips (a shared
-  // linkId = locked). See `audioLocked` / `lockMode` below.
+  // Lock is NOT editor state: it lives in the clips (a shared linkId =
+  // locked). See `lockMode` below.
 
   // Runs an action: computes the result first (the reducer is pure, so this
   // is the same result dispatch will produce), logs it, dispatches it, and
@@ -103,8 +90,7 @@ export default function EditorScreen() {
     return next;
   };
 
-  // Full model dump whenever it changes — easy to compare with the old
-  // trim/offset logs while testing 1a.
+  // Full model dump whenever it changes.
   useEffect(() => {
     if (__DEV__) console.log(`[project] now: ${summarizeProject(project)}`);
   }, [project]);
@@ -124,7 +110,7 @@ export default function EditorScreen() {
   // A second, audio-only instance of the same source file. No <VideoView>
   // is mounted for this one — expo-video is able to decode/play just the
   // audio track with no view attached. It is synced independently, off
-  // its own `audioOffset` / `audioTrim`.
+  // the audio track's own clips.
   const audioPlayer = useVideoPlayer(videoUri ?? "", (p) => {
     p.loop = false;
     p.timeUpdateEventInterval = 0.2;
@@ -191,23 +177,14 @@ export default function EditorScreen() {
     generate();
   }, [videoUri, duration]);
 
-  // ---- Clips → the per-track values the timeline/hooks use (1a) --------
-  // One clip per track until Split exists (step 2). 1b makes the timeline,
-  // clock and sync work on the full clip lists instead.
-  const videoClip = project.tracks.video[0] ?? null;
-  const audioClip = project.tracks.audio[0] ?? null;
+  // ---- Clips on each track -------------------------------------------
+  const videoClips = project.tracks.video;
+  const audioClips = project.tracks.audio;
 
-  const videoTrim = clipTrim(videoClip);
-  const audioTrim = clipTrim(audioClip);
-  const videoOffset = videoClip?.start ?? 0;
-  const audioOffset = audioClip?.start ?? 0;
-
-  const videoClipStart = videoOffset;
-  const videoClipEnd = videoClip ? clipEnd(videoClip) : 0;
-  const audioClipStart = audioOffset;
-  const audioClipEnd = audioClip ? clipEnd(audioClip) : 0;
-
-  const timelineDuration = Math.max(duration, projectEnd(project));
+  // The timeline ends where the last clip ends (after trimming everything
+  // shorter, playback stops there instead of running on through black to
+  // the original video's length).
+  const timelineDuration = projectEnd(project);
 
   const selectedClip = selectedClipId
     ? findClip(project, selectedClipId)
@@ -215,20 +192,6 @@ export default function EditorScreen() {
   const selectedPartner = selectedClip
     ? findLinkedPartner(project, selectedClip)
     : null;
-  const selection: ClipSelection =
-    selectedClip?.track === "video"
-      ? "video"
-      : selectedClip?.track === "audio"
-        ? "audio"
-        : null;
-
-  // Whether the video and audio clips are still locked together. The
-  // timeline uses this to highlight/trim/move them as one (1a bridge).
-  const audioLocked =
-    videoClip !== null &&
-    audioClip !== null &&
-    videoClip.linkId !== null &&
-    videoClip.linkId === audioClip.linkId;
 
   // Lock button: only usable when the selected clip is locked to a partner
   // (tap = unlock, one-way). Greyed out when nothing is selected or the
@@ -240,39 +203,39 @@ export default function EditorScreen() {
       : "unlocked";
 
   // ---- Shared clock + per-track sync ----------------------------------
+  // One clock entry per clip. Each track's single player serves all of
+  // that track's clips (the sync hook seeks it into whichever clip is under
+  // the playhead), so every entry on a track reads the same player.
+  const clockEntries = (
+    clips: Clip[],
+    p: typeof player,
+    priority: number,
+  ): ClockTrack[] =>
+    clips.map((clip) => ({
+      label: clip.id,
+      trackKey: clip.track,
+      clipStart: clip.start,
+      clipEnd: clipEnd(clip),
+      trimStart: clip.trimIn,
+      speed: clip.speed,
+      priority,
+      getCurrentTime: () => p.currentTime,
+      // Used when a player is stuck (ground truth, ~1.2s) or has drifted
+      // away from the playhead (the other tracks).
+      resyncTo: (sourceTime) => {
+        if (__DEV__)
+          console.log(
+            `[editor] clock pulled ${clip.track} player (${clip.id}) to ${sourceTime.toFixed(2)}s`,
+          );
+        p.currentTime = sourceTime;
+      },
+      pause: () => p.pause(),
+      play: () => p.play(),
+    }));
+  // Video first (priority 0): the picture is what the playhead follows.
   const clockTracks: ClockTrack[] = [
-    {
-      label: "video",
-      clipStart: videoClipStart,
-      clipEnd: videoClipEnd,
-      trimStart: videoTrim.start,
-      priority: 0,
-      getCurrentTime: () => player.currentTime,
-      // Last-resort only: the clock calls this if the video player is stuck
-      // on a wrong position for more than ~1.2s.
-      resyncTo: (sourceTime) => {
-        if (__DEV__)
-          console.log(
-            `[editor] clock pulled video player to ${sourceTime.toFixed(2)}s`,
-          );
-        player.currentTime = sourceTime;
-      },
-    },
-    {
-      label: "audio",
-      clipStart: audioClipStart,
-      clipEnd: audioClipEnd,
-      trimStart: audioTrim.start,
-      priority: 1,
-      getCurrentTime: () => audioPlayer.currentTime,
-      resyncTo: (sourceTime) => {
-        if (__DEV__)
-          console.log(
-            `[editor] clock pulled audio player to ${sourceTime.toFixed(2)}s`,
-          );
-        audioPlayer.currentTime = sourceTime;
-      },
-    },
+    ...clockEntries(videoClips, player, 0),
+    ...clockEntries(audioClips, audioPlayer, 1),
   ];
 
   const { timelineTime, seekVersion, seekTo, playhead, halt } =
@@ -293,10 +256,7 @@ export default function EditorScreen() {
     isPlaying,
     timelineTime,
     seekVersion,
-    clipStart: videoClipStart,
-    clipEnd: videoClipEnd,
-    trimStart: videoTrim.start,
-    trimEnd: videoTrim.end,
+    clips: videoClips,
   });
 
   useTrackTimelineSync({
@@ -305,16 +265,18 @@ export default function EditorScreen() {
     isPlaying,
     timelineTime,
     seekVersion,
-    clipStart: audioClipStart,
-    clipEnd: audioClipEnd,
-    trimStart: audioTrim.start,
-    trimEnd: audioTrim.end,
+    clips: audioClips,
     holdSeeks: isScrubbing,
   });
 
-  const isVoidNow =
-    timelineTime < videoClipStart - 0.001 ||
-    timelineTime > videoClipEnd + 0.001;
+  // Black preview when no video clip is under the playhead. Clip ends count
+  // as covered (inclusive), so pausing exactly on the last frame of the
+  // timeline still shows it instead of going black.
+  const isVoidNow = !videoClips.some(
+    (clip) =>
+      timelineTime >= clip.start - 0.001 &&
+      timelineTime <= clipEnd(clip) + 0.001,
+  );
 
   // ---- Transport handlers (thin — the hooks above react to the state
   // changes these make, so there's no manual player.play()/currentTime
@@ -382,23 +344,23 @@ export default function EditorScreen() {
   const handlePinchZoomStart = () => pauseForGesture("pinch zoom");
 
   // Tapping a clip: selects it, or deselects if it's already selected.
-  // Locked: video+audio act as one, so tapping EITHER while they're
-  // selected deselects both. Unlocked: tapping the other clip switches the
-  // selection to it. Either way, a tap on a clip means "I'm editing now",
-  // so playback pauses first.
-  const handleSelectClip = (clip: "video" | "audio") => {
-    pauseForGesture(`${clip} clip tap`);
-    const target = clip === "video" ? videoClip : audioClip;
+  // A locked pair acts as one, so tapping EITHER clip of a selected pair
+  // deselects both. Otherwise tapping another clip switches the selection
+  // to it. Either way, a tap on a clip means "I'm editing now", so playback
+  // pauses first.
+  const handleSelectClip = (clipId: string) => {
+    const target = findClip(project, clipId);
+    pauseForGesture(`${target?.track ?? "clip"} clip tap`);
     if (!target) return;
-    // Locked: the tapped clip and its linked partner count as one.
     const alreadySelected =
       selectedClipId === target.id || selectedPartner?.id === target.id;
     if (alreadySelected) {
-      if (__DEV__) console.log(`[editor] ${clip} tapped again — deselecting`);
+      if (__DEV__)
+        console.log(`[editor] ${target.track} tapped again — deselecting`);
       setSelectedClipId(null);
       return;
     }
-    if (__DEV__) console.log(`[editor] select ${clip} (${target.id})`);
+    if (__DEV__) console.log(`[editor] select ${target.track} (${target.id})`);
     setSelectedClipId(target.id);
   };
 
@@ -407,9 +369,11 @@ export default function EditorScreen() {
   // take the tap first and never reach this — the selection survives them,
   // which tools like Split/Delete will need.
   const clearSelection = (reason: string) => {
-    if (selection === null) return;
+    if (selectedClip === null) return;
     if (__DEV__)
-      console.log(`[editor] ${reason} tapped — deselecting ${selection}`);
+      console.log(
+        `[editor] ${reason} tapped — deselecting ${selectedClip.track} (${selectedClip.id})`,
+      );
     setSelectedClipId(null);
   };
 
@@ -431,50 +395,41 @@ export default function EditorScreen() {
       );
     commitProject(
       { type: "UNLINK_CLIP", clipId: selectedClip.id },
-      `unlock ${selection}`,
+      `unlock ${selectedClip.track}`,
     );
   };
 
-  const handleClipChange = (
-    which: "video" | "audio",
-    update: { trim: TrimRange; offset: number },
-  ) => {
-    const clip = which === "video" ? videoClip : audioClip;
+  // A trim or move committed on the timeline (finger lifted).
+  const handleClipChange = (clipId: string, range: ClipRange) => {
+    const clip = findClip(project, clipId);
     if (!clip) return;
     const trimChanged =
-      update.trim.start !== clip.trimIn || update.trim.end !== clip.trimOut;
+      range.trimIn !== clip.trimIn || range.trimOut !== clip.trimOut;
+    const kind = `${clip.track} ${trimChanged ? "trim" : "move"}`;
+    const locked = findLinkedPartner(project, clip) !== null;
 
     // One action for the whole edit. If the clip is locked to a partner,
     // the reducer applies the same range to it (video + audio cut and move
     // together).
     const nextProject = commitProject(
-      {
-        type: "UPDATE_CLIP_RANGE",
-        clipId: clip.id,
-        range: {
-          start: update.offset,
-          trimIn: update.trim.start,
-          trimOut: update.trim.end,
-        },
-      },
-      `${which} ${trimChanged ? "trim" : "move"}${audioLocked ? ", locked" : ""}`,
+      { type: "UPDATE_CLIP_RANGE", clipId, range },
+      `${kind}${locked ? ", locked" : ""}`,
     );
 
-    // The playhead STAYS where it is after a trim or move (it used to jump
-    // to the start of the trimmed clip whenever it ended up outside it). If
-    // the cut leaves it over empty space, the preview just shows the gap,
-    // like any other gap. The only time it has to move: the timeline got
-    // shorter than where the playhead sits.
-    const nextTimelineDuration = Math.max(duration, projectEnd(nextProject));
+    // The playhead STAYS where it is after a trim or move. If the edit
+    // leaves it over empty space, the preview just shows the gap, like any
+    // other gap. The only time it has to move: the timeline got shorter
+    // than where the playhead sits.
+    const nextTimelineDuration = projectEnd(nextProject);
     if (timelineTime > nextTimelineDuration) {
       if (__DEV__)
         console.log(
-          `[editor] ${which} ${trimChanged ? "trim" : "move"} — timeline now ${nextTimelineDuration.toFixed(2)}s, playhead ${timelineTime.toFixed(2)}s was past the end → moved to end`,
+          `[editor] ${kind} — timeline now ${nextTimelineDuration.toFixed(2)}s, playhead ${timelineTime.toFixed(2)}s was past the end → moved to end`,
         );
       seekTo(nextTimelineDuration);
     } else if (__DEV__) {
       console.log(
-        `[editor] ${which} ${trimChanged ? "trim" : "move"} — playhead stays @ ${timelineTime.toFixed(2)}s`,
+        `[editor] ${kind} — playhead stays @ ${timelineTime.toFixed(2)}s`,
       );
     }
   };
@@ -574,14 +529,11 @@ export default function EditorScreen() {
               currentTime={timelineTime}
               isPlaying={isPlaying}
               playhead={playhead}
-              duration={duration}
+              timelineDuration={timelineDuration}
               thumbnails={thumbnails}
-              selection={selection}
-              audioLocked={audioLocked}
-              videoTrim={videoTrim}
-              audioTrim={audioTrim}
-              videoOffset={videoOffset}
-              audioOffset={audioOffset}
+              videoClips={videoClips}
+              audioClips={audioClips}
+              selectedClipId={selectedClip?.id ?? null}
               onMutePress={() => setComingSoonVisible(true)}
               onSelectClip={handleSelectClip}
               onAddTextPress={() => setComingSoonVisible(true)}

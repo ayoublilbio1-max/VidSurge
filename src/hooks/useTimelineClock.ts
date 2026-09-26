@@ -23,11 +23,22 @@ const MAX_HOLD_MS = 1200;
 const MAX_WALL_CLOCK_STEP = 0.25;
 // While playing, React state (`timelineTime`) is only committed this often
 // (plus immediately whenever the playhead crosses a clip edge, so players
-// still start/stop exactly on time). The smooth visual movement of the
-// timeline no longer depends on React at all — it runs on the UI thread
-// from `playhead` below — so re-rendering the whole editor 60x/s was pure
-// waste and was what made playback choppy.
-const JS_COMMIT_INTERVAL_MS = 50;
+// still start/stop on time). The smooth visual movement of the timeline
+// doesn't depend on React at all — it runs on the UI thread from
+// `playhead` below — and every commit re-renders the whole editor. At 50ms
+// the dev build only managed ~9 clock frames/s; fewer commits leave the JS
+// thread free for the clock loop, which makes clip edges more precise.
+const JS_COMMIT_INTERVAL_MS = 200;
+// A clip's player is paused by the clock itself when the playhead reaches
+// the clip's end, instead of waiting for React to re-render and the track
+// sync to notice (that came ~0.2s late, so you heard audio from past the
+// trim point). When a clip end is less than this far ahead, a timer is set
+// to pause the player right at the end.
+const END_PAUSE_LOOKAHEAD = 0.4;
+// A clip whose end touches the next clip on the same track (a split point)
+// is NOT paused at its end — the same player carries straight on into the
+// next clip, and the track sync seeks it there.
+const CONTINUOUS_EPSILON = 0.02;
 // When playback is paused, the playhead the user SEES (drawn by the UI
 // thread, which predicts between the decoder's coarse time reports) is
 // usually a little ahead of the clock's last decoder report — up to ~0.2s.
@@ -36,6 +47,29 @@ const JS_COMMIT_INTERVAL_MS = 50;
 // by no more than this, the pause keeps the drawn position instead, and the
 // players are seeked there so the preview frame matches it.
 const PAUSE_ALIGN_MAX_AHEAD = 0.4;
+// Drift correction for the OTHER playing tracks (not the one the playhead
+// follows). If one stays off by more than DRIFT_MAX for DRIFT_GRACE_MS, it
+// is seeked back in line, at most once per DRIFT_COOLDOWN_MS per track.
+const DRIFT_MAX = 0.25;
+const DRIFT_GRACE_MS = 1000;
+const DRIFT_COOLDOWN_MS = 2500;
+// A moving player up to this far BEHIND the playhead is still followed (the
+// playhead just doesn't move back for it).
+const FOLLOW_BEHIND = 0.15;
+// Early start: when a clip is this close (timeline seconds) and its track's
+// player is free, the player is started ahead of the clip by its start-up
+// time, so it's already running when the playhead gets there.
+const PRESTART_WINDOW = 1.0;
+// Starting guesses for a player's start-up time after play(), per track.
+// Each early start measures the real value and updates it (kept between
+// plays): video decoders need noticeably longer than audio.
+const DEFAULT_START_LATENCY: Record<string, number> = {
+  video: 0.35,
+  audio: 0.12,
+  other: 0.25,
+};
+const LATENCY_MIN = 0.05;
+const LATENCY_MAX = 0.8;
 
 /**
  * Shared values the UI thread reads every frame to move the timeline
@@ -57,14 +91,26 @@ export type PlayheadSync = {
   uiTimeSV: SharedValue<number>;
 };
 
+/**
+ * One entry per CLIP (not per track): a track with three clips gives three
+ * entries. Only the entry whose clip is under the playhead matters at any
+ * moment; its player is the one the track sync has seeked into that clip.
+ */
 export type ClockTrack = {
-  /** Just for debug logs, e.g. "video" / "audio". */
+  /** Just for debug logs, e.g. "video:<clip id>". Unique per entry. */
   label: string;
-  /** Where this track's clip starts/ends on the shared timeline (seconds). */
+  /**
+   * Which track (player) this clip belongs to, e.g. "video" / "audio".
+   * Entries with the same key share one player.
+   */
+  trackKey: string;
+  /** Where this clip starts/ends on the shared timeline (seconds). */
   clipStart: number;
   clipEnd: number;
-  /** The trim-in point inside the *source* file for this track. */
+  /** The clip's trim-in point inside its *source* file. */
   trimStart: number;
+  /** Clip playback speed (1 = normal). Source seconds per timeline second. */
+  speed: number;
   /**
    * Lower number = preferred as "ground truth" when more than one track
    * covers the current playhead position. Video should be 0 (visual sync
@@ -74,17 +120,36 @@ export type ClockTrack = {
   /** Returns this track's player's current decoded position (seconds). */
   getCurrentTime: () => number;
   /**
-   * Moves this track's player to a source-file position. Only used as a
-   * last resort, for a player that is stuck on a wrong position for more
-   * than MAX_HOLD_MS.
+   * Moves this track's player to a source-file position. Used as a last
+   * resort for a stuck ground-truth player (MAX_HOLD_MS), and for drift
+   * correction of the other playing tracks (DRIFT_*).
    */
   resyncTo: (sourceTime: number) => void;
+  /**
+   * Pauses / starts this clip's player. Used at the clip's end (see
+   * END_PAUSE_*), for the early start (PRESTART_WINDOW), and to kick a
+   * player that never started.
+   */
+  pause: () => void;
+  play: () => void;
 };
+
+/** Decoder position → timeline time, for this clip. */
+function decoderToTimeline(t: ClockTrack, decoderTime: number): number {
+  const speed = t.speed > 0 ? t.speed : 1;
+  return t.clipStart + (decoderTime - t.trimStart) / speed;
+}
+
+/** Timeline time → the source position this clip should be at. */
+function timelineToDecoder(t: ClockTrack, timelineTime: number): number {
+  const speed = t.speed > 0 ? t.speed : 1;
+  return t.trimStart + (timelineTime - t.clipStart) * speed;
+}
 
 type UseTimelineClockParams = {
   isPlaying: boolean;
   timelineDuration: number;
-  /** Video + audio track descriptors. Safe to pass a new array every render. */
+  /** One entry per clip (all tracks). Safe to pass a new array every render. */
   tracks: ClockTrack[];
   /** Called once when the playhead reaches the end of the whole timeline. */
   onReachEnd: () => void;
@@ -94,18 +159,18 @@ type UseTimelineClockParams = {
  * Master clock for the editor's shared playhead (`timelineTime`).
  *
  * While playing, runs one requestAnimationFrame loop. Each frame:
- *   - Outside any clip (a gap), time advances by wall clock.
- *   - Inside a clip, the playhead FOLLOWS that clip's decoder (video
- *     preferred over audio) whenever the decoder is at or slightly ahead
- *     of the playhead.
- *   - If the decoder is BEHIND (still starting up after play()), or far
- *     away (still on an old position after a seek), the playhead HOLDS —
- *     it doesn't move — until the decoder catches up. So the playhead never
- *     jumps backwards and never runs ahead of the picture, the same way
- *     InShot waits for the video to start.
- *   - If a decoder is still wrong after MAX_HOLD_MS, the player is pulled
- *     to the playhead once. If that still doesn't help, the playhead
- *     follows the decoder so everything lines up again.
+ *   - The playhead FOLLOWS a player: the highest-priority clip under the
+ *     playhead (video first) whose player is moving and in step. Outside
+ *     any clip (a gap), or while no player is in step yet, it runs on the
+ *     wall clock.
+ *   - Only the very start of playback holds the playhead, until the top
+ *     clip's player is running (all players start together there).
+ *     Mid-playback it never holds: a clip that begins while playing has
+ *     its player started EARLY (by its measured start-up time), so it is
+ *     already running when the playhead arrives; until it's in step, the
+ *     playhead follows another player or the wall clock.
+ *   - The other players are kept in step (drift correction), paused right
+ *     at their clip's end, and kicked once if they never start.
  *
  * The authoritative current time lives in `timeRef`. React state is just a
  * (throttled) mirror of it for rendering, and `playhead` is the per-frame
@@ -128,6 +193,8 @@ export function useTimelineClock({
   // playback. The loop must stop on the spot — not a few frames later when
   // React gets around to the isPlaying=false render.
   const haltedRef = useRef(false);
+  // Measured player start-up time per track (see DEFAULT_START_LATENCY).
+  const startLatencyRef = useRef<Record<string, number>>({});
 
   const tracksRef = useRef(tracks);
   tracksRef.current = tracks;
@@ -154,16 +221,15 @@ export function useTimelineClock({
 
     let rafId: number | null = null;
     let lastTs = Date.now();
-    // When the playhead started waiting for the current ground-truth decoder.
+    // When the playhead started holding (start of playback only, see below).
     let holdingSince: number | null = null;
-    // Whether we already pulled the player once during this wait.
+    // Whether we already pulled the player once during this hold.
     let nudged = false;
-    let lastGroundTruthLabel = "";
     let lastSource = "";
     // Performance counters, logged once per second while playing (dev only).
     // `ticks` = animation frames the loop ran, `updates` = how many of those
     // actually moved the playhead (React re-renders), `decoderChanges` = how
-    // many times the ground-truth decoder reported a NEW time. These tell us
+    // many times the followed decoder reported a NEW time. These tell us
     // where choppiness comes from: few ticks = JS thread overloaded; many
     // ticks but few decoder changes = decoder time is coarse.
     let perfWindowStart = Date.now();
@@ -172,6 +238,53 @@ export function useTimelineClock({
     let perfDecoderChanges = 0;
     let lastDecoderValue = NaN;
     let lastCommitTs = 0;
+    // Drift correction bookkeeping, per clock entry label (see DRIFT_*).
+    const driftSince: Record<string, number> = {};
+    const lastDriftFix: Record<string, number> = {};
+    // End-of-clip pauses (see END_PAUSE_LOOKAHEAD), per clock entry label.
+    const endTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+    const endPaused: Record<string, boolean> = {};
+    // Has the playhead really moved yet in this run? Only the very start of
+    // playback holds the playhead (all players starting together).
+    let hasMoved = false;
+    // Per clip under the playhead: the player position when first seen, and
+    // whether it has moved since. A parked player reports exactly its
+    // clip's first frame, which looks "in sync" while it hasn't started.
+    const firstSeenPos: Record<string, number> = {};
+    const firstSeenAt: Record<string, number> = {};
+    const moved: Record<string, boolean> = {};
+    const stuckFixed: Record<string, boolean> = {};
+    // Early starts (see PRESTART_WINDOW), per clock entry label.
+    const prestartTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+    const prestarted: Record<string, boolean> = {};
+    // For measuring how long a player takes to start after play().
+    const prestartCall: Record<string, { at: number; pos: number }> = {};
+
+    const startLatency = (trackKey: string) =>
+      startLatencyRef.current[trackKey] ??
+      DEFAULT_START_LATENCY[trackKey] ??
+      DEFAULT_START_LATENCY.other;
+
+    // Does another clip on the same track start right where this one ends
+    // (a split point)? Then its player keeps going.
+    const continuesOnSameTrack = (t: ClockTrack) =>
+      tracksRef.current.some(
+        (o) =>
+          o.trackKey === t.trackKey &&
+          o.label !== t.label &&
+          Math.abs(o.clipStart - t.clipEnd) < CONTINUOUS_EPSILON,
+      );
+
+    const pauseAtClipEnd = (t: ClockTrack, how: string) => {
+      if (endPaused[t.label]) return;
+      endPaused[t.label] = true;
+      t.pause();
+      if (__DEV__) {
+        console.log(
+          `[timelineClock] ${t.label} reached its end (${t.clipEnd.toFixed(2)}s) — player paused by ${how} @ ${timeRef.current.toFixed(2)}s`,
+        );
+      }
+    };
 
     // Hand the UI thread its starting point: jump (snap) to the current
     // time, not moving yet (rate 0) until the first tick decides.
@@ -220,77 +333,249 @@ export function useTimelineClock({
 
       let next = prev + Math.min(rawDt, MAX_WALL_CLOCK_STEP);
       let source = "wall-clock";
+      let followed: ClockTrack | null = null;
 
-      if (active.length > 0) {
-        const gt = active[0];
-
-        // Ground truth switched to a different track: start fresh.
-        if (gt.label !== lastGroundTruthLabel) {
-          holdingSince = null;
-          nudged = false;
-          lastGroundTruthLabel = gt.label;
+      // Read every clip under the playhead once.
+      const readings = active.map((t) => {
+        const decoderTime = t.getCurrentTime();
+        if (firstSeenPos[t.label] === undefined) {
+          firstSeenPos[t.label] = decoderTime;
+          firstSeenAt[t.label] = now;
         }
+        if (!moved[t.label] && decoderTime !== firstSeenPos[t.label]) {
+          moved[t.label] = true;
+        }
+        const candidate = decoderToTimeline(t, decoderTime);
+        return { t, decoderTime, candidate, gap: candidate - prev };
+      });
+      const followable = (r: (typeof readings)[number]) =>
+        moved[r.t.label] &&
+        r.gap >= -FOLLOW_BEHIND &&
+        r.gap <= MAX_FOLLOW_AHEAD;
 
-        const decoderTime = gt.getCurrentTime();
-        if (__DEV__ && decoderTime !== lastDecoderValue) {
+      // Which player does the playhead follow? The highest-priority clip
+      // (video first) whose player is moving and in step. At the very start
+      // of playback it must be the top one (everything starts together, and
+      // the picture leads). After that, NEVER hold: if the top clip's player
+      // is still starting (a clip that just began), follow another moving
+      // player, or the wall clock, and switch over once it's running.
+      const pick = hasMoved
+        ? readings.find(followable)
+        : readings.length > 0 && followable(readings[0])
+          ? readings[0]
+          : undefined;
+
+      if (pick) {
+        if (holdingSince !== null && __DEV__) {
+          console.log(
+            `[timelineClock] ${pick.t.label} started after ${now - holdingSince}ms — following @ ${pick.candidate.toFixed(2)}s`,
+          );
+        }
+        // A player slightly behind the playhead (≤ FOLLOW_BEHIND) is still
+        // followed, but the playhead never goes back for it.
+        next = Math.max(prev, pick.candidate);
+        source = pick.t.label;
+        followed = pick.t;
+        holdingSince = null;
+        nudged = false;
+        if (__DEV__ && pick.decoderTime !== lastDecoderValue) {
           perfDecoderChanges += 1;
-          lastDecoderValue = decoderTime;
+          lastDecoderValue = pick.decoderTime;
         }
-        const candidate = gt.clipStart + (decoderTime - gt.trimStart);
-        const gap = candidate - prev;
-
-        if (gap >= 0 && gap <= MAX_FOLLOW_AHEAD) {
-          // Decoder is at/just ahead of the playhead: follow it.
-          if (holdingSince !== null && __DEV__) {
+      } else if (readings.length > 0 && !hasMoved) {
+        // Start of playback: hold until the top clip's player is running.
+        const gt = readings[0];
+        next = prev;
+        source = `holding for ${gt.t.label}`;
+        if (holdingSince === null) {
+          holdingSince = now;
+          if (__DEV__) {
             console.log(
-              `[timelineClock] ${gt.label} caught up after ${now - holdingSince}ms — following again @ ${candidate.toFixed(2)}s`,
+              `[timelineClock] start — waiting for ${gt.t.label} @ ${prev.toFixed(2)}s (player at ${gt.candidate.toFixed(2)}s)`,
             );
           }
-          next = candidate;
-          source = gt.label;
-          holdingSince = null;
-          nudged = false;
-        } else {
-          // Decoder is behind (starting up) or far away (old position).
-          // Hold the playhead where it is.
-          next = prev;
-          source = `holding for ${gt.label}`;
-
-          if (holdingSince === null) {
-            holdingSince = now;
+        } else if (now - holdingSince >= MAX_HOLD_MS) {
+          if (!nudged) {
+            const target = timelineToDecoder(gt.t, prev);
             if (__DEV__) {
               console.log(
-                `[timelineClock] holding @ ${prev.toFixed(2)}s — ${gt.label} decoder at ${candidate.toFixed(2)}s (gap ${gap.toFixed(2)}s)`,
+                `[timelineClock] ${gt.t.label} not started after ${MAX_HOLD_MS}ms — pulling player to playhead (source ${target.toFixed(2)}s)`,
               );
             }
-          } else if (now - holdingSince >= MAX_HOLD_MS) {
-            if (!nudged) {
-              const target = gt.trimStart + (prev - gt.clipStart);
-              if (__DEV__) {
-                console.log(
-                  `[timelineClock] ${gt.label} still off by ${gap.toFixed(2)}s after ${MAX_HOLD_MS}ms — pulling player to playhead (source ${target.toFixed(2)}s)`,
-                );
-              }
-              gt.resyncTo(target);
-              nudged = true;
-              holdingSince = now;
-            } else {
-              if (__DEV__) {
-                console.log(
-                  `[timelineClock] ${gt.label} still off after pull — following it (${candidate.toFixed(2)}s)`,
-                );
-              }
-              next = candidate;
-              source = gt.label;
-              holdingSince = null;
-              nudged = false;
+            gt.t.resyncTo(target);
+            nudged = true;
+            holdingSince = now;
+          } else {
+            if (__DEV__) {
+              console.log(
+                `[timelineClock] ${gt.t.label} still not in step after pull — following it (${gt.candidate.toFixed(2)}s)`,
+              );
             }
+            next = Math.max(prev, gt.candidate);
+            source = gt.t.label;
+            followed = gt.t;
+            moved[gt.t.label] = true;
+            holdingSince = null;
+            nudged = false;
           }
         }
+      } else if (readings.length > 0) {
+        // Mid-playback and no player is in step yet (a clip is starting):
+        // keep going on the wall clock instead of freezing the playhead.
+        source = `wall-clock (waiting for ${readings[0].t.label})`;
       } else {
         holdingSince = null;
         nudged = false;
-        lastGroundTruthLabel = "";
+      }
+
+      if (!source.startsWith("holding") && next > prev + 0.0001) {
+        hasMoved = true;
+      }
+
+      // Measure how long early-started players took to get going, and use
+      // it for the next early start on that track.
+      for (const label of Object.keys(prestartCall)) {
+        const t = tracksRef.current.find((o) => o.label === label);
+        if (!t) {
+          delete prestartCall[label];
+          continue;
+        }
+        if (t.getCurrentTime() !== prestartCall[label].pos) {
+          // Minus half a frame: the move is only seen on the frame after it
+          // happened.
+          const sample = Math.max(
+            0,
+            (now - prestartCall[label].at) / 1000 - rawDt / 2,
+          );
+          const old = startLatency(t.trackKey);
+          const updated = Math.min(
+            LATENCY_MAX,
+            Math.max(LATENCY_MIN, old * 0.5 + sample * 0.5),
+          );
+          startLatencyRef.current[t.trackKey] = updated;
+          delete prestartCall[label];
+          if (__DEV__) {
+            console.log(
+              `[timelineClock] ${label} player started ${Math.round(sample * 1000)}ms after play() — ${t.trackKey} start lead now ${Math.round(updated * 1000)}ms`,
+            );
+          }
+        }
+      }
+
+      // Keep the OTHER players in step with the playhead. A player that
+      // never started (stuck) is kicked once after MAX_HOLD_MS.
+      for (const r of readings) {
+        const t = r.t;
+        if (t === followed || endPaused[t.label]) continue;
+        if (!moved[t.label]) {
+          if (
+            !stuckFixed[t.label] &&
+            now - firstSeenAt[t.label] >= MAX_HOLD_MS
+          ) {
+            stuckFixed[t.label] = true;
+            const target = timelineToDecoder(t, next);
+            if (__DEV__) {
+              console.log(
+                `[timelineClock] ${t.label} player hasn't started after ${MAX_HOLD_MS}ms — seek to ${target.toFixed(2)}s and play`,
+              );
+            }
+            t.resyncTo(target);
+            t.play();
+          }
+          continue;
+        }
+        const err = r.candidate - next;
+        if (Math.abs(err) <= DRIFT_MAX) {
+          delete driftSince[t.label];
+          continue;
+        }
+        if (driftSince[t.label] === undefined) {
+          driftSince[t.label] = now;
+          continue;
+        }
+        const offFor = now - driftSince[t.label];
+        const sinceFix = now - (lastDriftFix[t.label] ?? 0);
+        if (offFor >= DRIFT_GRACE_MS && sinceFix >= DRIFT_COOLDOWN_MS) {
+          const target = timelineToDecoder(t, next);
+          if (__DEV__) {
+            console.log(
+              `[timelineClock] ${t.label} drifted ${err > 0 ? "ahead" : "behind"} by ${Math.abs(err).toFixed(2)}s for ${offFor}ms — resync to source ${target.toFixed(2)}s`,
+            );
+          }
+          t.resyncTo(target);
+          lastDriftFix[t.label] = now;
+          delete driftSince[t.label];
+        }
+      }
+
+      // Start the player of an upcoming clip EARLY — by its measured
+      // start-up time — so it's already running when the playhead reaches
+      // the clip, and playback carries straight on. The track sync has
+      // parked the player on the clip's first frame; the early frames are
+      // hidden (the preview is black in the gap). Only when the player is
+      // free (no clip of its track under the playhead).
+      for (const t of tracksRef.current) {
+        if (prestarted[t.label]) continue;
+        const until = t.clipStart - next;
+        if (until <= 0 || until > PRESTART_WINDOW) continue;
+        const busy = tracksRef.current.some(
+          (o) =>
+            o.trackKey === t.trackKey &&
+            o.label !== t.label &&
+            next >= o.clipStart - CLIP_EPSILON &&
+            next < o.clipEnd &&
+            !endPaused[o.label],
+        );
+        if (busy) continue;
+        prestarted[t.label] = true;
+        const lead = startLatency(t.trackKey);
+        const delayMs = Math.max(0, (until - lead) * 1000);
+        prestartTimers[t.label] = setTimeout(() => {
+          delete prestartTimers[t.label];
+          if (haltedRef.current) return;
+          prestartCall[t.label] = { at: Date.now(), pos: t.getCurrentTime() };
+          t.play();
+          if (__DEV__) {
+            console.log(
+              `[timelineClock] early start ${t.label} — ${Math.round(lead * 1000)}ms before its clip (@ ${t.clipStart.toFixed(2)}s)`,
+            );
+          }
+        }, delayMs);
+      }
+
+      // Pause each clip's player right at its end, without waiting for a
+      // React re-render: a timer when the end is close, and a direct pause
+      // if this frame already went past it.
+      for (const t of tracksRef.current) {
+        if (endPaused[t.label]) continue;
+        const crossed = prev < t.clipEnd && next >= t.clipEnd;
+        const inside = next >= t.clipStart - CLIP_EPSILON && next < t.clipEnd;
+        if (!crossed && !inside) continue;
+        if (continuesOnSameTrack(t)) continue;
+        if (crossed) {
+          if (endTimers[t.label] !== undefined) {
+            clearTimeout(endTimers[t.label]);
+            delete endTimers[t.label];
+          }
+          pauseAtClipEnd(t, "clock frame");
+          continue;
+        }
+        // Time left until the end, from the player's own position when it's
+        // plausible (a drifted player reaches its end sooner or later than
+        // the playhead), otherwise from the playhead.
+        const playerPos = decoderToTimeline(t, t.getCurrentTime());
+        const from = Math.abs(playerPos - next) < 1 ? playerPos : next;
+        const remaining = Math.max(0, t.clipEnd - from);
+        if (
+          remaining <= END_PAUSE_LOOKAHEAD &&
+          endTimers[t.label] === undefined
+        ) {
+          endTimers[t.label] = setTimeout(() => {
+            delete endTimers[t.label];
+            if (haltedRef.current) return;
+            pauseAtClipEnd(t, "end timer");
+          }, remaining * 1000);
+        }
       }
 
       if (source !== lastSource) {
@@ -344,6 +629,16 @@ export function useTimelineClock({
     rafId = requestAnimationFrame(tick);
 
     return () => {
+      for (const label of Object.keys(endTimers))
+        clearTimeout(endTimers[label]);
+      for (const label of Object.keys(prestartTimers))
+        clearTimeout(prestartTimers[label]);
+      // An early-started player whose clip hasn't begun yet isn't known to
+      // the track sync as playing — pause it here, or it would keep playing
+      // hidden after playback stops.
+      for (const t of tracksRef.current) {
+        if (prestarted[t.label] && t.clipStart > timeRef.current) t.pause();
+      }
       // rafId is only null here if the loop already stopped by itself (end
       // of the timeline, or halted by a gesture) — then there's nothing to
       // align: the end position is exact, and after a halt the gesture

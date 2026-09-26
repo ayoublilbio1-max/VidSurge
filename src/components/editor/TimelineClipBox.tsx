@@ -1,5 +1,5 @@
 import { Ionicons } from "@expo/vector-icons";
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { StyleSheet, TouchableOpacity, View } from "react-native";
 import {
   GestureDetector,
@@ -7,6 +7,7 @@ import {
 } from "react-native-gesture-handler";
 import Animated, {
   useAnimatedStyle,
+  useSharedValue,
   withTiming,
   type SharedValue,
 } from "react-native-reanimated";
@@ -15,28 +16,40 @@ import AppText from "../AppText";
 const HOLD_FEEDBACK_DURATION_MS = 120;
 const HOLD_OPACITY = 0.6;
 
-// Presentational shell for a track's clip box: a fixed-height, normal-flow
-// "slot" (so it still takes up space in the video/audio row stack) with an
-// absolutely-positioned rounded box inside it that can sit anywhere on the
-// timeline and be any length (via `lengthSeconds`) — used for both the video and
-// the audio clip so trimming/moving one doesn't duplicate this markup.
-// Purely presentational: EditorTimeline still owns all the trim/offset math
-// and gesture wiring. The box's timeline position is read from `offsetSV`
-// every frame (not a plain number prop) so that when EditorTimeline's move
-// gesture writes to it directly on the UI thread, the box tracks the
-// finger with no React re-renders in between — same idea as the trim
-// handles. `movingSV` drives the "picked up" look (shrink + fade) while
-// that's happening.
+/**
+ * Live move state shared by every clip box on the timeline. EditorTimeline
+ * writes it from the move gesture (UI thread); each box reads it every
+ * frame, so a dragged clip follows the finger with no React re-render.
+ *
+ *   basesSV  — the dragged clips' starting positions, by clip id (the
+ *              clip itself + its locked partner). Empty = nothing dragged.
+ *   deltaSV  — how far the finger has moved them, in timeline seconds.
+ *   activeSV — the finger is still down (drives the dimmed "held" look).
+ *
+ * After a drop, the bases stay set until the committed positions arrive
+ * as props (EditorTimeline clears them then), so the box never flashes
+ * back to its old spot in between.
+ */
+export type ClipDragState = {
+  basesSV: SharedValue<Record<string, number>>;
+  deltaSV: SharedValue<number>;
+  activeSV: SharedValue<boolean>;
+};
+
+// Presentational clip box: an absolutely-positioned rounded box inside its
+// track row, placed at `start` and `lengthSeconds` long (both in timeline
+// seconds; the pixel position/width is computed on the UI thread from the
+// live zoom, so it follows a pinch frame by frame). EditorTimeline owns all
+// the trim/move math and gesture wiring; one box is rendered per clip.
 interface TimelineClipBoxProps {
-  slotHeight: number;
-  slotMarginTop: number;
-  offsetSV: SharedValue<number>;
-  pixelsPerSecondSV: SharedValue<number>;
-  // Clip length in seconds. The on-screen width is length × zoom, computed
-  // on the UI thread so it follows a pinch-zoom frame by frame (a plain
-  // pixel-width prop only updated when React re-rendered, so the boxes
-  // lagged behind the ruler while zooming).
+  clipId: string;
+  /** Committed timeline position of the clip's left edge (seconds). */
+  start: number;
+  /** Clip length on the timeline (seconds, speed included). */
   lengthSeconds: number;
+  height: number;
+  pixelsPerSecondSV: SharedValue<number>;
+  drag: ClipDragState;
   selected: boolean;
   backgroundColor: string;
   selectedBorderColor: string;
@@ -44,23 +57,20 @@ interface TimelineClipBoxProps {
   labelIcon: keyof typeof Ionicons.glyphMap;
   labelText: string;
   onPress: () => void;
-  // Optional press-and-hold-to-move gesture. When given, the whole box is
-  // wrapped in a GestureDetector for it — a quick tap still falls through
-  // to the label's TouchableOpacity below (selection), since the pan only
-  // activates after the hold delay set on the gesture itself.
+  // Optional press-and-hold-to-move gesture. A quick tap still falls
+  // through to the label's TouchableOpacity below (selection), since the
+  // pan only activates after the hold delay set on the gesture itself.
   moveGesture?: GestureType;
-  // Whether the box is currently being held/moved. Optional since not
-  // every box needs the hold feedback.
-  movingSV?: SharedValue<boolean>;
   children?: ReactNode;
 }
 
 export default function TimelineClipBox({
-  slotHeight,
-  slotMarginTop,
-  offsetSV,
-  pixelsPerSecondSV,
+  clipId,
+  start,
   lengthSeconds,
+  height,
+  pixelsPerSecondSV,
+  drag,
   selected,
   backgroundColor,
   selectedBorderColor,
@@ -69,17 +79,33 @@ export default function TimelineClipBox({
   labelText,
   onPress,
   moveGesture,
-  movingSV,
   children,
 }: TimelineClipBoxProps) {
-  const positionStyle = useAnimatedStyle(() => ({
-    left: offsetSV.value * pixelsPerSecondSV.value,
-    width: Math.max(lengthSeconds * pixelsPerSecondSV.value, 2),
-  }));
+  // The committed start, mirrored to the UI thread. This effect runs before
+  // EditorTimeline's (children first), so when a moved clip's new start
+  // arrives, this is already up to date by the time the drag bases are
+  // cleared — the box never jumps back.
+  const startSV = useSharedValue(start);
+  useEffect(() => {
+    startSV.value = start;
+  }, [start, startSV]);
+
+  const positionStyle = useAnimatedStyle(() => {
+    const base = drag.basesSV.value[clipId];
+    const t =
+      base !== undefined
+        ? Math.max(0, base + drag.deltaSV.value)
+        : startSV.value;
+    return {
+      left: t * pixelsPerSecondSV.value,
+      width: Math.max(lengthSeconds * pixelsPerSecondSV.value, 2),
+    };
+  });
 
   // Held look is a plain dim/fade (like muting a track) — no scale change.
   const holdStyle = useAnimatedStyle(() => {
-    const isMoving = movingSV?.value ?? false;
+    const isMoving =
+      drag.activeSV.value && drag.basesSV.value[clipId] !== undefined;
     return {
       opacity: withTiming(isMoving ? HOLD_OPACITY : 1, {
         duration: HOLD_FEEDBACK_DURATION_MS,
@@ -94,7 +120,7 @@ export default function TimelineClipBox({
         positionStyle,
         holdStyle,
         {
-          height: slotHeight,
+          height,
           backgroundColor,
           borderColor: selected ? selectedBorderColor : inactiveBorderColor,
         },
@@ -117,14 +143,10 @@ export default function TimelineClipBox({
     </Animated.View>
   );
 
-  return (
-    <View style={{ height: slotHeight, marginTop: slotMarginTop }}>
-      {moveGesture ? (
-        <GestureDetector gesture={moveGesture}>{box}</GestureDetector>
-      ) : (
-        box
-      )}
-    </View>
+  return moveGesture ? (
+    <GestureDetector gesture={moveGesture}>{box}</GestureDetector>
+  ) : (
+    box
   );
 }
 

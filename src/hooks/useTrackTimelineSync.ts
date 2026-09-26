@@ -1,7 +1,20 @@
 import type { VideoPlayer } from "expo-video";
 import { useEffect, useRef } from "react";
+import { activeClipAt, timelineToSource, type Clip } from "../editor/clipModel";
 
-const CLIP_EPSILON = 0.001;
+// How far ahead (timeline seconds) a gap's NEXT clip gets pre-seeked. While
+// the playhead crosses a gap, this track's player is idle, so it can be
+// parked on the next clip's first frame in advance. Entering that clip then
+// only needs play(), not a seek + play — the playhead waits much less for
+// the player to start (that wait is what let the other track drift ahead).
+const PREROLL_WINDOW = 1.5;
+// On entering a prerolled clip, skip the seek if the player is within this
+// of where it should be. The playhead reaches this code a little late
+// (React re-renders ~100–200ms after the clock crosses the edge in the dev
+// build), so the parked player is usually 0.1–0.2s "behind". Playing from
+// the parked frame is still much faster than a seek; the clock simply
+// holds the playhead until the picture catches up.
+const PREROLL_TOLERANCE = 0.3;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(value, max));
@@ -17,16 +30,11 @@ type UseTrackTimelineSyncParams = {
   /**
    * Bumped by useTimelineClock's `seekTo` on every EXPLICIT jump (scrub,
    * restart, trim-clamp). A change here means "force this track's player
-   * to timelineTime right now", even if the playhead never left this
-   * clip's bounds during the jump.
+   * to timelineTime right now", even if the playhead stayed in one clip.
    */
   seekVersion: number;
-  /** Where this track's clip starts/ends on the shared timeline (seconds). */
-  clipStart: number;
-  clipEnd: number;
-  /** This track's trim-in/out points inside the *source* file. */
-  trimStart: number;
-  trimEnd: number;
+  /** This track's clips, sorted by start (from the project). */
+  clips: Clip[];
   /**
    * While true, this track does NOT seek its player — it only remembers
    * that a seek is owed, and does it (once, to the exact position) as soon
@@ -39,25 +47,24 @@ type UseTrackTimelineSyncParams = {
 };
 
 /**
- * Per-track playback reactor. Call once per track (video, audio). It
- * seeks/plays/pauses THAT track's player based only on the shared
- * playhead vs THAT track's own clip bounds, so video and audio can sit at
- * different timeline positions.
+ * Per-track playback reactor. Call once per track (video, audio). One
+ * player serves every clip on the track: it seeks/plays/pauses that player
+ * based on which of the track's clips is under the playhead.
  *
  * The player gets force-seeked to the playhead when:
- *   1. the playhead just crossed INTO this clip,
+ *   1. the playhead entered a clip (from a gap, or from another clip —
+ *      e.g. across a split point),
  *   2. `seekVersion` changed (an explicit scrub/jump),
- *   3. the clip was moved or its start was trimmed (clipStart/trimStart
- *      changed) — the same playhead now maps to a different spot in the
- *      source file, so the player has to jump there, or
+ *   3. the active clip was moved, trimmed at the start, or changed speed —
+ *      the same playhead now maps to a different spot in the source, or
  *   4. playback resumes (paused -> playing). A player keeps running for a
  *      moment after pause() is sent, so it's usually a bit ahead of the
  *      playhead by the time you press play again.
  *
- * The clip end is detected from `timelineTime` (the playhead leaving
- * clipEnd), NOT from `player.currentTime`. Right after a seek, Android
- * players briefly report their OLD position, and reading that used to make
- * a track think it had "reached its trim end" the instant play was pressed.
+ * Clip ends are detected from `timelineTime` (the playhead leaving the
+ * clip), NOT from `player.currentTime`. Right after a seek, Android players
+ * briefly report their OLD position, and reading that used to make a track
+ * think it had "reached its trim end" the instant play was pressed.
  */
 export function useTrackTimelineSync({
   label,
@@ -65,68 +72,108 @@ export function useTrackTimelineSync({
   isPlaying,
   timelineTime,
   seekVersion,
-  clipStart,
-  clipEnd,
-  trimStart,
-  trimEnd,
+  clips,
   holdSeeks = false,
 }: UseTrackTimelineSyncParams) {
-  // Whether the playhead is currently inside this track's clip bounds.
-  const insideRef = useRef(false);
+  // The clip currently under the playhead (id), or null in a gap.
+  const activeIdRef = useRef<string | null>(null);
   // Whether we've told this player to play, to avoid redundant native calls.
   const playingRef = useRef(false);
   // Last seekVersion already applied, so each explicit jump reseeks once.
   const lastSeekVersionRef = useRef(seekVersion);
-  // Last timeline->source mapping applied to the player.
-  const lastClipStartRef = useRef(clipStart);
-  const lastTrimStartRef = useRef(trimStart);
+  // Last timeline->source mapping applied to the player (active clip).
+  const lastStartRef = useRef(0);
+  const lastTrimInRef = useRef(0);
+  const lastSpeedRef = useRef(1);
   // A seek that was skipped because of `holdSeeks`, still to be done.
   const pendingSeekRef = useRef(false);
+  // The clip the player was parked on during a gap (see PREROLL_WINDOW).
+  const prerolledIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!player) return;
 
-    const insideClip =
-      timelineTime >= clipStart - CLIP_EPSILON && timelineTime < clipEnd;
+    const active = activeClipAt(clips, timelineTime);
 
-    if (!insideClip) {
-      if (insideRef.current) {
+    if (!active) {
+      if (activeIdRef.current !== null) {
         player.pause();
         playingRef.current = false;
         if (__DEV__) {
           console.log(
-            `[trackSync:${label}] exit clip @ ${timelineTime.toFixed(2)}s`,
+            `[trackSync:${label}] exit clip ${activeIdRef.current} @ ${timelineTime.toFixed(2)}s`,
           );
         }
       }
-      insideRef.current = false;
+      activeIdRef.current = null;
       lastSeekVersionRef.current = seekVersion;
-      lastClipStartRef.current = clipStart;
-      lastTrimStartRef.current = trimStart;
+
+      // In a gap while playing: park the player on the next clip's start.
+      if (isPlaying && !holdSeeks) {
+        const nextClip = clips.find((c) => c.start > timelineTime);
+        if (
+          nextClip &&
+          nextClip.start - timelineTime <= PREROLL_WINDOW &&
+          prerolledIdRef.current !== nextClip.id
+        ) {
+          prerolledIdRef.current = nextClip.id;
+          player.currentTime = nextClip.trimIn;
+          if (__DEV__) {
+            console.log(
+              `[trackSync:${label}] preroll — next clip ${nextClip.id} starts in ${(nextClip.start - timelineTime).toFixed(2)}s, parked at source ${nextClip.trimIn.toFixed(2)}s`,
+            );
+          }
+        }
+      }
       return;
     }
 
-    const justEntered = !insideRef.current;
-    insideRef.current = true;
+    const justEntered = activeIdRef.current !== active.id;
+    activeIdRef.current = active.id;
+    // Entering a clip always (re)starts the player below: the clock may
+    // have paused it at the previous clip's end (useTimelineClock pauses
+    // players right at their clip end, before React re-renders), and
+    // play() on a player that's already playing is harmless.
+    if (justEntered) playingRef.current = false;
 
     const explicitSeek = seekVersion !== lastSeekVersionRef.current;
     lastSeekVersionRef.current = seekVersion;
 
     const mappingChanged =
-      clipStart !== lastClipStartRef.current ||
-      trimStart !== lastTrimStartRef.current;
-    lastClipStartRef.current = clipStart;
-    lastTrimStartRef.current = trimStart;
+      !justEntered &&
+      (active.start !== lastStartRef.current ||
+        active.trimIn !== lastTrimInRef.current ||
+        active.speed !== lastSpeedRef.current);
+    lastStartRef.current = active.start;
+    lastTrimInRef.current = active.trimIn;
+    lastSpeedRef.current = active.speed;
 
     const resuming = isPlaying && !playingRef.current;
 
     const targetTime = clamp(
-      trimStart + (timelineTime - clipStart),
-      trimStart,
-      trimEnd,
+      timelineToSource(active, timelineTime),
+      active.trimIn,
+      active.trimOut,
     );
 
-    const wantsSeek = justEntered || explicitSeek || mappingChanged || resuming;
+    let wantsSeek = justEntered || explicitSeek || mappingChanged || resuming;
+
+    // Entering a clip the player is already parked on: no seek needed.
+    if (
+      wantsSeek &&
+      justEntered &&
+      !explicitSeek &&
+      prerolledIdRef.current === active.id &&
+      Math.abs(player.currentTime - targetTime) <= PREROLL_TOLERANCE
+    ) {
+      wantsSeek = false;
+      if (__DEV__) {
+        console.log(
+          `[trackSync:${label}] enter prerolled clip ${active.id} — no seek (player @ ${player.currentTime.toFixed(2)}s)`,
+        );
+      }
+    }
+    if (justEntered) prerolledIdRef.current = null;
 
     if (holdSeeks && !isPlaying) {
       // Scrubbing always pauses playback first — make sure this player is
@@ -166,7 +213,7 @@ export function useTrackTimelineSync({
       player.currentTime = targetTime;
       if (__DEV__) {
         const reason = justEntered
-          ? "enter clip"
+          ? `enter clip ${active.id}`
           : explicitSeek
             ? "explicit seek"
             : mappingChanged
@@ -176,6 +223,13 @@ export function useTrackTimelineSync({
           `[trackSync:${label}] ${reason}, seek to ${targetTime.toFixed(2)}s`,
         );
       }
+    }
+
+    // Speed: the player plays at the clip's rate.
+    if (player.playbackRate !== active.speed) {
+      player.playbackRate = active.speed;
+      if (__DEV__)
+        console.log(`[trackSync:${label}] playback rate → x${active.speed}`);
     }
 
     if (!isPlaying) {
@@ -196,16 +250,5 @@ export function useTrackTimelineSync({
       if (__DEV__)
         console.log(`[trackSync:${label}] play @ ${timelineTime.toFixed(2)}s`);
     }
-  }, [
-    timelineTime,
-    seekVersion,
-    isPlaying,
-    clipStart,
-    clipEnd,
-    trimStart,
-    trimEnd,
-    player,
-    label,
-    holdSeeks,
-  ]);
+  }, [timelineTime, seekVersion, isPlaying, clips, player, label, holdSeeks]);
 }

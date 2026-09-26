@@ -24,10 +24,11 @@ import Animated, {
   withTiming,
   type SharedValue,
 } from "react-native-reanimated";
+import { clipLength, type Clip, type ClipRange } from "../../editor/clipModel";
 import { useTheme } from "../../hooks/useTheme";
 import type { PlayheadSync } from "../../hooks/useTimelineClock";
 import AppText from "../AppText";
-import TimelineClipBox from "./TimelineClipBox";
+import TimelineClipBox, { type ClipDragState } from "./TimelineClipBox";
 
 const MIN_PIXELS_PER_SECOND = 20;
 const MAX_PIXELS_PER_SECOND = 200;
@@ -94,12 +95,13 @@ const UI_SNAP_THRESHOLD = 0.3;
 // Fraction of the remaining error corrected per frame.
 const UI_CORRECTION = 0.08;
 
-export type ClipSelection = "video" | "audio" | null;
-
 export interface TrimRange {
   start: number;
   end: number;
 }
+
+// Hold time before a press on a clip turns into a move.
+const MOVE_LONG_PRESS_MS = 180;
 
 interface EditorTimelineProps {
   clipLabel: string;
@@ -111,16 +113,15 @@ interface EditorTimelineProps {
   isPlaying: boolean;
   // Per-frame playhead info from useTimelineClock, read on the UI thread.
   playhead: PlayheadSync;
-  duration: number;
+  // Full length of the project on the timeline (ruler, scroll range).
+  timelineDuration: number;
   thumbnails: (string | null)[];
-  selection: ClipSelection;
-  audioLocked: boolean;
-  videoTrim: TrimRange;
-  audioTrim: TrimRange;
-  videoOffset: number;
-  audioOffset: number;
+  // The clips on each track row, sorted by start (from the project).
+  videoClips: Clip[];
+  audioClips: Clip[];
+  selectedClipId: string | null;
   onMutePress: () => void;
-  onSelectClip: (clip: "video" | "audio") => void;
+  onSelectClip: (clipId: string) => void;
   onAddTextPress: () => void;
   onScrub: (time: number) => void;
   // Fired the moment the user touches the timeline to start dragging the
@@ -144,10 +145,9 @@ interface EditorTimelineProps {
   // space before/after/between clips) — lets the parent clear the clip
   // selection, InShot-style.
   onEmptyAreaPress?: () => void;
-  onClipChange: (
-    which: "video" | "audio",
-    update: { trim: TrimRange; offset: number },
-  ) => void;
+  // A trim or move just committed (finger lifted). `range` is the clip's
+  // full new range; the parent applies it (and to a locked partner).
+  onClipChange: (clipId: string, range: ClipRange) => void;
 }
 
 function formatTime(seconds: number): string {
@@ -315,32 +315,17 @@ const WaveformBars = memo(function WaveformBars({
 });
 
 // memo for the same reason as WaveformBars — thumbnails never change during
-// playback.
+// playback. Tiles share the strip's width equally (flex: 1), so the strip
+// alone decides how wide they are.
 const ThumbnailTile = memo(function ThumbnailTile({
   uri,
-  count,
-  durationSV,
-  pixelsPerSecondSV,
   placeholderColor,
 }: {
   uri: string | null;
-  count: number;
-  durationSV: SharedValue<number>;
-  pixelsPerSecondSV: SharedValue<number>;
   placeholderColor: string;
 }) {
-  const animatedStyle = useAnimatedStyle(() => ({
-    width: (durationSV.value / count) * pixelsPerSecondSV.value,
-  }));
-
   return (
-    <Animated.View
-      style={[
-        styles.thumbTile,
-        animatedStyle,
-        { backgroundColor: placeholderColor },
-      ]}
-    >
+    <View style={[styles.thumbTile, { backgroundColor: placeholderColor }]}>
       {uri && (
         <Image
           source={{ uri }}
@@ -348,23 +333,97 @@ const ThumbnailTile = memo(function ThumbnailTile({
           resizeMode="cover"
         />
       )}
-    </Animated.View>
+    </View>
   );
 });
+
+// The whole source file laid out behind a clip box, shifted left by the
+// clip's trim-in point, so the box shows exactly its part of the source.
+// Widths follow the live zoom on the UI thread (keeps up with a pinch
+// frame by frame) and are divided by the clip's speed.
+//
+// NOTE: `thumbnails` are generated from the one loaded source. Clips from
+// other files (PIP, a second video) will need their own set later.
+function ClipThumbnails({
+  clip,
+  thumbnails,
+  pixelsPerSecondSV,
+  placeholderColor,
+}: {
+  clip: Clip;
+  thumbnails: (string | null)[];
+  pixelsPerSecondSV: SharedValue<number>;
+  placeholderColor: string;
+}) {
+  const { trimIn, sourceDuration, speed } = clip;
+  const windowStyle = useAnimatedStyle(() => ({
+    left: (-trimIn / speed) * pixelsPerSecondSV.value,
+    width: Math.max((sourceDuration / speed) * pixelsPerSecondSV.value, 2),
+  }));
+  if (thumbnails.length === 0) return null;
+  return (
+    <Animated.View
+      style={[styles.thumbLayer, windowStyle]}
+      pointerEvents="none"
+    >
+      {thumbnails.map((uri, i) => (
+        <ThumbnailTile key={i} uri={uri} placeholderColor={placeholderColor} />
+      ))}
+    </Animated.View>
+  );
+}
+
+// Same windowing for the audio waveform. The bars are built for the last
+// zoom React knows about (`committedPPS`) and stretched to the live zoom
+// during a pinch, instead of rebuilding hundreds of bars every frame.
+function ClipWaveform({
+  clip,
+  pixelsPerSecondSV,
+  committedPPS,
+  color,
+}: {
+  clip: Clip;
+  pixelsPerSecondSV: SharedValue<number>;
+  committedPPS: number;
+  color: string;
+}) {
+  const { trimIn, sourceDuration, speed } = clip;
+  const windowStyle = useAnimatedStyle(() => ({
+    left: (-trimIn / speed) * pixelsPerSecondSV.value,
+    width: Math.max((sourceDuration / speed) * pixelsPerSecondSV.value, 2),
+  }));
+  const stretchStyle = useAnimatedStyle(() => ({
+    transform: [{ scaleX: pixelsPerSecondSV.value / committedPPS }],
+  }));
+  // Bars sampled in SOURCE time, so a sped-up clip shows the same waveform
+  // squeezed rather than a different one.
+  const sourcePPS = committedPPS / speed;
+  return (
+    <Animated.View
+      style={[styles.waveformWindow, windowStyle]}
+      pointerEvents="none"
+    >
+      <Animated.View style={[styles.waveformStretch, stretchStyle]}>
+        <WaveformBars
+          color={color}
+          contentWidth={Math.max(sourceDuration * sourcePPS, 2)}
+          pixelsPerSecond={sourcePPS}
+        />
+      </Animated.View>
+    </Animated.View>
+  );
+}
 
 export default function EditorTimeline({
   clipLabel,
   currentTime,
   isPlaying,
   playhead,
-  duration,
+  timelineDuration,
   thumbnails,
-  selection,
-  audioLocked,
-  videoTrim,
-  audioTrim,
-  videoOffset,
-  audioOffset,
+  videoClips,
+  audioClips,
+  selectedClipId,
   onMutePress,
   onSelectClip,
   onAddTextPress,
@@ -473,25 +532,35 @@ export default function EditorTimeline({
   const zoomAnchorSV = useSharedValue(0);
   const playheadTimeSV = useSharedValue(0);
   const scrollX = useSharedValue(0);
-  const durationSV = useSharedValue(0);
   const trackAreaWidthSV = useSharedValue(0);
+  // Trim handles, for the selected clip (synced from its committed range at
+  // rest, written directly on the UI thread while a handle is dragged):
+  //   trimStartSV/trimEndSV — source in/out points
+  //   offsetSV              — the clip's timeline start
+  //   trimMaxSV             — the source file's length (right handle cap)
+  //   trimSpeedSV           — the clip's speed (px ↔ source seconds)
   const trimStartSV = useSharedValue(0);
   const trimEndSV = useSharedValue(0);
+  const trimMaxSV = useSharedValue(0);
+  const trimSpeedSV = useSharedValue(1);
   const trimDragBaseSV = useSharedValue(0);
   const offsetSV = useSharedValue(0);
   const offsetDragBaseSV = useSharedValue(0);
   const timelineDurationSV = useSharedValue(0);
-  // Per-track timeline position, kept in sync with the committed
-  // videoOffset/audioOffset props at rest (effects below), and written to
-  // directly (UI thread, no React involved) while that track's clip box is
-  // being press-and-held-moved — this is what makes the move as smooth as
-  // the trim handles, which already work this way.
-  const videoOffsetSV = useSharedValue(0);
-  const audioOffsetSV = useSharedValue(0);
-  // True while that track's clip box is currently held/being moved, purely
-  // for the box's own "picked up" visual feedback (fade).
-  const videoMovingSV = useSharedValue(false);
-  const audioMovingSV = useSharedValue(false);
+  // Live clip-move state, shared by every clip box (see ClipDragState in
+  // TimelineClipBox). One set of values serves any number of clips: the
+  // move gesture fills in which clips are being dragged and by how much.
+  const dragBasesSV = useSharedValue<Record<string, number>>({});
+  const dragDeltaSV = useSharedValue(0);
+  const dragActiveSV = useSharedValue(false);
+  const drag = useMemo<ClipDragState>(
+    () => ({
+      basesSV: dragBasesSV,
+      deltaSV: dragDeltaSV,
+      activeSV: dragActiveSV,
+    }),
+    [dragBasesSV, dragDeltaSV, dragActiveSV],
+  );
   // Guards against the ScrollView "stealing" a bit of horizontal drag in
   // the moment right before a press-and-hold move gesture activates (both
   // are reading the same finger motion, so without this the timeline can
@@ -527,20 +596,9 @@ export default function EditorTimeline({
     () => LEADING_WIDTH + contentWidthSV.value + trackAreaWidthSV.value,
   );
 
-  const safeDuration = duration > 0 ? duration : 0;
-  // The video/audio clips can sit anywhere on the timeline (moved away from
-  // 0, or trimmed shorter), which may make the overall project longer than
-  // the source video itself — the ruler, scroll range and zoom all need to
-  // span that full extent, not just the source video's own length. Source
-  // duration (`safeDuration`/`durationSV`) is kept separately below, purely
-  // to cap how far the trim handles can go (you can't trim past what the
-  // video actually has).
-  const timelineDuration = Math.max(
-    safeDuration,
-    videoOffset + (videoTrim.end - videoTrim.start),
-    audioOffset + (audioTrim.end - audioTrim.start),
-  );
-  const contentWidth = Math.max(safeDuration * pixelsPerSecond, 200);
+  // Clips can sit anywhere on the timeline (moved, trimmed, later split),
+  // so the ruler, scroll range and zoom span the whole project, which the
+  // parent computes (`timelineDuration`).
   const secondMarks = Array.from(
     { length: Math.ceil(timelineDuration) + 1 },
     (_, i) => i,
@@ -561,14 +619,38 @@ export default function EditorTimeline({
     Math.ceil(MIN_RULER_LABEL_SPACING / pixelsPerSecond),
   );
 
-  // When audio is locked to the video (default), selecting either one
-  // highlights both, since they move/trim together. Once a lock/unlock
-  // button exists, flipping `audioLocked` to false makes these independent
-  // with no other change needed here.
-  const isVideoSelected =
-    selection === "video" || (selection === "audio" && audioLocked);
-  const isAudioSelected =
-    selection === "audio" || (selection === "video" && audioLocked);
+  // Selection. A clip locked to a partner (same linkId on the other track)
+  // is highlighted, trimmed and moved together with it.
+  const allClips = useMemo(
+    () => [...videoClips, ...audioClips],
+    [videoClips, audioClips],
+  );
+  const partnerOf = (clip: Clip): Clip | null => {
+    if (clip.linkId === null) return null;
+    return (
+      allClips.find(
+        (c) =>
+          c.id !== clip.id &&
+          c.track !== clip.track &&
+          c.linkId === clip.linkId,
+      ) ?? null
+    );
+  };
+  const selectedClip =
+    selectedClipId !== null
+      ? (allClips.find((c) => c.id === selectedClipId) ?? null)
+      : null;
+  const selectedPartner = selectedClip ? partnerOf(selectedClip) : null;
+  const isClipHighlighted = (clip: Clip) =>
+    clip.id === selectedClip?.id || clip.id === selectedPartner?.id;
+
+  // A committed edit arrived as new clip props: drop the finished move's
+  // drag state. Each box has already picked up its new start (child effects
+  // run before this one), so nothing visibly moves here.
+  useEffect(() => {
+    dragBasesSV.value = {};
+    dragDeltaSV.value = 0;
+  }, [videoClips, audioClips, dragBasesSV, dragDeltaSV]);
 
   // NOTE: the zoom's source of truth is pixelsPerSecondSV (UI thread);
   // `pixelsPerSecond` state is only its mirror for rendering, updated via
@@ -584,24 +666,12 @@ export default function EditorTimeline({
   }, [currentTime]);
 
   useEffect(() => {
-    durationSV.value = safeDuration;
-  }, [safeDuration]);
-
-  useEffect(() => {
     timelineDurationSV.value = timelineDuration;
   }, [timelineDuration]);
 
   useEffect(() => {
     trackAreaWidthSV.value = trackAreaWidth;
   }, [trackAreaWidth]);
-
-  useEffect(() => {
-    videoOffsetSV.value = videoOffset;
-  }, [videoOffset]);
-
-  useEffect(() => {
-    audioOffsetSV.value = audioOffset;
-  }, [audioOffset]);
 
   // Follows the playhead (`currentTime`, in timeline space) whenever it
   // changes. During playback, editor.tsx re-renders this prop every frame
@@ -744,14 +814,21 @@ export default function EditorTimeline({
       t = target;
       targetAgeSV.value = 0;
     } else {
-      t += dt * rate;
+      const advanced = t + dt * rate;
       // Where the clock most likely is right now.
       const predicted = target + targetAgeSV.value * rate;
-      const err = predicted - t;
+      const err = predicted - advanced;
       if (Math.abs(err) > UI_SNAP_THRESHOLD) {
+        // A real jump (seek, big correction): go straight there.
         t = predicted;
       } else {
-        t += err * UI_CORRECTION;
+        // Ease toward the clock, but never draw the playhead moving
+        // backwards while playing. The drawn playhead runs slightly ahead
+        // of the clock between decoder reports; when the clock holds (e.g.
+        // waiting for the video to start at a clip edge), easing back to it
+        // made the playhead visibly step back. Now it just stops and waits
+        // for the clock to catch up.
+        t = Math.max(t, advanced + err * UI_CORRECTION);
       }
     }
     if (t < 0) t = 0;
@@ -1292,49 +1369,48 @@ export default function EditorTimeline({
     (i) => RULER_HEIGHT + i * TRACK_HEIGHT + (i + 1) * TRACK_GAP,
   );
 
-  // Trim handle geometry. Locked: one shared handle pair spanning from the
-  // top of the video row to the bottom of the audio row, using the video
-  // clip's trim range (and writing back to both video+audio, since they cut
-  // together). Unlocked: handles appear only on whichever single track is
-  // selected, using — and writing back to — that track's own trim range.
-  const showHandles = selection === "video" || selection === "audio";
+  // Trim handles sit on the selected clip. If it's locked to a partner, one
+  // handle pair spans the video row and the audio row (they cut together;
+  // the parent applies the same range to the partner). Otherwise the
+  // handles cover only the selected clip's own row.
+  const showHandles = selectedClip !== null;
+  const rowTop = (track: Clip["track"]) =>
+    track === "audio" ? trackPanelTops[1] : trackPanelTops[0];
   let handleTop = 0;
   let handleHeight = 0;
-  let handleTrim: TrimRange = videoTrim;
-  let handleOffset = videoOffset;
-  let trimTargetKind: "video" | "audio" = "video";
-
-  if (showHandles) {
-    if (audioLocked) {
+  if (selectedClip) {
+    if (selectedPartner) {
       handleTop = trackPanelTops[0];
       handleHeight = trackPanelTops[1] + TRACK_HEIGHT - trackPanelTops[0];
-      handleTrim = videoTrim;
-      handleOffset = videoOffset;
-      trimTargetKind = "video";
-    } else if (selection === "video") {
-      handleTop = trackPanelTops[0];
-      handleHeight = TRACK_HEIGHT;
-      handleTrim = videoTrim;
-      handleOffset = videoOffset;
-      trimTargetKind = "video";
     } else {
-      handleTop = trackPanelTops[1];
+      handleTop = rowTop(selectedClip.track);
       handleHeight = TRACK_HEIGHT;
-      handleTrim = audioTrim;
-      handleOffset = audioOffset;
-      trimTargetKind = "audio";
     }
   }
+  const handleClipId = selectedClip?.id ?? null;
+  const handleTrimIn = selectedClip?.trimIn ?? 0;
+  const handleTrimOut = selectedClip?.trimOut ?? 0;
+  const handleStart = selectedClip?.start ?? 0;
+  const handleSpeed = selectedClip?.speed ?? 1;
+  const handleSourceDuration = selectedClip?.sourceDuration ?? 0;
 
   // Keep the shared values (which drive the handles every frame while
-  // dragging) synced to the latest committed trim range + timeline
-  // position. This also fires right after our own onEnd commit below, but
-  // with the same value, so it never causes a visible jump.
+  // dragging) synced to the selected clip's committed range. This also
+  // fires right after our own commit, with the same values, so it never
+  // causes a visible jump.
   useEffect(() => {
-    trimStartSV.value = handleTrim.start;
-    trimEndSV.value = handleTrim.end;
-    offsetSV.value = handleOffset;
-  }, [handleTrim.start, handleTrim.end, handleOffset]);
+    trimStartSV.value = handleTrimIn;
+    trimEndSV.value = handleTrimOut;
+    offsetSV.value = handleStart;
+    trimSpeedSV.value = handleSpeed;
+    trimMaxSV.value = handleSourceDuration;
+  }, [
+    handleTrimIn,
+    handleTrimOut,
+    handleStart,
+    handleSpeed,
+    handleSourceDuration,
+  ]);
 
   // A clip move (after the long-press) or a trim-handle drag just started.
   // Tell the parent so it can pause playback — editing a clip while the
@@ -1366,27 +1442,21 @@ export default function EditorTimeline({
     onEmptyAreaPress?.();
   };
 
-  const commitClip = (
-    target: "video" | "audio",
-    start: number,
-    end: number,
-    offset: number,
-  ) => {
+  const commitTrim = (trimIn: number, trimOut: number, start: number) => {
+    if (handleClipId === null) return;
     if (__DEV__) {
-      console.log("[EditorTimeline] commitClip", {
-        target,
-        start,
-        end,
-        offset,
-      });
+      console.log(
+        `[EditorTimeline] commit trim ${handleClipId} — start ${start.toFixed(2)}s, src ${trimIn.toFixed(2)}–${trimOut.toFixed(2)}s`,
+      );
     }
-    onClipChange(target, { trim: { start, end }, offset });
+    onClipChange(handleClipId, { start, trimIn, trimOut });
   };
 
   // Dragging the left handle shortens the clip from the front — the clip's
-  // timeline position (offset) shifts by the same amount as trim.start, so
-  // the clip's far/right edge stays put and only the near/left edge slides
-  // in, like a normal trim rather than the whole clip jumping around.
+  // timeline start shifts by the same amount (in timeline time), so the
+  // clip's right edge stays put and only the left edge slides in.
+  // Finger movement is in timeline pixels; × speed turns it into source
+  // seconds (a 2x clip covers 2 source seconds per timeline second).
   const leftHandlePan = Gesture.Pan()
     // Lopsided on purpose: generous to the left (outside the clip, easy to
     // grab the handle) but barely any padding to the right (into the clip
@@ -1406,22 +1476,19 @@ export default function EditorTimeline({
       runOnJS(setTrimDragging)(true);
     })
     .onUpdate((event) => {
+      const speed = trimSpeedSV.value;
       const next = clampWorklet(
-        trimDragBaseSV.value + event.translationX / pixelsPerSecondSV.value,
+        trimDragBaseSV.value +
+          (event.translationX / pixelsPerSecondSV.value) * speed,
         0,
         trimEndSV.value - MIN_TRIM_DURATION,
       );
-      const delta = next - trimDragBaseSV.value;
+      const sourceDelta = next - trimDragBaseSV.value;
       trimStartSV.value = next;
-      offsetSV.value = offsetDragBaseSV.value + delta;
+      offsetSV.value = offsetDragBaseSV.value + sourceDelta / speed;
     })
     .onEnd(() => {
-      runOnJS(commitClip)(
-        trimTargetKind,
-        trimStartSV.value,
-        trimEndSV.value,
-        offsetSV.value,
-      );
+      runOnJS(commitTrim)(trimStartSV.value, trimEndSV.value, offsetSV.value);
     })
     .onFinalize(() => {
       runOnJS(setTrimDragging)(false);
@@ -1441,19 +1508,15 @@ export default function EditorTimeline({
     })
     .onUpdate((event) => {
       const next = clampWorklet(
-        trimDragBaseSV.value + event.translationX / pixelsPerSecondSV.value,
+        trimDragBaseSV.value +
+          (event.translationX / pixelsPerSecondSV.value) * trimSpeedSV.value,
         trimStartSV.value + MIN_TRIM_DURATION,
-        durationSV.value,
+        trimMaxSV.value,
       );
       trimEndSV.value = next;
     })
     .onEnd(() => {
-      runOnJS(commitClip)(
-        trimTargetKind,
-        trimStartSV.value,
-        trimEndSV.value,
-        offsetSV.value,
-      );
+      runOnJS(commitTrim)(trimStartSV.value, trimEndSV.value, offsetSV.value);
     })
     .onFinalize(() => {
       runOnJS(setTrimDragging)(false);
@@ -1461,142 +1524,121 @@ export default function EditorTimeline({
     });
 
   // Press-and-hold on a clip body to move it along the timeline (changes
-  // only `offset`, not the trim range). While the finger is down, the box
-  // is repositioned purely on the UI thread (videoOffsetSV/audioOffsetSV,
-  // written straight from the worklet below) — exactly like the trim
-  // handles already do — so it tracks the finger smoothly with no React
-  // re-renders in between. The committed `offset` state (what the rest of
-  // the app — playhead mapping, void detection, etc. — actually reads)
-  // only updates once, on release. Locked: moving either clip moves both
-  // together, mirrored live during the drag and committed together too. A
-  // short hold delay (activateAfterLongPress) means a quick tap still
-  // falls through to the label's TouchableOpacity for selection instead of
-  // starting a move.
-  const commitMove = (kind: "video" | "audio", offset: number) => {
-    const trim = kind === "video" ? videoTrim : audioTrim;
+  // only its start, not the trim range). While the finger is down, the box
+  // (and its locked partner) are repositioned purely on the UI thread
+  // through the shared drag state — no React re-renders in between — and
+  // the new start is committed once, on release. A short hold delay means
+  // a quick tap still falls through to the label's TouchableOpacity for
+  // selection instead of starting a move.
+  const commitMove = (clip: Clip, start: number) => {
+    const next = Math.max(0, start);
     if (__DEV__) {
-      console.log("[EditorTimeline] commitMove", { kind, offset, trim });
+      console.log(
+        `[EditorTimeline] commit move ${clip.id} — ${clip.start.toFixed(2)}s → ${next.toFixed(2)}s`,
+      );
     }
-    onClipChange(kind, { trim, offset: Math.max(0, offset) });
+    onClipChange(clip.id, {
+      start: next,
+      trimIn: clip.trimIn,
+      trimOut: clip.trimOut,
+    });
   };
 
-  const logMoveCancelled = (kind: "video" | "audio") => {
+  const logMoveCancelled = (clipId: string) => {
     if (__DEV__)
       console.log(
-        `[EditorTimeline] clip move cancelled (${kind}) — restored position`,
+        `[EditorTimeline] clip move cancelled (${clipId}) — restored position`,
       );
   };
 
-  const makeMoveGesture = (kind: "video" | "audio") => {
-    const trackOffsetSV = kind === "video" ? videoOffsetSV : audioOffsetSV;
-    const trackMovingSV = kind === "video" ? videoMovingSV : audioMovingSV;
-    const mirrorOffsetSV = kind === "video" ? audioOffsetSV : videoOffsetSV;
-    const startOffset = kind === "video" ? videoOffset : audioOffset;
-    const mirrorStartOffset = kind === "video" ? audioOffset : videoOffset;
-    const locked = audioLocked;
-    // Do the trim handles sit on the clip being moved (or on its locked
-    // mirror)? If so they have to slide along with it during the drag.
-    // `handlesOnThisClip` = handles belong to the dragged clip itself;
-    // `handlesOnMirror` = locked mode, handles belong to the OTHER clip,
-    // which is being moved along with this one.
-    const handlesOnThisClip = showHandles && trimTargetKind === kind;
-    const handlesOnMirror = showHandles && locked && trimTargetKind !== kind;
-    const handleStartOffset = handleOffset;
+  const makeMoveGesture = (clip: Clip) => {
+    const partner = partnerOf(clip);
+    // Starting positions of everything this drag moves: the clip and, if
+    // locked, its partner.
+    const bases: Record<string, number> = { [clip.id]: clip.start };
+    if (partner) bases[partner.id] = partner.start;
+    // The trim handles slide along if they sit on one of the moved clips.
+    const handlesMove =
+      handleClipId !== null && bases[handleClipId] !== undefined;
+    const handleBase = handleStart;
+    const clipStart = clip.start;
 
     return Gesture.Pan()
-      .activateAfterLongPress(180)
+      .activateAfterLongPress(MOVE_LONG_PRESS_MS)
       .onBegin(() => {
-        trackMovingSV.value = true;
+        dragBasesSV.value = bases;
+        dragDeltaSV.value = 0;
+        dragActiveSV.value = true;
         // Lock the scroll to wherever it happens to be right now, before
         // the drag can nudge it at all.
         isMovingSV.value = true;
         scrollLockXSV.value = scrollX.value;
         // NOTE: `moveDragging` (which turns the ScrollView's scrolling OFF)
-        // is NOT set here any more. onBegin fires on every touch-down on a
-        // clip — including the start of a normal timeline scroll — and
-        // disabling the ScrollView there made it drop the scroll the user
-        // had just started ("stuck, doesn't move"). It's set in onStart
-        // below, once the long-press has really turned into a move.
+        // is NOT set here. onBegin fires on every touch-down on a clip —
+        // including the start of a normal timeline scroll — and disabling
+        // the ScrollView there made it drop the scroll the user had just
+        // started. It's set in onStart, once the long-press really turned
+        // into a move.
       })
       .onStart(() => {
-        // onStart = the long-press actually activated the move (onBegin
-        // above fires on touch-down, even for a quick tap to select).
         runOnJS(setMoveDragging)(true);
         runOnJS(handleClipGestureStart)("move");
       })
       .onUpdate((event) => {
-        const next = Math.max(
-          0,
-          startOffset + event.translationX / pixelsPerSecondSV.value,
+        // Never let the dragged clip go before timeline 0.
+        const delta = Math.max(
+          -clipStart,
+          event.translationX / pixelsPerSecondSV.value,
         );
-        trackOffsetSV.value = next;
-        let mirrorNext = mirrorStartOffset;
-        if (locked) {
-          mirrorNext = Math.max(
-            0,
-            mirrorStartOffset + event.translationX / pixelsPerSecondSV.value,
-          );
-          mirrorOffsetSV.value = mirrorNext;
-        }
-        // Keep the trim handles glued to the clip while it's being dragged
-        // (before, they only jumped to the new spot after the finger lifted,
-        // because they read `offsetSV`, which only updated on commit).
-        if (handlesOnThisClip) {
-          offsetSV.value = next;
-        } else if (handlesOnMirror) {
-          offsetSV.value = mirrorNext;
-        }
+        dragDeltaSV.value = delta;
+        if (handlesMove) offsetSV.value = handleBase + delta;
       })
       .onEnd((event) => {
-        const next = Math.max(
-          0,
-          startOffset + event.translationX / pixelsPerSecondSV.value,
+        const delta = Math.max(
+          -clipStart,
+          event.translationX / pixelsPerSecondSV.value,
         );
-        runOnJS(commitMove)(kind, next);
+        if (delta === 0) {
+          // Dropped where it started: nothing to commit, so no new props
+          // will arrive to clear the drag state — clear it here.
+          dragBasesSV.value = {};
+          return;
+        }
+        runOnJS(commitMove)(clip, clipStart + delta);
       })
       .onFinalize((_event, success) => {
-        trackMovingSV.value = false;
+        dragActiveSV.value = false;
         isMovingSV.value = false;
         // `success` is also false for a quick tap that never became a move
-        // (that's how the tap falls through to "select clip"), so only
-        // restore if the clip actually got dragged somewhere.
-        if (!success && trackOffsetSV.value !== startOffset) {
-          // The move was cancelled (e.g. interrupted by the system) — no
-          // commit will happen, so put the clip(s) and the trim handles
-          // back where they were instead of leaving them half-dragged.
-          trackOffsetSV.value = startOffset;
-          if (locked) mirrorOffsetSV.value = mirrorStartOffset;
-          if (handlesOnThisClip || handlesOnMirror) {
-            offsetSV.value = handleStartOffset;
-          }
-          runOnJS(logMoveCancelled)(kind);
+        // (that's how the tap falls through to "select clip"). Either way no
+        // commit happens, so drop the drag state and put the clip(s) and
+        // the handles back where they were.
+        if (!success) {
+          const wasDragged = dragDeltaSV.value !== 0;
+          dragBasesSV.value = {};
+          dragDeltaSV.value = 0;
+          if (handlesMove) offsetSV.value = handleBase;
+          if (wasDragged) runOnJS(logMoveCancelled)(clip.id);
         }
         runOnJS(setMoveDragging)(false);
       });
   };
 
-  const videoMoveGesture = makeMoveGesture("video");
-  const audioMoveGesture = makeMoveGesture("audio");
+  // One move gesture per clip, rebuilt each render (gestures are plain
+  // objects, not hooks, so any number of clips is fine).
+  const moveGestures: Record<string, ReturnType<typeof makeMoveGesture>> = {};
+  for (const clip of allClips) moveGestures[clip.id] = makeMoveGesture(clip);
 
   // The ScrollView's own built-in pan-to-scroll normally races the clip
-  // move/trim gestures for the same touch — both are free to start
-  // recognizing off the exact same finger-down event. That race is the
-  // real cause of the timeline "stealing" part of a move/trim (scrolling,
-  // or worse, feeding the raw scroll offset into the scrub/seek path and
-  // dragging the playhead along with it) — not anything in the trim/offset
-  // logic itself, and not something a post-hoc lock (isMovingSV below) can
-  // fully close, since a few scroll/scrub events can still land in the
-  // gap before that lock engages. Wrapping the ScrollView's native pan as
-  // its own gesture and making it explicitly wait for all four
-  // move/trim gestures to fail first means it genuinely cannot start
-  // scrolling — so it cannot scrub the playhead either — until we're sure
-  // the touch wasn't one of those. A normal scroll fling still works
-  // exactly as before, since those gestures fail out almost immediately
-  // for a touch that isn't held on a clip or a handle.
+  // move/trim gestures for the same touch. Wrapping it as its own gesture
+  // and making it wait for every move/trim gesture to fail first means it
+  // cannot start scrolling (or scrubbing the playhead) until we're sure the
+  // touch wasn't one of those. A normal scroll still works as before, since
+  // those gestures fail out almost immediately for a touch that isn't held
+  // on a clip or a handle.
   const scrollNativeGesture = Gesture.Native()
     .requireExternalGestureToFail(
-      videoMoveGesture,
-      audioMoveGesture,
+      ...Object.values(moveGestures),
       leftHandlePan,
       rightHandlePan,
     )
@@ -1604,9 +1646,8 @@ export default function EditorTimeline({
       runOnJS(handleFingerLifted)();
     });
 
-  // Handles sit at the clip box's actual left/right edges — left edge is
-  // always the offset (timeline position), right edge is offset + the
-  // clip's (trimmed) length.
+  // Handles sit at the selected clip's actual left/right edges: left edge
+  // is its start, right edge is start + its timeline length.
   const leftHandleStyle = useAnimatedStyle(() => ({
     left:
       LEADING_WIDTH +
@@ -1619,33 +1660,15 @@ export default function EditorTimeline({
   const rightHandleStyle = useAnimatedStyle(() => ({
     left:
       LEADING_WIDTH +
-      (offsetSV.value + (trimEndSV.value - trimStartSV.value)) *
+      (offsetSV.value +
+        (trimEndSV.value - trimStartSV.value) / trimSpeedSV.value) *
         pixelsPerSecondSV.value -
       TRIM_HANDLE_WIDTH / 2,
     top: handleTop,
     height: handleHeight,
   }));
 
-  // The full source video laid out behind each clip box (thumbnails /
-  // waveform), shifted left by the trim-in point. Driven by the UI-thread
-  // zoom so it keeps up with a pinch frame by frame.
-  const videoTrimStart = videoTrim.start;
-  const audioTrimStart = audioTrim.start;
-  const videoSourceWindowStyle = useAnimatedStyle(() => ({
-    left: -videoTrimStart * pixelsPerSecondSV.value,
-    width: Math.max(safeDuration * pixelsPerSecondSV.value, 200),
-  }));
-  const audioSourceWindowStyle = useAnimatedStyle(() => ({
-    left: -audioTrimStart * pixelsPerSecondSV.value,
-    width: Math.max(safeDuration * pixelsPerSecondSV.value, 200),
-  }));
-  // The waveform bars are built for the last zoom React knows about; during
-  // a pinch they're stretched to the live zoom (and rebuilt crisp once the
-  // fingers lift), instead of rebuilding hundreds of bars every frame.
   const committedPPS = pixelsPerSecond;
-  const waveformStretchStyle = useAnimatedStyle(() => ({
-    transform: [{ scaleX: pixelsPerSecondSV.value / committedPPS }],
-  }));
 
   const outerRowStyle = useAnimatedStyle(() => ({
     width: totalScrollWidthSV.value,
@@ -1770,81 +1793,63 @@ export default function EditorTimeline({
                           ))}
                         </View>
 
-                        <TimelineClipBox
-                          slotHeight={TRACK_HEIGHT}
-                          slotMarginTop={TRACK_GAP}
-                          offsetSV={videoOffsetSV}
-                          pixelsPerSecondSV={pixelsPerSecondSV}
-                          lengthSeconds={videoTrim.end - videoTrim.start}
-                          selected={isVideoSelected}
-                          backgroundColor={colors.background}
-                          selectedBorderColor={colors.accentPurple}
-                          inactiveBorderColor={colors.iconInactive}
-                          labelIcon="film-outline"
-                          labelText={clipLabel}
-                          onPress={() => onSelectClip("video")}
-                          moveGesture={videoMoveGesture}
-                          movingSV={videoMovingSV}
-                        >
-                          {thumbnails.length > 0 && (
-                            <Animated.View
-                              style={[
-                                styles.thumbLayer,
-                                videoSourceWindowStyle,
-                              ]}
-                              pointerEvents="none"
+                        <View style={styles.clipRow}>
+                          {videoClips.map((clip) => (
+                            <TimelineClipBox
+                              key={clip.id}
+                              clipId={clip.id}
+                              start={clip.start}
+                              lengthSeconds={clipLength(clip)}
+                              height={TRACK_HEIGHT}
+                              pixelsPerSecondSV={pixelsPerSecondSV}
+                              drag={drag}
+                              selected={isClipHighlighted(clip)}
+                              backgroundColor={colors.background}
+                              selectedBorderColor={colors.accentPurple}
+                              inactiveBorderColor={colors.iconInactive}
+                              labelIcon="film-outline"
+                              labelText={clipLabel}
+                              onPress={() => onSelectClip(clip.id)}
+                              moveGesture={moveGestures[clip.id]}
                             >
-                              {thumbnails.map((uri, i) => (
-                                <ThumbnailTile
-                                  key={i}
-                                  uri={uri}
-                                  count={thumbnails.length}
-                                  durationSV={durationSV}
-                                  pixelsPerSecondSV={pixelsPerSecondSV}
-                                  placeholderColor={colors.background}
-                                />
-                              ))}
-                            </Animated.View>
-                          )}
-                        </TimelineClipBox>
-
-                        <TimelineClipBox
-                          slotHeight={TRACK_HEIGHT}
-                          slotMarginTop={TRACK_GAP}
-                          offsetSV={audioOffsetSV}
-                          pixelsPerSecondSV={pixelsPerSecondSV}
-                          lengthSeconds={audioTrim.end - audioTrim.start}
-                          selected={isAudioSelected}
-                          backgroundColor={colors.background}
-                          selectedBorderColor={colors.accentPurple}
-                          inactiveBorderColor={colors.iconInactive}
-                          labelIcon="musical-notes-outline"
-                          labelText="Original audio"
-                          onPress={() => onSelectClip("audio")}
-                          moveGesture={audioMoveGesture}
-                          movingSV={audioMovingSV}
-                        >
-                          <Animated.View
-                            style={[
-                              styles.waveformWindow,
-                              audioSourceWindowStyle,
-                            ]}
-                            pointerEvents="none"
-                          >
-                            <Animated.View
-                              style={[
-                                styles.waveformStretch,
-                                waveformStretchStyle,
-                              ]}
-                            >
-                              <WaveformBars
-                                color={colors.iconInactive}
-                                contentWidth={contentWidth}
-                                pixelsPerSecond={pixelsPerSecond}
+                              <ClipThumbnails
+                                clip={clip}
+                                thumbnails={thumbnails}
+                                pixelsPerSecondSV={pixelsPerSecondSV}
+                                placeholderColor={colors.background}
                               />
-                            </Animated.View>
-                          </Animated.View>
-                        </TimelineClipBox>
+                            </TimelineClipBox>
+                          ))}
+                        </View>
+
+                        <View style={styles.clipRow}>
+                          {audioClips.map((clip) => (
+                            <TimelineClipBox
+                              key={clip.id}
+                              clipId={clip.id}
+                              start={clip.start}
+                              lengthSeconds={clipLength(clip)}
+                              height={TRACK_HEIGHT}
+                              pixelsPerSecondSV={pixelsPerSecondSV}
+                              drag={drag}
+                              selected={isClipHighlighted(clip)}
+                              backgroundColor={colors.background}
+                              selectedBorderColor={colors.accentPurple}
+                              inactiveBorderColor={colors.iconInactive}
+                              labelIcon="musical-notes-outline"
+                              labelText="Original audio"
+                              onPress={() => onSelectClip(clip.id)}
+                              moveGesture={moveGestures[clip.id]}
+                            >
+                              <ClipWaveform
+                                clip={clip}
+                                pixelsPerSecondSV={pixelsPerSecondSV}
+                                committedPPS={committedPPS}
+                                color={colors.iconInactive}
+                              />
+                            </TimelineClipBox>
+                          ))}
+                        </View>
 
                         <Animated.View
                           style={[styles.emptyTrackRow, trackWidthStyle]}
@@ -1967,6 +1972,11 @@ const styles = StyleSheet.create({
   },
   // Empty-state placeholder row (e.g. "Add text" before any text is
   // added) — flat, no border/box, so it doesn't read as an existing clip.
+  // One row per track; clip boxes are absolutely positioned inside it.
+  clipRow: {
+    height: TRACK_HEIGHT,
+    marginTop: TRACK_GAP,
+  },
   emptyTrackRow: {
     height: TRACK_HEIGHT,
     marginTop: TRACK_GAP,
@@ -1980,6 +1990,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
   },
   thumbTile: {
+    flex: 1,
     height: "100%",
     overflow: "hidden",
   },
