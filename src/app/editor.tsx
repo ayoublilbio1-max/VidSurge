@@ -1,9 +1,11 @@
 import { Ionicons } from "@expo/vector-icons";
+import * as DocumentPicker from "expo-document-picker";
 import { router, useLocalSearchParams } from "expo-router";
 import { useVideoPlayer, VideoView } from "expo-video";
 import * as VideoThumbnails from "expo-video-thumbnails";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
+  Alert,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -34,7 +36,9 @@ import {
   type ClipRange,
   type Project,
 } from "../editor/clipModel";
+import { probeDuration } from "../editor/mediaProbe";
 import {
+  addAudioClipAction,
   initSourceAction,
   projectReducer,
   splitClipAction,
@@ -63,6 +67,8 @@ export default function EditorScreen() {
   const colors = useTheme();
   const { videoUri } = useLocalSearchParams<{ videoUri: string }>();
   const [comingSoonVisible, setComingSoonVisible] = useState(false);
+  // The phone's file picker is open / the picked file is being read.
+  const addingAudioRef = useRef(false);
   const [isPlaying, setIsPlaying] = useState(false);
   // True while the user is dragging/flinging the timeline. The audio
   // player's seeks are held back during this (see useTrackTimelineSync's
@@ -356,6 +362,7 @@ export default function EditorScreen() {
     timelineTime,
     seekVersion,
     clips: videoClipsBySlot[0],
+    initialUri: videoUri ?? "",
     onEnterClip: () => showVideoSlot(0, "playhead entered its clip"),
   });
   useTrackTimelineSync({
@@ -365,6 +372,7 @@ export default function EditorScreen() {
     timelineTime,
     seekVersion,
     clips: videoClipsBySlot[1],
+    initialUri: videoUri ?? "",
     onEnterClip: () => showVideoSlot(1, "playhead entered its clip"),
   });
   useTrackTimelineSync({
@@ -374,6 +382,7 @@ export default function EditorScreen() {
     timelineTime,
     seekVersion,
     clips: audioClipsBySlot[0],
+    initialUri: videoUri ?? "",
     holdSeeks: isScrubbing,
     onEnterClip: () => hearAudioSlot(0, "playhead entered its clip"),
   });
@@ -384,6 +393,7 @@ export default function EditorScreen() {
     timelineTime,
     seekVersion,
     clips: audioClipsBySlot[1],
+    initialUri: videoUri ?? "",
     holdSeeks: isScrubbing,
     onEnterClip: () => hearAudioSlot(1, "playhead entered its clip"),
   });
@@ -403,6 +413,13 @@ export default function EditorScreen() {
     selectedClip !== null &&
     canSplitAt(selectedClip, timelineTime) &&
     (selectedPartner === null || canSplitAt(selectedPartner, timelineTime));
+
+  // Delete is usable on any selected clip, unless it (with its locked
+  // partner) is everything left in the project: an empty project has no way
+  // to add media back yet (that comes with an "add clip" tool).
+  const clipCount = project.tracks.video.length + project.tracks.audio.length;
+  const deleteEnabled =
+    selectedClip !== null && clipCount - (selectedPartner ? 2 : 1) > 0;
 
   // ---- Transport handlers (thin — the hooks above react to the state
   // changes these make, so there's no manual player.play()/currentTime
@@ -554,8 +571,106 @@ export default function EditorScreen() {
     );
   };
 
+  // Delete the selected clip — and its locked partner (the reducer does
+  // both). The gap stays; nothing else moves. Pauses first, like every
+  // edit. Nothing is selected afterwards (project tools come back). The
+  // playhead stays, unless the timeline got shorter than where it sits.
+  const handleDelete = () => {
+    if (!selectedClip || !deleteEnabled) return;
+    pauseForGesture("delete");
+    if (__DEV__)
+      console.log(
+        `[editor] delete ${selectedClip.id}${selectedPartner ? ` + locked ${selectedPartner.id}` : " (unlocked, alone)"}`,
+      );
+    const nextProject = commitProject(
+      { type: "DELETE_CLIP", clipId: selectedClip.id },
+      `delete ${selectedClip.track}${selectedPartner ? ", locked" : ""}`,
+    );
+    setSelectedClipId(null);
+    const at = isPlaying ? playhead.uiTimeSV.get() : timelineTime;
+    const end = projectEnd(nextProject);
+    if (at > end) {
+      if (__DEV__)
+        console.log(
+          `[editor] delete — timeline now ${end.toFixed(2)}s, playhead ${at.toFixed(2)}s was past the end → moved to end`,
+        );
+      seekTo(end);
+    } else {
+      if (isPlaying) seekTo(at);
+      if (__DEV__)
+        console.log(`[editor] delete — playhead stays @ ${at.toFixed(2)}s`);
+    }
+  };
+
+  // Add music from the phone (the empty audio row's "Add audio", or the
+  // Music tool): opens the phone's file picker for audio files, reads the
+  // file's length, and adds it as a new unlinked audio clip at the playhead
+  // — full length, even past the end of the video. If the playhead is inside
+  // another audio clip, it goes to that clip's nearer edge and later clips
+  // move right (clips never overlap on a track).
+  const handleAddAudio = async (from: string) => {
+    if (addingAudioRef.current) return;
+    addingAudioRef.current = true;
+    pauseForGesture("add audio");
+    const at = isPlaying ? playhead.uiTimeSV.get() : timelineTime;
+    if (isPlaying) seekTo(at);
+    if (__DEV__)
+      console.log(
+        `[editor] add audio (${from}) @ ${at.toFixed(2)}s — opening the file picker`,
+      );
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: "audio/*",
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      const asset = result.canceled ? null : result.assets?.[0];
+      if (!asset) {
+        if (__DEV__) console.log("[editor] add audio — picker cancelled");
+        return;
+      }
+      if (__DEV__)
+        console.log(
+          `[editor] add audio — picked ${asset.name} (${asset.mimeType ?? "unknown type"})`,
+        );
+      const duration = await probeDuration(asset.uri);
+      if (duration <= 0) {
+        Alert.alert(
+          "Couldn't add audio",
+          "This file couldn't be read. Try another audio file.",
+        );
+        return;
+      }
+      const title = asset.name.replace(/\.[^.]+$/, "") || "Music";
+      const next = commitProject(
+        addAudioClipAction(asset.uri, duration, title, at),
+        "add audio",
+      );
+      if (__DEV__) {
+        const added = next.tracks.audio.find(
+          (c) => c.sourceUri === asset.uri && !findClip(project, c.id),
+        );
+        console.log(
+          `[editor] add audio — "${title}" (${duration.toFixed(2)}s) wanted @ ${at.toFixed(2)}s, placed @ ${added?.start.toFixed(2) ?? "?"}s`,
+        );
+      }
+    } catch (error) {
+      if (__DEV__) console.log("[editor] add audio failed", error);
+      Alert.alert(
+        "Couldn't add audio",
+        "Something went wrong opening the file.",
+      );
+    } finally {
+      addingAudioRef.current = false;
+    }
+  };
+
   // Tools that aren't built yet.
   const handleComingSoonTool = (key: string) => {
+    if (key === "music") {
+      void handleAddAudio("Music tool");
+      return;
+    }
     if (__DEV__)
       console.log(
         `[editor] ${key} on ${selectionKind === "none" ? "project" : `${selectionKind} selection`} — coming soon`,
@@ -748,8 +863,10 @@ export default function EditorScreen() {
           selectionKind={selectionKind}
           lockMode={lockMode}
           splitEnabled={splitEnabled}
+          deleteEnabled={deleteEnabled}
           onUnlock={handleUnlock}
           onSplit={handleSplit}
+          onDelete={handleDelete}
           onToolPress={handleComingSoonTool}
         />
 
@@ -768,6 +885,8 @@ export default function EditorScreen() {
               onMutePress={() => setComingSoonVisible(true)}
               onSelectClip={handleSelectClip}
               onAddTextPress={() => setComingSoonVisible(true)}
+              onAddAudioPress={() => void handleAddAudio("empty audio row")}
+              originalUri={videoUri ?? ""}
               onScrub={handleScrub}
               onScrubStart={handleScrubStart}
               onScrubEnd={handleScrubEnd}

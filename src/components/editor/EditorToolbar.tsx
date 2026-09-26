@@ -33,6 +33,7 @@ const DISABLED_OPACITY = 0.4;
 // Selection-based toolbar (CapCut style).
 // Nothing selected → project tools (things you ADD to the project).
 const PROJECT_TOOLS: EditorTool[] = [
+  { key: "music", icon: "musical-notes-outline", label: "Music" },
   { key: "canvas", icon: "tablet-portrait-outline", label: "Canvas" },
   { key: "addText", icon: "text-outline", label: "Add text" },
   { key: "stickers", icon: "happy-outline", label: "Stickers" },
@@ -88,8 +89,14 @@ interface EditorToolbarProps {
   lockMode: LockMode;
   /** Split can cut the selected clip at the playhead right now. */
   splitEnabled: boolean;
+  /**
+   * Delete can remove the selected clip (not when it would leave the
+   * project with no clips at all — there's no way to add media back yet).
+   */
+  deleteEnabled: boolean;
   onUnlock: () => void;
   onSplit: () => void;
+  onDelete: () => void;
   /** Any other tool (the ones not built yet). */
   onToolPress: (key: string) => void;
 }
@@ -98,8 +105,10 @@ export default function EditorToolbar({
   selectionKind,
   lockMode,
   splitEnabled,
+  deleteEnabled,
   onUnlock,
   onSplit,
+  onDelete,
   onToolPress,
 }: EditorToolbarProps) {
   const colors = useTheme();
@@ -134,6 +143,14 @@ export default function EditorToolbar({
           `[EditorToolbar] split pressed${splitEnabled ? "" : " — disabled (playhead not inside the selected clip)"}`,
         );
       if (splitEnabled) onSplit();
+      return;
+    }
+    if (key === "delete") {
+      if (__DEV__)
+        console.log(
+          `[EditorToolbar] delete pressed${deleteEnabled ? "" : " — disabled (it's the last clip in the project)"}`,
+        );
+      if (deleteEnabled) onDelete();
       return;
     }
     if (__DEV__) console.log(`[EditorToolbar] ${key} pressed (coming soon)`);
@@ -197,7 +214,9 @@ export default function EditorToolbar({
       )}
 
       {tools.map((tool) => {
-        const disabled = tool.key === "split" && !splitEnabled;
+        const disabled =
+          (tool.key === "split" && !splitEnabled) ||
+          (tool.key === "delete" && !deleteEnabled);
         return (
           <TouchableOpacity
             key={tool.key}

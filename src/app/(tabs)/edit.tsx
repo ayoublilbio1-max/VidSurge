@@ -45,6 +45,12 @@ export default function EditScreen() {
     }
   };
 
+  const handleConvertToMp3 = () => {
+    if (__DEV__) console.log("[edit] convert video to MP3 pressed");
+    // TODO: pick a video, extract audio, save as MP3 (needs native module).
+    setComingSoonVisible(true);
+  };
+
   if (loading) {
     return <EditScreenSkeleton />;
   }
@@ -78,6 +84,29 @@ export default function EditScreen() {
           onPress={() => setComingSoonVisible(true)}
         />
       </View>
+
+      <TouchableOpacity
+        activeOpacity={0.8}
+        style={[styles.toolButton, { backgroundColor: colors.surface }]}
+        onPress={handleConvertToMp3}
+      >
+        <View
+          style={[
+            styles.toolIconWrap,
+            { backgroundColor: colors.accentPurple + "22" },
+          ]}
+        >
+          <Ionicons
+            name="musical-notes-outline"
+            size={20}
+            color={colors.accentPurpleBright}
+          />
+        </View>
+        <AppText style={[styles.toolLabel, { color: colors.textPrimary }]}>
+          Convert video to MP3
+        </AppText>
+        <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
+      </TouchableOpacity>
 
       <View style={styles.projectsHeader}>
         <AppText style={[styles.projectsTitle, { color: colors.textMuted }]}>
@@ -134,7 +163,24 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
   badgeText: { fontSize: 13, fontFamily: "Poppins-Medium" },
-  cardsRow: { flexDirection: "row", gap: 10, marginBottom: 32 },
+  cardsRow: { flexDirection: "row", gap: 10, marginBottom: 12 },
+  toolButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    borderRadius: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    marginBottom: 32,
+  },
+  toolIconWrap: {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  toolLabel: { flex: 1, fontSize: 14, fontFamily: "Poppins-Medium" },
   projectsHeader: {
     flexDirection: "row",
     alignItems: "center",

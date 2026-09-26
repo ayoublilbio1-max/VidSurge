@@ -17,7 +17,11 @@
 //     Unlocking (UNLINK_CLIP) clears the link for good — there is no
 //     re-lock action. Undo (step 4) is the only way back.
 //
-// Delete arrives in step 3 as a new action.
+// Add audio: ADD_CLIP puts a new clip (e.g. music from the phone) on its
+// track at the given time — or, if that's inside another clip, at that
+// clip's nearer edge — and pushes later clips right (clips never overlap).
+// Delete (step 3): DELETE_CLIP removes a clip — and its locked partner.
+// The timeline is free-form, so the gap it leaves stays; nothing moves.
 
 import {
   addClips,
@@ -26,11 +30,13 @@ import {
   findLinkedPartner,
   insertionPoint,
   newId,
+  removeClips,
   replaceClip,
   resolveOverlaps,
   sameRange,
   sanitizeRange,
   splitClip,
+  type Clip,
   type ClipRange,
   type Project,
 } from "./clipModel";
@@ -91,7 +97,52 @@ export type ProjectAction =
       rightId: string;
       partnerRightId: string;
       rightLinkId: string;
+    }
+  | {
+      /**
+       * Delete: removes the clip, and its locked partner with it (a locked
+       * pair acts as one). An unlocked clip goes alone. The space it took
+       * stays empty — nothing after it moves (free-form timeline).
+       */
+      type: "DELETE_CLIP";
+      clipId: string;
+    }
+  | {
+      /** A new clip (made by addAudioClipAction). See the note at the top. */
+      type: "ADD_CLIP";
+      clip: Clip;
     };
+
+/** What an added music clip keeps in `data`: its file name, for the label. */
+export type AudioClipData = { title: string };
+
+/**
+ * Music picked from the phone: a new, unlinked audio clip covering the
+ * whole file (full length, even if it runs past the video), placed at
+ * timeline time `at`.
+ */
+export function addAudioClipAction(
+  sourceUri: string,
+  sourceDuration: number,
+  title: string,
+  at: number,
+): ProjectAction {
+  const data: AudioClipData = { title };
+  return {
+    type: "ADD_CLIP",
+    clip: createClip({
+      id: newId("music"),
+      track: "audio",
+      sourceUri,
+      sourceDuration,
+      linkId: null,
+      start: Math.max(0, at),
+      trimIn: 0,
+      trimOut: sourceDuration,
+      data,
+    }),
+  };
+}
 
 /**
  * First load of a video: one video clip and one audio clip covering the
@@ -221,6 +272,24 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
         added.push(partnerHalves[1]);
       }
       return addClips(next, added);
+    }
+
+    case "ADD_CLIP": {
+      const clip = action.clip;
+      if (findClip(state, clip.id)) return state;
+      const start = insertionPoint(
+        state.tracks[clip.track],
+        Math.max(0, clip.start),
+      );
+      const next = addClips(state, [{ ...clip, start }]);
+      return resolveOverlaps(next, [clip.id]);
+    }
+
+    case "DELETE_CLIP": {
+      const clip = findClip(state, action.clipId);
+      if (!clip) return state;
+      const partner = findLinkedPartner(state, clip);
+      return removeClips(state, partner ? [clip.id, partner.id] : [clip.id]);
     }
 
     default:

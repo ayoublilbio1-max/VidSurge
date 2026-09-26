@@ -131,6 +131,10 @@ interface EditorTimelineProps {
   onMutePress: () => void;
   onSelectClip: (clipId: string) => void;
   onAddTextPress: () => void;
+  /** The empty audio row was tapped: add music from the phone. */
+  onAddAudioPress: () => void;
+  /** The project's original video file (its audio clips say "Original audio"). */
+  originalUri: string;
   onScrub: (time: number) => void;
   // Fired the moment the user touches the timeline to start dragging the
   // playhead — lets the parent pause playback (InShot-style) so the scrub
@@ -285,6 +289,16 @@ function waveAmplitudeAtTime(t: number): number {
 // tick (currentTime changes), but the waveform only depends on zoom/width,
 // so it can skip all of those re-renders instead of rebuilding hundreds of
 // bar Views each time.
+// Label of an audio clip: music added from the phone shows its file name;
+// the video's own sound says "Original audio".
+function audioClipLabel(clip: Clip, originalUri: string): string {
+  const data = clip.data as { title?: unknown } | undefined;
+  if (clip.sourceUri !== originalUri && typeof data?.title === "string") {
+    return data.title;
+  }
+  return "Original audio";
+}
+
 const WaveformBars = memo(function WaveformBars({
   color,
   contentWidth,
@@ -437,6 +451,8 @@ export default function EditorTimeline({
   onMutePress,
   onSelectClip,
   onAddTextPress,
+  onAddAudioPress,
+  originalUri,
   onScrub,
   onScrubStart,
   onScrubEnd,
@@ -1979,34 +1995,67 @@ export default function EditorTimeline({
                           ))}
                         </View>
 
-                        <View style={styles.clipRow}>
-                          {audioClips.map((clip) => (
-                            <TimelineClipBox
-                              key={clip.id}
-                              clipId={clip.id}
-                              start={clip.start}
-                              lengthSeconds={clipLength(clip)}
-                              height={TRACK_HEIGHT}
-                              pixelsPerSecondSV={pixelsPerSecondSV}
-                              drag={drag}
-                              selected={isClipHighlighted(clip)}
-                              backgroundColor={colors.background}
-                              selectedBorderColor={colors.accentPurple}
-                              inactiveBorderColor={colors.iconInactive}
-                              labelIcon="musical-notes-outline"
-                              labelText="Original audio"
-                              onPress={() => onSelectClip(clip.id)}
-                              moveGesture={moveGestures[clip.id]}
+                        {audioClips.length === 0 ? (
+                          // No audio at all: a tappable "Add audio" row
+                          // (opens the phone's file picker).
+                          <Animated.View
+                            style={[styles.emptyTrackRow, trackWidthStyle]}
+                          >
+                            <TouchableOpacity
+                              style={styles.trackRowTouchable}
+                              onPress={() => {
+                                if (__DEV__)
+                                  console.log(
+                                    "[EditorTimeline] empty audio row tapped — add audio",
+                                  );
+                                onAddAudioPress();
+                              }}
                             >
-                              <ClipWaveform
-                                clip={clip}
-                                pixelsPerSecondSV={pixelsPerSecondSV}
-                                committedPPS={committedPPS}
-                                color={colors.iconInactive}
+                              <Ionicons
+                                name="musical-notes-outline"
+                                size={16}
+                                color={colors.textMuted}
                               />
-                            </TimelineClipBox>
-                          ))}
-                        </View>
+                              <AppText
+                                style={[
+                                  styles.trackLabel,
+                                  { color: colors.textMuted },
+                                ]}
+                              >
+                                Add audio
+                              </AppText>
+                            </TouchableOpacity>
+                          </Animated.View>
+                        ) : (
+                          <View style={styles.clipRow}>
+                            {audioClips.map((clip) => (
+                              <TimelineClipBox
+                                key={clip.id}
+                                clipId={clip.id}
+                                start={clip.start}
+                                lengthSeconds={clipLength(clip)}
+                                height={TRACK_HEIGHT}
+                                pixelsPerSecondSV={pixelsPerSecondSV}
+                                drag={drag}
+                                selected={isClipHighlighted(clip)}
+                                backgroundColor={colors.background}
+                                selectedBorderColor={colors.accentPurple}
+                                inactiveBorderColor={colors.iconInactive}
+                                labelIcon="musical-notes-outline"
+                                labelText={audioClipLabel(clip, originalUri)}
+                                onPress={() => onSelectClip(clip.id)}
+                                moveGesture={moveGestures[clip.id]}
+                              >
+                                <ClipWaveform
+                                  clip={clip}
+                                  pixelsPerSecondSV={pixelsPerSecondSV}
+                                  committedPPS={committedPPS}
+                                  color={colors.iconInactive}
+                                />
+                              </TimelineClipBox>
+                            ))}
+                          </View>
+                        )}
 
                         <Animated.View
                           style={[styles.emptyTrackRow, trackWidthStyle]}

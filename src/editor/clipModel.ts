@@ -239,6 +239,21 @@ export function replaceClip(project: Project, clip: Clip): Project {
   };
 }
 
+/** Removes the clips with these ids (unknown ids are ignored). */
+export function removeClips(project: Project, ids: string[]): Project {
+  const drop = new Set(ids);
+  const tracks = { ...project.tracks };
+  let changed = false;
+  for (const key of Object.keys(tracks) as (keyof typeof tracks)[]) {
+    const kept = tracks[key].filter((c) => !drop.has(c.id));
+    if (kept.length !== tracks[key].length) {
+      tracks[key] = kept;
+      changed = true;
+    }
+  }
+  return changed ? { ...project, tracks } : project;
+}
+
 /** Adds clips to their tracks (each track re-sorted). */
 export function addClips(project: Project, clips: Clip[]): Project {
   const tracks = { ...project.tracks };

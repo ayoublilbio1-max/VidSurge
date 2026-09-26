@@ -44,6 +44,13 @@ type UseTrackTimelineSyncParams = {
   /** This track's clips, sorted by start (from the project). */
   clips: Clip[];
   /**
+   * The file the player was created with. Clips can come from other files
+   * (music added from the phone); the player is switched to a clip's file
+   * (player.replace) when it's about to play it, and remembers which file
+   * it has loaded.
+   */
+  initialUri: string;
+  /**
    * While true, this track does NOT seek its player — it only remembers
    * that a seek is owed, and does it (once, to the exact position) as soon
    * as this goes back to false. Used for the audio track while the user
@@ -90,9 +97,12 @@ export function useTrackTimelineSync({
   timelineTime,
   seekVersion,
   clips,
+  initialUri,
   holdSeeks = false,
   onEnterClip,
 }: UseTrackTimelineSyncParams) {
+  // The file currently loaded in the player (see `initialUri`).
+  const loadedUriRef = useRef(initialUri);
   const onEnterClipRef = useRef(onEnterClip);
   onEnterClipRef.current = onEnterClip;
   // The clip currently under the playhead (id), or null in a gap.
@@ -114,6 +124,23 @@ export function useTrackTimelineSync({
 
   useEffect(() => {
     if (!player) return;
+
+    // Load `clip`'s file into the player if it has another one loaded.
+    // Returns true if it switched (the player then needs a seek + play).
+    const ensureSource = (clip: Clip, why: string): boolean => {
+      if (!clip.sourceUri || clip.sourceUri === loadedUriRef.current) {
+        return false;
+      }
+      if (__DEV__) {
+        console.log(
+          `[trackSync:${label}] load ${clip.sourceUri.split("/").pop()} for ${clip.id} (${why})`,
+        );
+      }
+      player.replace(clip.sourceUri);
+      loadedUriRef.current = clip.sourceUri;
+      playingRef.current = false;
+      return true;
+    };
 
     const active = activeClipAt(clips, timelineTime);
 
@@ -149,6 +176,7 @@ export function useTrackTimelineSync({
           prerolledIdRef.current !== nextClip.id
         ) {
           prerolledIdRef.current = nextClip.id;
+          ensureSource(nextClip, "preroll");
           player.currentTime = nextClip.trimIn;
           if (__DEV__) {
             console.log(
@@ -159,6 +187,11 @@ export function useTrackTimelineSync({
       }
       return;
     }
+
+    // Another file than the one loaded: switch first. A prerolled clip was
+    // already switched during the gap, so this is a no-op then.
+    const switchedSource = ensureSource(active, "clip under the playhead");
+    if (switchedSource) prerolledIdRef.current = null;
 
     const justEntered = activeIdRef.current !== active.id;
     // Came straight from another clip of this track (no gap in between),
@@ -194,7 +227,12 @@ export function useTrackTimelineSync({
       active.trimOut,
     );
 
-    let wantsSeek = justEntered || explicitSeek || mappingChanged || resuming;
+    let wantsSeek =
+      justEntered ||
+      explicitSeek ||
+      mappingChanged ||
+      resuming ||
+      switchedSource;
 
     // Entering a clip the player is already at: no seek needed. Either it
     // was parked there during a gap (preroll), or playback just crossed a
@@ -207,6 +245,7 @@ export function useTrackTimelineSync({
       wantsSeek &&
       justEntered &&
       !explicitSeek &&
+      !switchedSource &&
       (prerolled || continuing) &&
       offset >= -PREROLL_TOLERANCE &&
       offset <= (isPlaying ? ENTER_AHEAD_TOLERANCE : PREROLL_TOLERANCE)
