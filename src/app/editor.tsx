@@ -2,7 +2,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
 import { useVideoPlayer, VideoView } from "expo-video";
 import * as VideoThumbnails from "expo-video-thumbnails";
-import { useEffect, useReducer, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   Pressable,
   ScrollView,
@@ -10,14 +10,20 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import Animated, {
+  useAnimatedStyle,
+  useSharedValue,
+} from "react-native-reanimated";
 import ComingSoonModal from "../components/ComingSoonModal";
 import EditorScreenSkeleton from "../components/EditorScreenSkeleton";
 import EditorTimeline from "../components/editor/EditorTimeline";
 import EditorToolbar, {
   type LockMode,
+  type SelectionKind,
 } from "../components/editor/EditorToolbar";
 import EditorTopBar from "../components/editor/EditorTopBar";
 import {
+  canSplitAt,
   clipEnd,
   describeClip,
   EMPTY_PROJECT,
@@ -31,6 +37,7 @@ import {
 import {
   initSourceAction,
   projectReducer,
+  splitClipAction,
   type ProjectAction,
 } from "../editor/projectReducer";
 import { useTheme } from "../hooks/useTheme";
@@ -96,25 +103,51 @@ export default function EditorScreen() {
   }, [project]);
 
   // ---- Players -------------------------------------------------------
-  // The visual player. Its own embedded audio is muted permanently —
-  // sound only ever comes from `audioPlayer` below, which is what lets
-  // the "audio" track be dragged to a different timeline position than
-  // the video track and actually be heard at that position instead of
-  // the video's.
-  const player = useVideoPlayer(videoUri ?? "", (p) => {
+  // Two players per track that take turns: consecutive clips on a track
+  // alternate between player A and player B. While one plays the current
+  // clip, the other is already parked on the next clip's first frame and
+  // started early, so a cut (a split point, reordered parts) needs no seek
+  // — we just switch which player you see / hear. With one player per
+  // track, every cut to a different part of the source was a 0.2–0.5s seek
+  // (a hitch, then drift corrections).
+  //
+  // Video players: their own embedded audio is muted permanently — sound
+  // only ever comes from the audio players, which is what lets the audio
+  // track sit at different timeline positions than the video.
+  const videoPlayerA = useVideoPlayer(videoUri ?? "", (p) => {
     p.loop = false;
     p.timeUpdateEventInterval = 0.2;
     p.muted = true;
   });
-
-  // A second, audio-only instance of the same source file. No <VideoView>
-  // is mounted for this one — expo-video is able to decode/play just the
-  // audio track with no view attached. It is synced independently, off
-  // the audio track's own clips.
-  const audioPlayer = useVideoPlayer(videoUri ?? "", (p) => {
+  const videoPlayerB = useVideoPlayer(videoUri ?? "", (p) => {
+    p.loop = false;
+    p.timeUpdateEventInterval = 0.2;
+    p.muted = true;
+  });
+  // Audio-only instances of the same file (no <VideoView> attached —
+  // expo-video can decode/play just the audio).
+  const audioPlayerA = useVideoPlayer(videoUri ?? "", (p) => {
     p.loop = false;
     p.timeUpdateEventInterval = 0.2;
   });
+  const audioPlayerB = useVideoPlayer(videoUri ?? "", (p) => {
+    p.loop = false;
+    p.timeUpdateEventInterval = 0.2;
+    p.muted = true;
+  });
+  const player = videoPlayerA;
+  const audioPlayers = [audioPlayerA, audioPlayerB] as const;
+
+  // Which video player is on screen (0 = A, 1 = B). Switched on the UI
+  // thread at the exact cut (by the clock), so no React re-render sits
+  // between the cut and the new picture.
+  const visibleVideoSV = useSharedValue(0);
+  const videoAStyle = useAnimatedStyle(() => ({
+    opacity: visibleVideoSV.value === 0 ? 1 : 0,
+  }));
+  const videoBStyle = useAnimatedStyle(() => ({
+    opacity: visibleVideoSV.value === 1 ? 1 : 0,
+  }));
 
   // Note: there used to be two `useEvent(player, "timeUpdate")`
   // subscriptions here. Their values were never read (the timeline clock
@@ -193,27 +226,76 @@ export default function EditorScreen() {
     ? findLinkedPartner(project, selectedClip)
     : null;
 
-  // Lock button: only usable when the selected clip is locked to a partner
-  // (tap = unlock, one-way). Greyed out when nothing is selected or the
-  // selected clip is already unlocked.
+  // Lock button (clip tools only): usable when the selected clip is locked
+  // to a partner (tap = unlock, one-way); greyed out if already unlocked.
   const lockMode: LockMode = !selectedClip
     ? "none"
     : selectedPartner
       ? "locked"
       : "unlocked";
 
-  // ---- Shared clock + per-track sync ----------------------------------
-  // One clock entry per clip. Each track's single player serves all of
-  // that track's clips (the sync hook seeks it into whichever clip is under
-  // the playhead), so every entry on a track reads the same player.
+  // Which clip tools the toolbar shows: a locked pair gets all of them
+  // (each applies to the part it belongs to), an unlocked clip only its
+  // own kind's (video: picture tools, no Volume; audio: Volume, no
+  // picture tools).
+  const selectionKind: SelectionKind = !selectedClip
+    ? "none"
+    : selectedPartner
+      ? "locked"
+      : selectedClip.track === "audio"
+        ? "audio"
+        : "video";
+
+  // ---- Clips per player -------------------------------------------------
+  // Consecutive clips on a track alternate between the track's two players
+  // (clip 0 → A, clip 1 → B, clip 2 → A...). Tracks are kept sorted by
+  // start, so the next clip is always on the other, free player.
+  const videoClipsBySlot = useMemo(
+    () => [
+      videoClips.filter((_, i) => i % 2 === 0),
+      videoClips.filter((_, i) => i % 2 === 1),
+    ],
+    [videoClips],
+  );
+  const audioClipsBySlot = useMemo(
+    () => [
+      audioClips.filter((_, i) => i % 2 === 0),
+      audioClips.filter((_, i) => i % 2 === 1),
+    ],
+    [audioClips],
+  );
+
+  // Make a video player the one on screen.
+  const showVideoSlot = (slot: number, why: string) => {
+    if (visibleVideoSV.get() === slot) return;
+    visibleVideoSV.set(slot);
+    if (__DEV__)
+      console.log(
+        `[editor] showing video player ${slot === 0 ? "A" : "B"} (${why})`,
+      );
+  };
+  // Make an audio player the one you hear (the other is muted).
+  const hearAudioSlot = (slot: number, why: string) => {
+    if (!audioPlayers[slot].muted && audioPlayers[1 - slot].muted) return;
+    audioPlayers[slot].muted = false;
+    audioPlayers[1 - slot].muted = true;
+    if (__DEV__)
+      console.log(
+        `[editor] hearing audio player ${slot === 0 ? "A" : "B"} (${why})`,
+      );
+  };
+
+  // ---- Shared clock + per-player sync -----------------------------------
+  // One clock entry per clip, reading the player that clip plays on.
   const clockEntries = (
     clips: Clip[],
     p: typeof player,
+    slot: number,
     priority: number,
   ): ClockTrack[] =>
     clips.map((clip) => ({
       label: clip.id,
-      trackKey: clip.track,
+      trackKey: `${clip.track}#${slot}`,
       clipStart: clip.start,
       clipEnd: clipEnd(clip),
       trimStart: clip.trimIn,
@@ -225,17 +307,32 @@ export default function EditorScreen() {
       resyncTo: (sourceTime) => {
         if (__DEV__)
           console.log(
-            `[editor] clock pulled ${clip.track} player (${clip.id}) to ${sourceTime.toFixed(2)}s`,
+            `[editor] clock pulled ${clip.track} player ${slot === 0 ? "A" : "B"} (${clip.id}) to ${sourceTime.toFixed(2)}s`,
           );
         p.currentTime = sourceTime;
       },
       pause: () => p.pause(),
       play: () => p.play(),
+      setRate: (rate) => {
+        p.playbackRate = rate;
+      },
+      activate: () =>
+        clip.track === "audio"
+          ? hearAudioSlot(slot, `${clip.id} begins`)
+          : showVideoSlot(slot, `${clip.id} begins`),
+      silence:
+        clip.track === "audio"
+          ? () => {
+              p.muted = true;
+            }
+          : undefined,
     }));
   // Video first (priority 0): the picture is what the playhead follows.
   const clockTracks: ClockTrack[] = [
-    ...clockEntries(videoClips, player, 0),
-    ...clockEntries(audioClips, audioPlayer, 1),
+    ...clockEntries(videoClipsBySlot[0], videoPlayerA, 0, 0),
+    ...clockEntries(videoClipsBySlot[1], videoPlayerB, 1, 0),
+    ...clockEntries(audioClipsBySlot[0], audioPlayerA, 0, 1),
+    ...clockEntries(audioClipsBySlot[1], audioPlayerB, 1, 1),
   ];
 
   const { timelineTime, seekVersion, seekTo, playhead, halt } =
@@ -250,23 +347,45 @@ export default function EditorScreen() {
       },
     });
 
+  // One sync per player, each with its own clips. Entering a clip (paused,
+  // scrubbing or playing) makes that player the one you see / hear.
   useTrackTimelineSync({
-    label: "video",
-    player,
+    label: "video A",
+    player: videoPlayerA,
     isPlaying,
     timelineTime,
     seekVersion,
-    clips: videoClips,
+    clips: videoClipsBySlot[0],
+    onEnterClip: () => showVideoSlot(0, "playhead entered its clip"),
   });
-
   useTrackTimelineSync({
-    label: "audio",
-    player: audioPlayer,
+    label: "video B",
+    player: videoPlayerB,
     isPlaying,
     timelineTime,
     seekVersion,
-    clips: audioClips,
+    clips: videoClipsBySlot[1],
+    onEnterClip: () => showVideoSlot(1, "playhead entered its clip"),
+  });
+  useTrackTimelineSync({
+    label: "audio A",
+    player: audioPlayerA,
+    isPlaying,
+    timelineTime,
+    seekVersion,
+    clips: audioClipsBySlot[0],
     holdSeeks: isScrubbing,
+    onEnterClip: () => hearAudioSlot(0, "playhead entered its clip"),
+  });
+  useTrackTimelineSync({
+    label: "audio B",
+    player: audioPlayerB,
+    isPlaying,
+    timelineTime,
+    seekVersion,
+    clips: audioClipsBySlot[1],
+    holdSeeks: isScrubbing,
+    onEnterClip: () => hearAudioSlot(1, "playhead entered its clip"),
   });
 
   // Black preview when no video clip is under the playhead. Clip ends count
@@ -277,6 +396,13 @@ export default function EditorScreen() {
       timelineTime >= clip.start - 0.001 &&
       timelineTime <= clipEnd(clip) + 0.001,
   );
+
+  // Split is usable when the playhead is inside the selected clip (and its
+  // locked partner), at least MIN_SPLIT_PART from either edge.
+  const splitEnabled =
+    selectedClip !== null &&
+    canSplitAt(selectedClip, timelineTime) &&
+    (selectedPartner === null || canSplitAt(selectedPartner, timelineTime));
 
   // ---- Transport handlers (thin — the hooks above react to the state
   // changes these make, so there's no manual player.play()/currentTime
@@ -399,22 +525,92 @@ export default function EditorScreen() {
     );
   };
 
+  // Split the selected clip at the playhead. Locked: its partner is cut at
+  // the same moment (the reducer does both). Unlocked: only this clip. The
+  // left half keeps the original id, so it stays selected.
+  const handleSplit = () => {
+    if (!selectedClip) return;
+    // While playing, cut where the playhead is DRAWN (the throttled React
+    // time can be ~0.2s behind), then pause there.
+    const at = isPlaying ? playhead.uiTimeSV.get() : timelineTime;
+    if (isPlaying) {
+      pauseForGesture("split");
+      seekTo(at);
+    }
+    if (!canSplitAt(selectedClip, at)) {
+      if (__DEV__)
+        console.log(
+          `[editor] split @ ${at.toFixed(2)}s — playhead not inside ${selectedClip.id} (or too close to an edge)`,
+        );
+      return;
+    }
+    if (__DEV__)
+      console.log(
+        `[editor] split ${selectedClip.id}${selectedPartner ? ` + locked ${selectedPartner.id}` : " (unlocked, alone)"} @ ${at.toFixed(2)}s`,
+      );
+    commitProject(
+      splitClipAction(selectedClip.id, at),
+      `split ${selectedClip.track}${selectedPartner ? ", locked" : ""}`,
+    );
+  };
+
+  // Tools that aren't built yet.
+  const handleComingSoonTool = (key: string) => {
+    if (__DEV__)
+      console.log(
+        `[editor] ${key} on ${selectionKind === "none" ? "project" : `${selectionKind} selection`} — coming soon`,
+      );
+    setComingSoonVisible(true);
+  };
+
+  // Capture (camera next to play): will save the frame under the playhead.
+  const handleCapture = () => {
+    if (__DEV__)
+      console.log(
+        `[editor] capture pressed @ ${timelineTime.toFixed(2)}s — coming soon`,
+      );
+    setComingSoonVisible(true);
+  };
+
   // A trim or move committed on the timeline (finger lifted).
-  const handleClipChange = (clipId: string, range: ClipRange) => {
+  // Returns whether the project changed.
+  const handleClipChange = (clipId: string, range: ClipRange): boolean => {
     const clip = findClip(project, clipId);
-    if (!clip) return;
+    if (!clip) return false;
     const trimChanged =
       range.trimIn !== clip.trimIn || range.trimOut !== clip.trimOut;
     const kind = `${clip.track} ${trimChanged ? "trim" : "move"}`;
     const locked = findLinkedPartner(project, clip) !== null;
 
-    // One action for the whole edit. If the clip is locked to a partner,
-    // the reducer applies the same range to it (video + audio cut and move
-    // together).
+    // A move: dropped at `range.start`; the reducer inserts it (nearer edge
+    // of the clip it landed on, later clips pushed right — never overlaps).
+    // A trim: the new range as-is; the timeline already stopped the handles
+    // at the neighbours. Locked: the partner gets the same either way.
+    const action: ProjectAction = trimChanged
+      ? { type: "UPDATE_CLIP_RANGE", clipId, range }
+      : { type: "MOVE_CLIP", clipId, start: range.start };
     const nextProject = commitProject(
-      { type: "UPDATE_CLIP_RANGE", clipId, range },
+      action,
       `${kind}${locked ? ", locked" : ""}`,
     );
+    if (__DEV__ && !trimChanged) {
+      const landed = findClip(nextProject, clipId);
+      const partnerId = findLinkedPartner(project, clip)?.id ?? null;
+      const pushed = (["video", "audio"] as const).flatMap((track) =>
+        nextProject.tracks[track].filter((c) => {
+          const before = findClip(project, c.id);
+          return (
+            before !== null &&
+            c.id !== clipId &&
+            c.id !== partnerId &&
+            before.start !== c.start
+          );
+        }),
+      );
+      console.log(
+        `[editor] ${kind} — dropped at ${range.start.toFixed(2)}s, landed at ${landed?.start.toFixed(2)}s${pushed.length > 0 ? `, pushed: ${pushed.map((c) => `${c.id} → ${c.start.toFixed(2)}s`).join(", ")}` : ""}`,
+      );
+    }
 
     // The playhead STAYS where it is after a trim or move. If the edit
     // leaves it over empty space, the preview just shows the gap, like any
@@ -432,6 +628,7 @@ export default function EditorScreen() {
         `[editor] ${kind} — playhead stays @ ${timelineTime.toFixed(2)}s`,
       );
     }
+    return nextProject !== project;
   };
 
   const clipLabel = videoUri
@@ -462,12 +659,33 @@ export default function EditorScreen() {
             <View
               style={[styles.previewBox, { backgroundColor: colors.surface }]}
             >
-              <VideoView
-                player={player}
-                style={styles.video}
-                contentFit="contain"
-                nativeControls={false}
-              />
+              {/* Two stacked video views, one per video player; only the
+                  active one is visible. TextureView (not the default
+                  SurfaceView) so they can be layered and faded on Android. */}
+              <Animated.View
+                pointerEvents="none"
+                style={[StyleSheet.absoluteFill, videoAStyle]}
+              >
+                <VideoView
+                  player={videoPlayerA}
+                  style={styles.video}
+                  contentFit="contain"
+                  nativeControls={false}
+                  surfaceType="textureView"
+                />
+              </Animated.View>
+              <Animated.View
+                pointerEvents="none"
+                style={[StyleSheet.absoluteFill, videoBStyle]}
+              >
+                <VideoView
+                  player={videoPlayerB}
+                  style={styles.video}
+                  contentFit="contain"
+                  nativeControls={false}
+                  surfaceType="textureView"
+                />
+              </Animated.View>
               {isVoidNow && (
                 <View pointerEvents="none" style={styles.voidOverlay} />
               )}
@@ -501,9 +719,13 @@ export default function EditorScreen() {
               />
             </TouchableOpacity>
 
-            <TouchableOpacity onPress={() => setComingSoonVisible(true)}>
+            <TouchableOpacity
+              onPress={handleCapture}
+              accessibilityRole="button"
+              accessibilityLabel="Capture frame"
+            >
               <Ionicons
-                name="options-outline"
+                name="camera-outline"
                 size={20}
                 color={colors.iconInactive}
               />
@@ -516,13 +738,22 @@ export default function EditorScreen() {
               />
             </TouchableOpacity>
           </View>
+        </Pressable>
 
-          <EditorToolbar
-            lockMode={lockMode}
-            onUnlock={handleUnlock}
-            onToolPress={() => setComingSoonVisible(true)}
-          />
+        {/* The toolbar sits OUTSIDE the tap-to-deselect areas: inside one,
+            the wrapper competed with the toolbar's own horizontal scroll
+            for the same touch, so scrolling sometimes didn't start or felt
+            sticky. Taps on the toolbar never deselect anyway. */}
+        <EditorToolbar
+          selectionKind={selectionKind}
+          lockMode={lockMode}
+          splitEnabled={splitEnabled}
+          onUnlock={handleUnlock}
+          onSplit={handleSplit}
+          onToolPress={handleComingSoonTool}
+        />
 
+        <Pressable onPress={() => clearSelection("background")}>
           <View style={styles.timelineWrap}>
             <EditorTimeline
               clipLabel={clipLabel}

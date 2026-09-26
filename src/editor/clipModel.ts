@@ -274,6 +274,144 @@ export function sameRange(clip: Clip, range: ClipRange): boolean {
   );
 }
 
+// ---- Placement (no overlaps on a track) -----------------------------------------
+//
+// Clips on the same track never overlap (one player per track can't play two
+// clips at once). A moved clip may pass over others while dragging; on drop:
+//   - dropped where it fits → it lands exactly there
+//   - dropped with its start INSIDE another clip → it's inserted at that
+//     clip's nearer edge
+//   - whatever it then overlaps is pushed right, just far enough; pushed
+//     locked clips take their partner along (which can push clips on the
+//     other track too)
+
+const PLACE_EPSILON = 0.001;
+
+/**
+ * Where a clip dropped at `start` actually goes on a track: `start` itself,
+ * unless that falls inside one of `others` — then that clip's nearer edge.
+ */
+export function insertionPoint(others: Clip[], start: number): number {
+  for (const o of others) {
+    const end = clipEnd(o);
+    if (start > o.start + PLACE_EPSILON && start < end - PLACE_EPSILON) {
+      return start - o.start <= end - start ? o.start : end;
+    }
+  }
+  return start;
+}
+
+/**
+ * Removes overlaps on every track by pushing clips right, without moving
+ * the `fixed` clips (the ones just placed). A clip is pushed only as far as
+ * needed; later clips move only if they then overlap. Locked pairs are kept
+ * aligned (both halves at the later of their two starts), which can push
+ * clips on the other track too; repeats until nothing overlaps.
+ */
+export function resolveOverlaps(
+  project: Project,
+  fixedIds: Iterable<string>,
+): Project {
+  let next = project;
+  const fixed = new Set(fixedIds);
+  for (let iteration = 0; iteration < 20; iteration++) {
+    let changed = false;
+
+    for (const track of TRACK_IDS) {
+      const clips = next.tracks[track];
+      if (clips.length < 2) continue;
+      const occupied = clips
+        .filter((c) => fixed.has(c.id))
+        .map((c) => ({ start: c.start, end: clipEnd(c) }));
+      const free = clips
+        .filter((c) => !fixed.has(c.id))
+        .sort((a, b) => a.start - b.start);
+      for (const c of free) {
+        const len = clipLength(c);
+        let start = c.start;
+        let moved = true;
+        while (moved) {
+          moved = false;
+          for (const o of occupied) {
+            if (
+              start < o.end - PLACE_EPSILON &&
+              start + len > o.start + PLACE_EPSILON
+            ) {
+              start = o.end;
+              moved = true;
+            }
+          }
+        }
+        occupied.push({ start, end: start + len });
+        if (start !== c.start) {
+          next = replaceClip(next, { ...c, start });
+          changed = true;
+        }
+      }
+    }
+
+    // Locked pairs stay aligned: if one half got pushed, the other follows.
+    for (const track of TRACK_IDS) {
+      for (const c of next.tracks[track]) {
+        const partner = findLinkedPartner(next, c);
+        if (!partner || Math.abs(partner.start - c.start) < PLACE_EPSILON) {
+          continue;
+        }
+        const start = Math.max(c.start, partner.start);
+        next = replaceClip(next, { ...c, start });
+        next = replaceClip(next, { ...partner, start });
+        fixed.add(c.id);
+        fixed.add(partner.id);
+        changed = true;
+      }
+    }
+
+    if (!changed) break;
+  }
+  return next;
+}
+
+// ---- Split -------------------------------------------------------------------
+
+/** Each half of a split must be at least this long on the timeline (s). */
+export const MIN_SPLIT_PART = 0.1;
+
+/**
+ * Whether the clip can be cut at timeline time `t`: the playhead is inside
+ * it, with at least MIN_SPLIT_PART on each side.
+ */
+export function canSplitAt(clip: Clip, t: number): boolean {
+  return (
+    t >= clip.start + MIN_SPLIT_PART && t <= clipEnd(clip) - MIN_SPLIT_PART
+  );
+}
+
+/**
+ * Cuts a clip at timeline time `t` into two clips that play back exactly
+ * like the original: the left keeps the original id, start and trim-in and
+ * now ends at `t`; the right (new id) starts at `t` and keeps the original
+ * end. Every other setting (speed, volume...) is copied to both halves.
+ * Returns null if the clip can't be cut there (see canSplitAt).
+ */
+export function splitClip(
+  clip: Clip,
+  t: number,
+  rightId: string,
+  rightLinkId: string | null,
+): [Clip, Clip] | null {
+  if (!canSplitAt(clip, t)) return null;
+  const cut = timelineToSource(clip, t);
+  const left: Clip = { ...clip, trimOut: cut };
+  const right: Clip = {
+    ...clip,
+    id: rightId,
+    start: t,
+    trimIn: cut,
+    linkId: rightLinkId,
+  };
+  return [left, right];
+}
+
 // ---- Debug ----------------------------------------------------------------
 
 /** One-line summary of a clip, for [project] logs. */

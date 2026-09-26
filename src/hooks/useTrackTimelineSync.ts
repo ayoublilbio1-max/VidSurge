@@ -15,6 +15,14 @@ const PREROLL_WINDOW = 1.5;
 // the parked frame is still much faster than a seek; the clock simply
 // holds the playhead until the picture catches up.
 const PREROLL_TOLERANCE = 0.3;
+// ...and how far AHEAD the player may be. While playing, `timelineTime`
+// (React) lags the real playhead by up to ~0.2s (more when the JS thread is
+// busy), and the clock starts an upcoming clip's player early — so on entry
+// the running player normally looks ahead of the stale target. Seeking it
+// back restarted the video and left it ~0.6s behind (then the drift fix
+// yanked it forward again). Within this window it's left alone; the clock,
+// which has the exact time, corrects any real difference.
+const ENTER_AHEAD_TOLERANCE = 1.0;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(value, max));
@@ -44,12 +52,21 @@ type UseTrackTimelineSyncParams = {
    * a paused audio player anyway.
    */
   holdSeeks?: boolean;
+  /**
+   * Called when the playhead enters one of this player's clips (playing,
+   * paused or scrubbing): makes this player the one you see / hear on its
+   * track. While playing, the clock already did it at the exact moment;
+   * calling it again is harmless.
+   */
+  onEnterClip?: () => void;
 };
 
 /**
- * Per-track playback reactor. Call once per track (video, audio). One
- * player serves every clip on the track: it seeks/plays/pauses that player
- * based on which of the track's clips is under the playhead.
+ * Per-player playback reactor. Each track has two players that take turns
+ * (consecutive clips alternate between them); call this once per player,
+ * with that player's clips. It seeks/plays/pauses the player based on which
+ * of its clips is under the playhead, and parks it on its next clip while
+ * the other player is playing.
  *
  * The player gets force-seeked to the playhead when:
  *   1. the playhead entered a clip (from a gap, or from another clip —
@@ -74,7 +91,10 @@ export function useTrackTimelineSync({
   seekVersion,
   clips,
   holdSeeks = false,
+  onEnterClip,
 }: UseTrackTimelineSyncParams) {
+  const onEnterClipRef = useRef(onEnterClip);
+  onEnterClipRef.current = onEnterClip;
   // The clip currently under the playhead (id), or null in a gap.
   const activeIdRef = useRef<string | null>(null);
   // Whether we've told this player to play, to avoid redundant native calls.
@@ -89,6 +109,8 @@ export function useTrackTimelineSync({
   const pendingSeekRef = useRef(false);
   // The clip the player was parked on during a gap (see PREROLL_WINDOW).
   const prerolledIdRef = useRef<string | null>(null);
+  // The clip speed last applied to the player (see the rate code below).
+  const appliedSpeedRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!player) return;
@@ -107,6 +129,16 @@ export function useTrackTimelineSync({
       }
       activeIdRef.current = null;
       lastSeekVersionRef.current = seekVersion;
+      // No clip of this player under the playhead: a seek held back during
+      // a scrub no longer applies. Left set, it used to fire much later —
+      // when playback reached this player's next clip — and throw the
+      // already-running player back (audio lag, then drift corrections).
+      if (pendingSeekRef.current && __DEV__) {
+        console.log(
+          `[trackSync:${label}] held scrub seek dropped (no clip under the playhead)`,
+        );
+      }
+      pendingSeekRef.current = false;
 
       // In a gap while playing: park the player on the next clip's start.
       if (isPlaying && !holdSeeks) {
@@ -129,12 +161,18 @@ export function useTrackTimelineSync({
     }
 
     const justEntered = activeIdRef.current !== active.id;
+    // Came straight from another clip of this track (no gap in between),
+    // e.g. across a split point.
+    const fromClip = justEntered && activeIdRef.current !== null;
     activeIdRef.current = active.id;
     // Entering a clip always (re)starts the player below: the clock may
     // have paused it at the previous clip's end (useTimelineClock pauses
     // players right at their clip end, before React re-renders), and
     // play() on a player that's already playing is harmless.
-    if (justEntered) playingRef.current = false;
+    if (justEntered) {
+      playingRef.current = false;
+      onEnterClipRef.current?.();
+    }
 
     const explicitSeek = seekVersion !== lastSeekVersionRef.current;
     lastSeekVersionRef.current = seekVersion;
@@ -158,18 +196,25 @@ export function useTrackTimelineSync({
 
     let wantsSeek = justEntered || explicitSeek || mappingChanged || resuming;
 
-    // Entering a clip the player is already parked on: no seek needed.
+    // Entering a clip the player is already at: no seek needed. Either it
+    // was parked there during a gap (preroll), or playback just crossed a
+    // split point and the same player carries straight on into the next
+    // part of the source (seeking there would cause a hitch at every cut).
+    const prerolled = prerolledIdRef.current === active.id;
+    const continuing = fromClip && isPlaying;
+    const offset = player.currentTime - targetTime;
     if (
       wantsSeek &&
       justEntered &&
       !explicitSeek &&
-      prerolledIdRef.current === active.id &&
-      Math.abs(player.currentTime - targetTime) <= PREROLL_TOLERANCE
+      (prerolled || continuing) &&
+      offset >= -PREROLL_TOLERANCE &&
+      offset <= (isPlaying ? ENTER_AHEAD_TOLERANCE : PREROLL_TOLERANCE)
     ) {
       wantsSeek = false;
       if (__DEV__) {
         console.log(
-          `[trackSync:${label}] enter prerolled clip ${active.id} — no seek (player @ ${player.currentTime.toFixed(2)}s)`,
+          `[trackSync:${label}] enter ${prerolled ? "prerolled" : "next (continuous)"} clip ${active.id} — no seek (player @ ${player.currentTime.toFixed(2)}s, ${offset >= 0 ? "+" : ""}${offset.toFixed(2)}s vs React time)`,
         );
       }
     }
@@ -198,6 +243,15 @@ export function useTrackTimelineSync({
       return;
     }
 
+    // A held scrub seek is only for the scrub release itself (paused). Once
+    // playing, the entry/resume logic above owns the player's position.
+    if (pendingSeekRef.current && isPlaying) {
+      pendingSeekRef.current = false;
+      if (__DEV__)
+        console.log(
+          `[trackSync:${label}] held scrub seek dropped (already playing)`,
+        );
+    }
     if (pendingSeekRef.current && !wantsSeek) {
       pendingSeekRef.current = false;
       player.currentTime = targetTime;
@@ -225,11 +279,20 @@ export function useTrackTimelineSync({
       }
     }
 
-    // Speed: the player plays at the clip's rate.
-    if (player.playbackRate !== active.speed) {
-      player.playbackRate = active.speed;
-      if (__DEV__)
-        console.log(`[trackSync:${label}] playback rate → x${active.speed}`);
+    // Speed: the player plays at the clip's rate. Only set when the clip
+    // speed changes (or while paused): while playing, the clock may be
+    // running this player a bit faster to catch up after a late start
+    // (useTimelineClock CATCH_UP), and resetting it here cut that short.
+    if (
+      active.speed !== appliedSpeedRef.current ||
+      (!isPlaying && player.playbackRate !== active.speed)
+    ) {
+      appliedSpeedRef.current = active.speed;
+      if (player.playbackRate !== active.speed) {
+        player.playbackRate = active.speed;
+        if (__DEV__)
+          console.log(`[trackSync:${label}] playback rate → x${active.speed}`);
+      }
     }
 
     if (!isPlaying) {

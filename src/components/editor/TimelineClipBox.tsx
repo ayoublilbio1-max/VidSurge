@@ -15,6 +15,9 @@ import AppText from "../AppText";
 
 const HOLD_FEEDBACK_DURATION_MS = 120;
 const HOLD_OPACITY = 0.6;
+// When a clip's committed position changes (dropped, pushed aside by a
+// drop, trimmed at the start), it slides to the new spot over this long.
+const SETTLE_DURATION_MS = 160;
 
 /**
  * Live move state shared by every clip box on the timeline. EditorTimeline
@@ -81,14 +84,21 @@ export default function TimelineClipBox({
   moveGesture,
   children,
 }: TimelineClipBoxProps) {
-  // The committed start, mirrored to the UI thread. This effect runs before
-  // EditorTimeline's (children first), so when a moved clip's new start
-  // arrives, this is already up to date by the time the drag bases are
-  // cleared — the box never jumps back.
+  // The committed start, mirrored to the UI thread, sliding to each new
+  // value. This effect runs before EditorTimeline's (children first), so
+  // when a dropped clip's new start arrives, the slide begins from where
+  // the finger left it — the box never jumps back to its old spot.
   const startSV = useSharedValue(start);
   useEffect(() => {
-    startSV.value = start;
-  }, [start, startSV]);
+    // .get()/.set() (not .value) outside worklets: with the React
+    // Compiler, `.value` here was read during render (621 Reanimated
+    // warnings per session).
+    const base = drag.basesSV.get()[clipId];
+    if (base !== undefined) {
+      startSV.set(Math.max(0, base + drag.deltaSV.get()));
+    }
+    startSV.set(withTiming(start, { duration: SETTLE_DURATION_MS }));
+  }, [start, startSV, clipId, drag]);
 
   const positionStyle = useAnimatedStyle(() => {
     const base = drag.basesSV.value[clipId];
@@ -103,6 +113,8 @@ export default function TimelineClipBox({
   });
 
   // Held look is a plain dim/fade (like muting a track) — no scale change.
+  // The held clip is drawn above its neighbours: it may pass over them
+  // while dragging (on drop it's inserted, never left overlapping).
   const holdStyle = useAnimatedStyle(() => {
     const isMoving =
       drag.activeSV.value && drag.basesSV.value[clipId] !== undefined;
@@ -110,6 +122,7 @@ export default function TimelineClipBox({
       opacity: withTiming(isMoving ? HOLD_OPACITY : 1, {
         duration: HOLD_FEEDBACK_DURATION_MS,
       }),
+      zIndex: isMoving ? 10 : 0,
     };
   });
 

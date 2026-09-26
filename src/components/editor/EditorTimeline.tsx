@@ -102,6 +102,14 @@ export interface TrimRange {
 
 // Hold time before a press on a clip turns into a move.
 const MOVE_LONG_PRESS_MS = 180;
+// While moving a clip, its start or end snaps to a neighbouring clip's edge,
+// the playhead or timeline 0 when it comes within this many pixels.
+const SNAP_PX = 10;
+// Stand-in for "no neighbour on the right".
+const NO_LIMIT = 1e9;
+const LANDING_LINE_WIDTH = 3;
+// A drop that changes nothing slides back over this long.
+const SLIDE_BACK_MS = 160;
 
 interface EditorTimelineProps {
   clipLabel: string;
@@ -147,7 +155,9 @@ interface EditorTimelineProps {
   onEmptyAreaPress?: () => void;
   // A trim or move just committed (finger lifted). `range` is the clip's
   // full new range; the parent applies it (and to a locked partner).
-  onClipChange: (clipId: string, range: ClipRange) => void;
+  // Returns whether the project changed (a drop can land exactly where the
+  // clip already was).
+  onClipChange: (clipId: string, range: ClipRange) => boolean;
 }
 
 function formatTime(seconds: number): string {
@@ -542,6 +552,16 @@ export default function EditorTimeline({
   const trimStartSV = useSharedValue(0);
   const trimEndSV = useSharedValue(0);
   const trimMaxSV = useSharedValue(0);
+  // Neighbours of the selected clip (and its locked partner): the trim
+  // handles can't be dragged into them. Timeline seconds.
+  const trimMinStartSV = useSharedValue(0);
+  const trimMaxEndSV = useSharedValue(NO_LIMIT);
+  // Landing line: while a clip is being moved, where it will land if
+  // dropped now (same rule as the drop itself, MOVE_CLIP).
+  const landingSV = useSharedValue(0);
+  const landingTopSV = useSharedValue(0);
+  const landingHeightSV = useSharedValue(0);
+  const landingVisibleSV = useSharedValue(false);
   const trimSpeedSV = useSharedValue(1);
   const trimDragBaseSV = useSharedValue(0);
   const offsetSV = useSharedValue(0);
@@ -1394,6 +1414,33 @@ export default function EditorTimeline({
   const handleSpeed = selectedClip?.speed ?? 1;
   const handleSourceDuration = selectedClip?.sourceDuration ?? 0;
 
+  // Clips on the same track as `clip`, other than the ones in `exclude`.
+  const neighboursOf = (clip: Clip, exclude: Set<string>) =>
+    (clip.track === "audio" ? audioClips : videoClips).filter(
+      (c) => !exclude.has(c.id),
+    );
+
+  // How far the selected clip's edges may go before touching a neighbour
+  // (checked on its track and on its locked partner's track).
+  let handleMinStart = 0;
+  let handleMaxEnd = NO_LIMIT;
+  if (selectedClip) {
+    const group = selectedPartner
+      ? [selectedClip, selectedPartner]
+      : [selectedClip];
+    const groupIds = new Set(group.map((c) => c.id));
+    for (const g of group) {
+      const gEnd = g.start + clipLength(g);
+      for (const o of neighboursOf(g, groupIds)) {
+        const oEnd = o.start + clipLength(o);
+        if (oEnd <= g.start + 0.001)
+          handleMinStart = Math.max(handleMinStart, oEnd);
+        if (o.start >= gEnd - 0.001)
+          handleMaxEnd = Math.min(handleMaxEnd, o.start);
+      }
+    }
+  }
+
   // Keep the shared values (which drive the handles every frame while
   // dragging) synced to the selected clip's committed range. This also
   // fires right after our own commit, with the same values, so it never
@@ -1404,12 +1451,16 @@ export default function EditorTimeline({
     offsetSV.value = handleStart;
     trimSpeedSV.value = handleSpeed;
     trimMaxSV.value = handleSourceDuration;
+    trimMinStartSV.value = handleMinStart;
+    trimMaxEndSV.value = handleMaxEnd;
   }, [
     handleTrimIn,
     handleTrimOut,
     handleStart,
     handleSpeed,
     handleSourceDuration,
+    handleMinStart,
+    handleMaxEnd,
   ]);
 
   // A clip move (after the long-press) or a trim-handle drag just started.
@@ -1477,10 +1528,17 @@ export default function EditorTimeline({
     })
     .onUpdate((event) => {
       const speed = trimSpeedSV.value;
+      // Can't start before the source's first frame, nor before the
+      // previous clip's end (clips never overlap).
+      const lowest = Math.max(
+        0,
+        trimDragBaseSV.value +
+          (trimMinStartSV.value - offsetDragBaseSV.value) * speed,
+      );
       const next = clampWorklet(
         trimDragBaseSV.value +
           (event.translationX / pixelsPerSecondSV.value) * speed,
-        0,
+        lowest,
         trimEndSV.value - MIN_TRIM_DURATION,
       );
       const sourceDelta = next - trimDragBaseSV.value;
@@ -1507,11 +1565,17 @@ export default function EditorTimeline({
       runOnJS(setTrimDragging)(true);
     })
     .onUpdate((event) => {
+      // Can't go past the source's last frame, nor into the next clip.
+      const highest = Math.min(
+        trimMaxSV.value,
+        trimStartSV.value +
+          (trimMaxEndSV.value - offsetSV.value) * trimSpeedSV.value,
+      );
       const next = clampWorklet(
         trimDragBaseSV.value +
           (event.translationX / pixelsPerSecondSV.value) * trimSpeedSV.value,
         trimStartSV.value + MIN_TRIM_DURATION,
-        trimMaxSV.value,
+        highest,
       );
       trimEndSV.value = next;
     })
@@ -1524,24 +1588,54 @@ export default function EditorTimeline({
     });
 
   // Press-and-hold on a clip body to move it along the timeline (changes
-  // only its start, not the trim range). While the finger is down, the box
+  // only its start, not the trim range). It may pass over other clips while
+  // dragging; on drop the parent inserts it (MOVE_CLIP: nearer edge of the
+  // clip it was dropped onto, later clips pushed right), so clips never end
+  // up overlapping. Its edges snap to neighbours, the playhead and 0. While the finger is down, the box
   // (and its locked partner) are repositioned purely on the UI thread
   // through the shared drag state — no React re-renders in between — and
   // the new start is committed once, on release. A short hold delay means
   // a quick tap still falls through to the label's TouchableOpacity for
   // selection instead of starting a move.
-  const commitMove = (clip: Clip, start: number) => {
+  // A drop that changed nothing (it landed back where it was): no new clip
+  // positions will arrive to end the drag, so slide the clip (and the
+  // handles, if they moved with it) back from the drop spot, then clear the
+  // drag state. Before, the box just stayed drawn where it was dropped, on
+  // top of its neighbour.
+  const slideBack = (handlesMove: boolean, handleBase: number) => {
+    "worklet";
+    if (handlesMove) {
+      offsetSV.value = withTiming(handleBase, { duration: SLIDE_BACK_MS });
+    }
+    dragDeltaSV.value = withTiming(0, { duration: SLIDE_BACK_MS }, (done) => {
+      if (done) dragBasesSV.value = {};
+    });
+  };
+
+  const commitMove = (
+    clip: Clip,
+    start: number,
+    handlesMove: boolean,
+    handleBase: number,
+  ) => {
     const next = Math.max(0, start);
     if (__DEV__) {
       console.log(
-        `[EditorTimeline] commit move ${clip.id} — ${clip.start.toFixed(2)}s → ${next.toFixed(2)}s`,
+        `[EditorTimeline] commit move ${clip.id} — ${clip.start.toFixed(2)}s → dropped at ${next.toFixed(2)}s`,
       );
     }
-    onClipChange(clip.id, {
+    const changed = onClipChange(clip.id, {
       start: next,
       trimIn: clip.trimIn,
       trimOut: clip.trimOut,
     });
+    if (!changed) {
+      if (__DEV__)
+        console.log(
+          `[EditorTimeline] ${clip.id} landed back where it was — sliding back`,
+        );
+      runOnUI(slideBack)(handlesMove, handleBase);
+    }
   };
 
   const logMoveCancelled = (clipId: string) => {
@@ -1562,6 +1656,29 @@ export default function EditorTimeline({
       handleClipId !== null && bases[handleClipId] !== undefined;
     const handleBase = handleStart;
     const clipStart = clip.start;
+    const clipLen = clipLength(clip);
+    // Everything the moved clip's start or end can snap to: 0, the
+    // playhead, and the edges of the other clips on its track and on its
+    // partner's track.
+    const moving = new Set(Object.keys(bases));
+    // The other clips on the moved clip's own track, as [start, end, ...],
+    // for the landing line (where a drop would insert it).
+    const landingRanges: number[] = [];
+    for (const o of neighboursOf(clip, moving)) {
+      landingRanges.push(o.start, o.start + clipLength(o));
+    }
+    // Row(s) the landing line covers: the clip's row, or both rows when
+    // it's locked (both move).
+    const landingTop = partner ? trackPanelTops[0] : rowTop(clip.track);
+    const landingHeight = partner
+      ? trackPanelTops[1] + TRACK_HEIGHT - trackPanelTops[0]
+      : TRACK_HEIGHT;
+    const snapPoints = [0, currentTime];
+    for (const g of partner ? [clip, partner] : [clip]) {
+      for (const o of neighboursOf(g, moving)) {
+        snapPoints.push(o.start, o.start + clipLength(o));
+      }
+    }
 
     return Gesture.Pan()
       .activateAfterLongPress(MOVE_LONG_PRESS_MS)
@@ -1585,30 +1702,60 @@ export default function EditorTimeline({
         runOnJS(handleClipGestureStart)("move");
       })
       .onUpdate((event) => {
+        const pps = pixelsPerSecondSV.value;
+        let delta = event.translationX / pps;
+        // Snap the start or the end to the nearest snap point in reach.
+        const start = clipStart + delta;
+        let best = SNAP_PX / pps;
+        let adjust = 0;
+        for (const point of snapPoints) {
+          const toStart = point - start;
+          if (Math.abs(toStart) < best) {
+            best = Math.abs(toStart);
+            adjust = toStart;
+          }
+          const toEnd = point - (start + clipLen);
+          if (Math.abs(toEnd) < best) {
+            best = Math.abs(toEnd);
+            adjust = toEnd;
+          }
+        }
         // Never let the dragged clip go before timeline 0.
-        const delta = Math.max(
-          -clipStart,
-          event.translationX / pixelsPerSecondSV.value,
-        );
+        delta = Math.max(-clipStart, delta + adjust);
         dragDeltaSV.value = delta;
         if (handlesMove) offsetSV.value = handleBase + delta;
+        // Where it would land if dropped now: where it is, unless its start
+        // is inside another clip — then that clip's nearer edge.
+        const dropStart = clipStart + delta;
+        let landing = dropStart;
+        for (let i = 0; i < landingRanges.length; i += 2) {
+          const s0 = landingRanges[i];
+          const e0 = landingRanges[i + 1];
+          if (dropStart > s0 + 0.001 && dropStart < e0 - 0.001) {
+            landing = dropStart - s0 <= e0 - dropStart ? s0 : e0;
+            break;
+          }
+        }
+        landingSV.value = landing;
+        landingTopSV.value = landingTop;
+        landingHeightSV.value = landingHeight;
+        landingVisibleSV.value = true;
       })
-      .onEnd((event) => {
-        const delta = Math.max(
-          -clipStart,
-          event.translationX / pixelsPerSecondSV.value,
-        );
+      .onEnd(() => {
+        // Exactly where the box was last drawn (snapping included).
+        const delta = dragDeltaSV.value;
         if (delta === 0) {
           // Dropped where it started: nothing to commit, so no new props
           // will arrive to clear the drag state — clear it here.
           dragBasesSV.value = {};
           return;
         }
-        runOnJS(commitMove)(clip, clipStart + delta);
+        runOnJS(commitMove)(clip, clipStart + delta, handlesMove, handleBase);
       })
       .onFinalize((_event, success) => {
         dragActiveSV.value = false;
         isMovingSV.value = false;
+        landingVisibleSV.value = false;
         // `success` is also false for a quick tap that never became a move
         // (that's how the tap falls through to "select clip"). Either way no
         // commit happens, so drop the drag state and put the clip(s) and
@@ -1669,6 +1816,16 @@ export default function EditorTimeline({
   }));
 
   const committedPPS = pixelsPerSecond;
+
+  const landingLineStyle = useAnimatedStyle(() => ({
+    left:
+      LEADING_WIDTH +
+      landingSV.value * pixelsPerSecondSV.value -
+      LANDING_LINE_WIDTH / 2,
+    top: landingTopSV.value,
+    height: landingHeightSV.value,
+    opacity: landingVisibleSV.value ? 1 : 0,
+  }));
 
   const outerRowStyle = useAnimatedStyle(() => ({
     width: totalScrollWidthSV.value,
@@ -1875,6 +2032,15 @@ export default function EditorTimeline({
                         </Animated.View>
                       </Animated.View>
 
+                      <Animated.View
+                        pointerEvents="none"
+                        style={[
+                          styles.landingLine,
+                          landingLineStyle,
+                          { backgroundColor: colors.accentGreen },
+                        ]}
+                      />
+
                       {showHandles && (
                         <>
                           <GestureDetector gesture={leftHandlePan}>
@@ -1957,6 +2123,13 @@ const styles = StyleSheet.create({
   rulerLabel: { fontSize: 10 },
   secondTick: { position: "absolute", left: 0, bottom: 0, width: 1, height: 7 },
   subTick: { position: "absolute", bottom: 0, width: 1, height: 5 },
+  // Where a dragged clip will land (see landingLineStyle).
+  landingLine: {
+    position: "absolute",
+    width: LANDING_LINE_WIDTH,
+    borderRadius: LANDING_LINE_WIDTH / 2,
+    zIndex: 20,
+  },
   trimHandle: {
     position: "absolute",
     width: TRIM_HANDLE_WIDTH,

@@ -17,17 +17,20 @@
 //     Unlocking (UNLINK_CLIP) clears the link for good — there is no
 //     re-lock action. Undo (step 4) is the only way back.
 //
-// Split and delete arrive in steps 2 and 3 as new actions.
+// Delete arrives in step 3 as a new action.
 
 import {
   addClips,
   createClip,
   findClip,
   findLinkedPartner,
+  insertionPoint,
   newId,
   replaceClip,
+  resolveOverlaps,
   sameRange,
   sanitizeRange,
+  splitClip,
   type ClipRange,
   type Project,
 } from "./clipModel";
@@ -54,12 +57,40 @@ export type ProjectAction =
     }
   | {
       /**
+       * A move (drag and drop) on the timeline: the clip — and its locked
+       * partner — go to `start`, or to the nearer edge of the clip they
+       * were dropped onto; anything they overlap is pushed right (see
+       * resolveOverlaps). Clips never overlap on a track.
+       */
+      type: "MOVE_CLIP";
+      clipId: string;
+      start: number;
+    }
+  | {
+      /**
        * Unlock: separates a clip from its linked partner, permanently.
        * Both clips keep their current range; they just stop moving
        * together. Does nothing if the clip isn't linked.
        */
       type: "UNLINK_CLIP";
       clipId: string;
+    }
+  | {
+      /**
+       * Split at the playhead: cuts the clip at timeline time `at` into two
+       * clips (the left keeps the original id). If the clip is locked to a
+       * partner, the partner is cut at the same moment and the two right
+       * halves are locked to each other (the left halves keep the original
+       * link). An unlocked clip is cut alone. Does nothing if either half
+       * would be shorter than MIN_SPLIT_PART.
+       */
+      type: "SPLIT_CLIP";
+      clipId: string;
+      at: number;
+      /** Ids for the new right halves, made by splitClipAction. */
+      rightId: string;
+      partnerRightId: string;
+      rightLinkId: string;
     };
 
 /**
@@ -78,6 +109,18 @@ export function initSourceAction(
     videoClipId: newId("video"),
     audioClipId: newId("audio"),
     linkId: newId("link"),
+  };
+}
+
+/** Split the clip at timeline time `at` (see SPLIT_CLIP). */
+export function splitClipAction(clipId: string, at: number): ProjectAction {
+  return {
+    type: "SPLIT_CLIP",
+    clipId,
+    at,
+    rightId: newId("clip"),
+    partnerRightId: newId("clip"),
+    rightLinkId: newId("link"),
   };
 }
 
@@ -121,6 +164,25 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
       return next;
     }
 
+    case "MOVE_CLIP": {
+      const clip = findClip(state, action.clipId);
+      if (!clip) return state;
+      const partner = findLinkedPartner(state, clip);
+      const group = partner ? [clip, partner] : [clip];
+      const groupIds = new Set(group.map((c) => c.id));
+      const others = state.tracks[clip.track].filter(
+        (c) => !groupIds.has(c.id),
+      );
+      const at = insertionPoint(others, Math.max(0, action.start));
+      const delta = at - clip.start;
+      if (Math.abs(delta) < 1e-6) return state;
+      let next = state;
+      for (const c of group) {
+        next = replaceClip(next, { ...c, start: Math.max(0, c.start + delta) });
+      }
+      return resolveOverlaps(next, groupIds);
+    }
+
     case "UNLINK_CLIP": {
       const clip = findClip(state, action.clipId);
       if (!clip) return state;
@@ -129,6 +191,36 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
       let next = replaceClip(state, { ...clip, linkId: null });
       next = replaceClip(next, { ...partner, linkId: null });
       return next;
+    }
+
+    case "SPLIT_CLIP": {
+      const clip = findClip(state, action.clipId);
+      if (!clip) return state;
+      const partner = findLinkedPartner(state, clip);
+      const halves = splitClip(
+        clip,
+        action.at,
+        action.rightId,
+        partner ? action.rightLinkId : null,
+      );
+      if (!halves) return state;
+      let next = replaceClip(state, halves[0]);
+      const added = [halves[1]];
+      if (partner) {
+        // A locked pair always has the same range, so the partner can be
+        // cut at the same moment; if not, split nothing rather than leave
+        // a half-split pair.
+        const partnerHalves = splitClip(
+          partner,
+          action.at,
+          action.partnerRightId,
+          action.rightLinkId,
+        );
+        if (!partnerHalves) return state;
+        next = replaceClip(next, partnerHalves[0]);
+        added.push(partnerHalves[1]);
+      }
+      return addClips(next, added);
     }
 
     default:
