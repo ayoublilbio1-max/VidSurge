@@ -21,6 +21,7 @@ import Animated, {
 } from "react-native-reanimated";
 import ComingSoonModal from "../components/ComingSoonModal";
 import EditorScreenSkeleton from "../components/EditorScreenSkeleton";
+import CanvasSheet from "../components/editor/CanvasSheet";
 import ClipSettingsSheet, {
   type ClipSettingKind,
 } from "../components/editor/ClipSettingsSheet";
@@ -30,6 +31,7 @@ import EditorToolbar, {
   type SelectionKind,
 } from "../components/editor/EditorToolbar";
 import EditorTopBar from "../components/editor/EditorTopBar";
+import RotateSheet from "../components/editor/RotateSheet";
 import TextEditorSheet, {
   MIN_PANEL_HEIGHT,
 } from "../components/editor/TextEditorSheet";
@@ -40,6 +42,8 @@ import TextOverlay, {
 import {
   activeClipAt,
   canSplitAt,
+  canvasAspect,
+  canvasOf,
   clipContains,
   clipEnd,
   DEFAULT_TEXT_DATA,
@@ -50,6 +54,7 @@ import {
   projectEnd,
   splitIntoPlayerSlots,
   textDataOf,
+  type CanvasSettings,
   type Clip,
   type ClipRange,
   type Project,
@@ -83,7 +88,65 @@ function summarizeProject(project: Project): string {
     const clips = project.tracks[track];
     return `  ${track}: ${clips.length === 0 ? "(empty)" : clips.map(describeClip).join(" | ")}`;
   });
-  return `end ${projectEnd(project).toFixed(2)}s\n${lines.join("\n")}`;
+  const canvas = canvasOf(project);
+  return `end ${projectEnd(project).toFixed(2)}s, canvas ${canvas.ratio} on ${canvas.background}\n${lines.join("\n")}`;
+}
+
+/** Absolute position style for a rect inside the preview box. */
+function frameStyle(r: FrameRect) {
+  return {
+    position: "absolute" as const,
+    left: r.left,
+    top: r.top,
+    width: r.width,
+    height: r.height,
+  };
+}
+
+/** The largest rect of `aspect` (w ÷ h) centred inside `box`. */
+function containRect(box: FrameRect, aspect: number): FrameRect {
+  if (aspect > box.width / box.height) {
+    const h = box.width / aspect;
+    return {
+      left: box.left,
+      top: box.top + (box.height - h) / 2,
+      width: box.width,
+      height: h,
+    };
+  }
+  const w = box.height * aspect;
+  return {
+    left: box.left + (box.width - w) / 2,
+    top: box.top,
+    width: w,
+    height: box.height,
+  };
+}
+
+/**
+ * Transform for a rotated / flipped picture. It is turned about its centre
+ * and shrunk just enough to stay whole inside the canvas — like CapCut,
+ * nothing is cut off; the canvas background shows around it.
+ */
+function pictureTransform(
+  deg: number,
+  flip: number,
+  w: number,
+  h: number,
+  cw: number,
+  ch: number,
+) {
+  "worklet";
+  // w × h = the picture (already fitted in the canvas), cw × ch = the
+  // canvas. Turned, its bounding box must still fit in the canvas.
+  let fit = 1;
+  if (deg !== 0 && w > 0 && h > 0 && cw > 0 && ch > 0) {
+    const rad = (deg * Math.PI) / 180;
+    const c = Math.abs(Math.cos(rad));
+    const sn = Math.abs(Math.sin(rad));
+    fit = Math.min(1, cw / (w * c + h * sn), ch / (w * sn + h * c));
+  }
+  return [{ rotate: `${deg}deg` }, { scaleX: fit * flip }, { scaleY: fit }];
 }
 
 // How long the mute button shows its spinner before the mute applies.
@@ -223,11 +286,38 @@ export default function EditorScreen() {
   // clip at its own opacity straight away.
   const opacityASV = useSharedValue(1);
   const opacityBSV = useSharedValue(1);
+  // Same for the Rotate tool: angle (degrees) and mirror (-1 = flipped).
+  const rotateASV = useSharedValue(0);
+  const rotateBSV = useSharedValue(0);
+  const flipASV = useSharedValue(1);
+  const flipBSV = useSharedValue(1);
+  // The picture's size in the preview (see `frame`), for fitting a turned
+  // picture inside it.
+  const frameWSV = useSharedValue(0);
+  const frameHSV = useSharedValue(0);
+  const pictureWSV = useSharedValue(0);
+  const pictureHSV = useSharedValue(0);
   const videoAStyle = useAnimatedStyle(() => ({
     opacity: visibleVideoSV.value === 0 ? opacityASV.value : 0,
+    transform: pictureTransform(
+      rotateASV.value,
+      flipASV.value,
+      pictureWSV.value,
+      pictureHSV.value,
+      frameWSV.value,
+      frameHSV.value,
+    ),
   }));
   const videoBStyle = useAnimatedStyle(() => ({
     opacity: visibleVideoSV.value === 1 ? opacityBSV.value : 0,
+    transform: pictureTransform(
+      rotateBSV.value,
+      flipBSV.value,
+      pictureWSV.value,
+      pictureHSV.value,
+      frameWSV.value,
+      frameHSV.value,
+    ),
   }));
 
   // Note: there used to be two `useEvent(player, "timeUpdate")`
@@ -453,7 +543,7 @@ export default function EditorScreen() {
     ...clockEntries(audioClipsBySlot[1], audioPlayerB, 1, 1),
   ];
 
-  const { timelineTime, seekVersion, seekTo, playhead, halt } =
+  const { timelineTime, seekVersion, seekTo, playhead, stopTimeRef, halt } =
     useTimelineClock({
       isPlaying,
       timelineDuration,
@@ -1095,23 +1185,56 @@ export default function EditorScreen() {
     });
   }
 
-  // Where the video picture sits in the preview box (contentFit "contain").
+  // ---- Canvas (nothing selected): the output frame --------------------
+  // While the Canvas sheet is open its draft is shown live.
+  const [canvasDraft, setCanvasDraft] = useState<CanvasSettings | null>(null);
+  const canvas = canvasDraft ?? canvasOf(project);
+  const videoAspect = videoSize ? videoSize.width / videoSize.height : null;
+
+  // `frame` = the canvas (the exported video's frame) inside the preview
+  // box: its shape, as big as fits. Texts are placed in it, the background
+  // colour fills it, and each picture is fitted whole inside it.
   let frame: FrameRect | null = null;
   if (previewSize) {
-    const { width: bw, height: bh } = previewSize;
-    if (videoSize) {
-      const aspect = videoSize.width / videoSize.height;
-      if (aspect > bw / bh) {
-        const h = bw / aspect;
-        frame = { left: 0, top: (bh - h) / 2, width: bw, height: h };
-      } else {
-        const w = bh * aspect;
-        frame = { left: (bw - w) / 2, top: 0, width: w, height: bh };
-      }
-    } else {
-      frame = { left: 0, top: 0, width: bw, height: bh };
-    }
+    frame = containRect(
+      { left: 0, top: 0, width: previewSize.width, height: previewSize.height },
+      canvasAspect(canvas.ratio, videoAspect),
+    );
   }
+  // The picture's own size inside the canvas (VideoView "contain").
+  const picture =
+    frame && videoAspect ? containRect(frame, videoAspect) : frame;
+
+  const openCanvas = () => {
+    pauseForGesture("canvas");
+    if (__DEV__)
+      console.log(
+        `[editor] canvas sheet open (${canvasOf(project).ratio} on ${canvasOf(project).background})`,
+      );
+    setCanvasDraft(canvasOf(project));
+  };
+  const closeCanvas = (why: string) => {
+    if (__DEV__) console.log(`[editor] canvas sheet closed (${why})`);
+    setCanvasDraft(null);
+  };
+  const applyCanvas = () => {
+    if (!canvasDraft) return;
+    commitProject(
+      { type: "SET_CANVAS", canvas: canvasDraft },
+      `canvas ${canvasDraft.ratio} on ${canvasDraft.background}`,
+    );
+    closeCanvas("applied");
+  };
+  // Android back closes the Canvas sheet without applying.
+  useEffect(() => {
+    if (!canvasDraft) return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      closeCanvas("back button");
+      return true;
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasDraft !== null]);
 
   // ---- Clip settings: Speed / Volume (step 7) --------------------------
   // The open settings sheet: which setting, which clip, the draft value.
@@ -1140,16 +1263,7 @@ export default function EditorScreen() {
     if (!target) return;
     pauseForGesture(kind);
     if (__DEV__) console.log(`[editor] ${kind} sheet open for ${target.id}`);
-    // Opacity is judged by looking at the picture: bring the playhead into
-    // the clip if it's elsewhere, so the preview shows the change live.
-    if (kind === "opacity" && !clipContains(target, timelineTime)) {
-      const into = Math.min(clipEnd(target) - 0.05, target.start + 0.05);
-      if (__DEV__)
-        console.log(
-          `[editor] opacity — playhead ${timelineTime.toFixed(2)}s is outside ${target.id}, moved to ${into.toFixed(2)}s`,
-        );
-      seekTo(into);
-    }
+    if (kind === "opacity") bringPlayheadInto(target, kind);
     setClipSetting({
       kind,
       clipId: target.id,
@@ -1161,6 +1275,75 @@ export default function EditorScreen() {
             : target.opacity,
     });
   };
+
+  // Picture tools (Opacity, Rotate) are judged by looking at the picture:
+  // bring the playhead into the clip if it's elsewhere, so the preview
+  // shows the change live.
+  const bringPlayheadInto = (target: Clip, why: string) => {
+    if (clipContains(target, timelineTime)) return;
+    const into = Math.min(clipEnd(target) - 0.05, target.start + 0.05);
+    if (__DEV__)
+      console.log(
+        `[editor] ${why} — playhead ${timelineTime.toFixed(2)}s is outside ${target.id}, moved to ${into.toFixed(2)}s`,
+      );
+    seekTo(into);
+  };
+
+  // ---- Rotate (video clips) --------------------------------------------
+  const [rotateSetting, setRotateSetting] = useState<{
+    clipId: string;
+    angle: number;
+    flip: boolean;
+  } | null>(null);
+
+  const openRotate = () => {
+    if (!selectedClip) return;
+    const target =
+      selectedClip.track === "video"
+        ? selectedClip
+        : selectedPartner?.track === "video"
+          ? selectedPartner
+          : null;
+    if (!target) return;
+    pauseForGesture("rotate");
+    if (__DEV__)
+      console.log(
+        `[editor] rotate sheet open for ${target.id} (${target.rotate}°${target.flipX ? ", flipped" : ""})`,
+      );
+    bringPlayheadInto(target, "rotate");
+    setRotateSetting({
+      clipId: target.id,
+      angle: target.rotate,
+      flip: !!target.flipX,
+    });
+  };
+
+  const closeRotate = (why: string) => {
+    if (__DEV__) console.log(`[editor] rotate sheet closed (${why})`);
+    setRotateSetting(null);
+  };
+
+  const applyRotate = () => {
+    if (!rotateSetting) return;
+    const { clipId, angle, flip } = rotateSetting;
+    const next = commitProject(
+      { type: "SET_CLIP_ROTATION", clipId, rotate: angle, flipX: flip },
+      `rotate ${angle}°${flip ? " flipped" : ""}`,
+    );
+    if (next !== project) flashClips([clipId]);
+    closeRotate("applied");
+  };
+
+  // Android back closes the Rotate sheet without applying.
+  useEffect(() => {
+    if (!rotateSetting) return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      closeRotate("back button");
+      return true;
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rotateSetting !== null]);
 
   const closeClipSetting = (why: string) => {
     if (__DEV__)
@@ -1216,8 +1399,13 @@ export default function EditorScreen() {
     clipSetting?.kind === "opacity" ? clipSetting.clipId : null;
   const opacityDraftValue =
     clipSetting?.kind === "opacity" ? clipSetting.value : null;
+  const rotateDraftId = rotateSetting?.clipId ?? null;
+  const rotateDraftAngle = rotateSetting?.angle ?? 0;
+  const rotateDraftFlip = rotateSetting?.flip ?? false;
   useEffect(() => {
     const svs = [opacityASV, opacityBSV];
+    const rotSVs = [rotateASV, rotateBSV];
+    const flipSVs = [flipASV, flipBSV];
     for (const slot of [0, 1]) {
       const clips = videoClipsBySlot[slot];
       const clip =
@@ -1225,6 +1413,18 @@ export default function EditorScreen() {
         clips.find((c) => c.start > timelineTime) ??
         null;
       if (!clip) continue;
+      // Rotation / flip (draft while the Rotate sheet is open).
+      const isRotDraft = clip.id === rotateDraftId;
+      const angle = isRotDraft ? rotateDraftAngle : clip.rotate;
+      const flip = (isRotDraft ? rotateDraftFlip : !!clip.flipX) ? -1 : 1;
+      if (rotSVs[slot].get() !== angle || flipSVs[slot].get() !== flip) {
+        rotSVs[slot].set(angle);
+        flipSVs[slot].set(flip);
+        if (__DEV__)
+          console.log(
+            `[editor] video player ${slot === 0 ? "A" : "B"} rotate → ${angle}°${flip < 0 ? ", flipped" : ""} (${clip.id}${isRotDraft ? ", preview" : ""})`,
+          );
+      }
       const opacity =
         clip.id === opacityDraftId && opacityDraftValue !== null
           ? opacityDraftValue
@@ -1244,12 +1444,48 @@ export default function EditorScreen() {
     opacityDraftValue,
     opacityASV,
     opacityBSV,
+    rotateDraftId,
+    rotateDraftAngle,
+    rotateDraftFlip,
+    rotateASV,
+    rotateBSV,
+    flipASV,
+    flipBSV,
+  ]);
+
+  // Canvas + picture sizes, for fitting a rotated picture (pictureTransform).
+  const frameW = frame?.width ?? 0;
+  const frameH = frame?.height ?? 0;
+  const pictureW = picture?.width ?? 0;
+  const pictureH = picture?.height ?? 0;
+  useEffect(() => {
+    frameWSV.set(frameW);
+    frameHSV.set(frameH);
+    pictureWSV.set(pictureW);
+    pictureHSV.set(pictureH);
+  }, [
+    frameW,
+    frameH,
+    pictureW,
+    pictureH,
+    frameWSV,
+    frameHSV,
+    pictureWSV,
+    pictureHSV,
   ]);
 
   // Tools that aren't built yet (and the ones routed from here).
   const handleComingSoonTool = (key: string) => {
     if (key === "speed" || key === "volume" || key === "opacity") {
       openClipSetting(key);
+      return;
+    }
+    if (key === "rotate") {
+      openRotate();
+      return;
+    }
+    if (key === "canvas") {
+      openCanvas();
       return;
     }
     if (key === "music") {
@@ -1398,20 +1634,17 @@ export default function EditorScreen() {
                 })
               }
             >
-              {/* Black behind the picture (only where the picture is), so a
-                  clip with lowered Opacity fades to black — as it will in
-                  the exported video. */}
+              {/* The canvas: its background colour, where the exported
+                  frame is. Shows around a picture that doesn't fill it
+                  (other shape, rotated) and through lowered Opacity — as
+                  it will in the exported video. */}
               {frame && (
                 <View
                   pointerEvents="none"
                   style={[
                     styles.pictureBackdrop,
-                    {
-                      left: frame.left,
-                      top: frame.top,
-                      width: frame.width,
-                      height: frame.height,
-                    },
+                    frameStyle(frame),
+                    { backgroundColor: canvas.background },
                   ]}
                 />
               )}
@@ -1420,7 +1653,10 @@ export default function EditorScreen() {
                   SurfaceView) so they can be layered and faded on Android. */}
               <Animated.View
                 pointerEvents="none"
-                style={[StyleSheet.absoluteFill, videoAStyle]}
+                style={[
+                  frame ? frameStyle(frame) : StyleSheet.absoluteFill,
+                  videoAStyle,
+                ]}
               >
                 <VideoView
                   player={videoPlayerA}
@@ -1432,7 +1668,10 @@ export default function EditorScreen() {
               </Animated.View>
               <Animated.View
                 pointerEvents="none"
-                style={[StyleSheet.absoluteFill, videoBStyle]}
+                style={[
+                  frame ? frameStyle(frame) : StyleSheet.absoluteFill,
+                  videoBStyle,
+                ]}
               >
                 <VideoView
                   player={videoPlayerB}
@@ -1443,7 +1682,14 @@ export default function EditorScreen() {
                 />
               </Animated.View>
               {isVoidNow && (
-                <View pointerEvents="none" style={styles.voidOverlay} />
+                <View
+                  pointerEvents="none"
+                  style={[
+                    styles.voidOverlay,
+                    frame && frameStyle(frame),
+                    { backgroundColor: canvas.background },
+                  ]}
+                />
               )}
               <TextOverlay
                 texts={visibleTexts}
@@ -1559,6 +1805,7 @@ export default function EditorScreen() {
               currentTime={timelineTime}
               isPlaying={isPlaying}
               playhead={playhead}
+              stopTimeRef={stopTimeRef}
               timelineDuration={timelineDuration}
               thumbnails={thumbnails}
               videoClips={videoClips}
@@ -1608,6 +1855,30 @@ export default function EditorScreen() {
           onChange={(value) => setClipSetting((c) => (c ? { ...c, value } : c))}
           onCancel={() => closeClipSetting("cancelled")}
           onDone={applyClipSetting}
+        />
+      )}
+
+      {canvasDraft && (
+        <CanvasSheet
+          value={canvasDraft}
+          videoAspect={videoAspect}
+          onChange={setCanvasDraft}
+          onCancel={() => closeCanvas("cancelled")}
+          onDone={applyCanvas}
+        />
+      )}
+
+      {rotateSetting && (
+        <RotateSheet
+          angle={rotateSetting.angle}
+          flip={rotateSetting.flip}
+          onChange={(d) =>
+            setRotateSetting((r) =>
+              r ? { ...r, angle: d.angle, flip: d.flip } : r,
+            )
+          }
+          onCancel={() => closeRotate("cancelled")}
+          onDone={applyRotate}
         />
       )}
 

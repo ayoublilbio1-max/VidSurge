@@ -1,5 +1,5 @@
 import { Ionicons } from "@expo/vector-icons";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
@@ -35,6 +35,28 @@ const ROTATION_SNAP = 5;
 function clamp(v: number, min: number, max: number) {
   "worklet";
   return Math.max(min, Math.min(v, max));
+}
+
+/**
+ * Half the width / height of a w × h box turned by `deg` (its upright
+ * bounding box) — what must fit inside the frame.
+ */
+function halfExtents(w: number, h: number, deg: number) {
+  "worklet";
+  const rad = (deg * Math.PI) / 180;
+  const c = Math.abs(Math.cos(rad));
+  const sn = Math.abs(Math.sin(rad));
+  return { hw: (w * c + h * sn) / 2, hh: (w * sn + h * c) / 2 };
+}
+
+/**
+ * A centre position (px) that keeps a box of half-size `half` inside
+ * 0…size. A box bigger than the frame is centred.
+ */
+function clampCenter(center: number, half: number, size: number) {
+  "worklet";
+  if (half * 2 >= size) return size / 2;
+  return clamp(center, half, size - half);
 }
 
 function snapRotation(deg: number) {
@@ -119,8 +141,21 @@ function OverlayText({
   onGestureActive?: (active: boolean) => void;
 }) {
   const fontSize = Math.max(6, data.size * frame.height * data.scale);
-  const cx = frame.left + data.x * frame.width;
-  const cy = frame.top + data.y * frame.height;
+  // The text's measured size (unscaled by a live gesture). Used to keep the
+  // whole text inside the frame even when it grew without being moved
+  // (bigger size, another font, longer words, a narrower canvas): its
+  // centre is pulled in just enough — the stored position is unchanged.
+  const [box, setBox] = useState<{ w: number; h: number } | null>(null);
+  let shownX = data.x;
+  let shownY = data.y;
+  if (box) {
+    const { hw, hh } = halfExtents(box.w, box.h, data.rotation);
+    shownX = clampCenter(data.x * frame.width, hw, frame.width) / frame.width;
+    shownY =
+      clampCenter(data.y * frame.height, hh, frame.height) / frame.height;
+  }
+  const cx = frame.left + shownX * frame.width;
+  const cy = frame.top + shownY * frame.height;
 
   // Live gesture offsets (UI thread), reset whenever the committed values
   // arrive.
@@ -141,8 +176,8 @@ function OverlayText({
 
   const baseRotation = data.rotation;
   const baseScale = data.scale;
-  const baseX = data.x;
-  const baseY = data.y;
+  const baseX = shownX;
+  const baseY = shownY;
   const fw = frame.width;
   const fh = frame.height;
 
@@ -169,13 +204,18 @@ function OverlayText({
       runOnJS(setActive)(true);
     })
     .onUpdate((e) => {
-      txSV.value = e.translationX;
-      tySV.value = e.translationY;
+      // The whole text stays inside the frame (the exported picture):
+      // the finger can go further, the text stops at the edge.
+      const { hw, hh } = halfExtents(boxWSV.value, boxHSV.value, baseRotation);
+      const cx0 = baseX * fw;
+      const cy0 = baseY * fh;
+      txSV.value = clampCenter(cx0 + e.translationX, hw, fw) - cx0;
+      tySV.value = clampCenter(cy0 + e.translationY, hh, fh) - cy0;
     })
-    .onEnd((e) => {
+    .onEnd(() => {
       runOnJS(commit)({
-        x: clamp(baseX + e.translationX / fw, 0, 1),
-        y: clamp(baseY + e.translationY / fh, 0, 1),
+        x: clamp(baseX + txSV.value / fw, 0, 1),
+        y: clamp(baseY + tySV.value / fh, 0, 1),
         scale: baseScale,
         rotation: baseRotation,
       });
@@ -210,11 +250,20 @@ function OverlayText({
       );
     })
     .onEnd(() => {
+      const scale = clamp(baseScale * scaleSV.value, MIN_SCALE, MAX_SCALE);
+      const rotation = snapRotation(baseRotation + rotSV.value);
+      // Bigger or turned, it may now stick out: move it back inside.
+      const k = scale / baseScale;
+      const { hw, hh } = halfExtents(
+        boxWSV.value * k,
+        boxHSV.value * k,
+        rotation,
+      );
       runOnJS(commit)({
-        x: baseX,
-        y: baseY,
-        scale: clamp(baseScale * scaleSV.value, MIN_SCALE, MAX_SCALE),
-        rotation: snapRotation(baseRotation + rotSV.value),
+        x: clampCenter(baseX * fw, hw, fw) / fw,
+        y: clampCenter(baseY * fh, hh, fh) / fh,
+        scale,
+        rotation,
       });
     })
     .onFinalize(() => {
@@ -250,8 +299,16 @@ function OverlayText({
             onLayout={(e: {
               nativeEvent: { layout: { width: number; height: number } };
             }) => {
-              boxWSV.value = e.nativeEvent.layout.width;
-              boxHSV.value = e.nativeEvent.layout.height;
+              const { width, height } = e.nativeEvent.layout;
+              boxWSV.value = width;
+              boxHSV.value = height;
+              if (
+                !box ||
+                Math.abs(box.w - width) > 0.5 ||
+                Math.abs(box.h - height) > 0.5
+              ) {
+                setBox({ w: width, h: height });
+              }
             }}
           >
             <TextVisual

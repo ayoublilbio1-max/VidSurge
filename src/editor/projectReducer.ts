@@ -26,6 +26,7 @@
 import {
   addClips,
   allowsOverlap,
+  canvasOf,
   clipEnd,
   createClip,
   createTextClip,
@@ -33,6 +34,7 @@ import {
   findLinkedPartner,
   insertionPoint,
   newId,
+  normalizeRotation,
   pickLane,
   removeClips,
   replaceClip,
@@ -40,6 +42,7 @@ import {
   sameRange,
   sanitizeRange,
   splitClip,
+  type CanvasSettings,
   type Clip,
   type ClipRange,
   type Project,
@@ -142,6 +145,19 @@ export type ProjectAction =
       type: "SET_CLIP_VOLUME";
       clipId: string;
       volume: number;
+    }
+  | {
+      // Rotation (degrees) + mirror of a video clip's picture. Only this
+      // clip — a locked audio partner has no picture.
+      type: "SET_CLIP_ROTATION";
+      clipId: string;
+      rotate: number;
+      flipX: boolean;
+    }
+  | {
+      // Output frame shape + background (Canvas tool; whole project).
+      type: "SET_CANVAS";
+      canvas: CanvasSettings;
     }
   | {
       // Opacity of a video clip's picture (0 = invisible, 1 = solid).
@@ -396,6 +412,30 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
         100;
       if (Math.abs(volume - clip.volume) < 1e-6) return state;
       return replaceClip(state, { ...clip, volume });
+    }
+
+    case "SET_CLIP_ROTATION": {
+      const clip = findClip(state, action.clipId);
+      if (!clip || clip.track !== "video") return state;
+      const rotate = normalizeRotation(action.rotate);
+      const flipX = action.flipX;
+      if (rotate === clip.rotate && flipX === !!clip.flipX) return state;
+      return replaceClip(state, { ...clip, rotate, flipX });
+    }
+
+    case "SET_CANVAS": {
+      const current = canvasOf(state);
+      const next = {
+        ratio: action.canvas.ratio,
+        background: action.canvas.background.toUpperCase(),
+      };
+      if (
+        current.ratio === next.ratio &&
+        current.background.toUpperCase() === next.background
+      ) {
+        return state;
+      }
+      return { ...state, canvas: next };
     }
 
     case "SET_CLIP_OPACITY": {

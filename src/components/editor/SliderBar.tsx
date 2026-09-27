@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { StyleSheet, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
@@ -12,6 +12,15 @@ import Animated, {
 // feels instant; the text on the preview catches up in these steps (every
 // update re-renders the editor, which the dev build does only ~5–10×/s).
 const SEND_EVERY_MS = 70;
+// After the finger lifts, values arriving back from the parent for this
+// long are echoes of the drag (a throttled update still on its way, or the
+// final value rounded / snapped by the parent). They used to move the
+// thumb back a pixel or two and then forward again; now the thumb stays
+// exactly where the finger left it.
+const RELEASE_ECHO_MS = 400;
+// A later value this close to the released one is the same value, rounded
+// by the parent (e.g. whole degrees) — also left alone.
+const ECHO_TOLERANCE = 0.03;
 const THUMB = 22;
 
 function clamp01(v: number) {
@@ -46,14 +55,28 @@ export default function SliderBar({
   const posSV = useSharedValue(clamp01(value));
   const draggingSV = useSharedValue(false);
   const lastSentSV = useSharedValue(0);
+  // Where and when the finger was last lifted (JS side, see RELEASE_ECHO_MS).
+  const releaseRef = useRef<{ at: number; v: number } | null>(null);
 
   // Follow the parent's value when it changes from elsewhere (not while the
-  // finger is on it — then the thumb leads).
+  // finger is on it — then the thumb leads — and not for the echoes of the
+  // drag that just ended).
   useEffect(() => {
-    if (!draggingSV.get()) posSV.set(clamp01(value));
+    if (draggingSV.get()) return;
+    const r = releaseRef.current;
+    if (r) {
+      if (Date.now() - r.at < RELEASE_ECHO_MS) return;
+      if (Math.abs(clamp01(value) - r.v) < ECHO_TOLERANCE) return;
+      releaseRef.current = null;
+    }
+    posSV.set(clamp01(value));
   }, [value, posSV, draggingSV]);
 
   const send = (v: number) => onChange(v);
+  const release = (v: number) => {
+    releaseRef.current = { at: Date.now(), v };
+    onChange(v);
+  };
 
   const moveTo = (x: number, force: boolean) => {
     "worklet";
@@ -79,8 +102,15 @@ export default function SliderBar({
       moveTo(e.x, false);
     })
     .onFinalize((e) => {
-      // The exact final value, always.
-      moveTo(e.x, true);
+      // The exact final value, always (marked as the release, see
+      // RELEASE_ECHO_MS).
+      const w = widthSV.value;
+      if (w > 0) {
+        const v = clamp01(e.x / w);
+        posSV.value = v;
+        lastSentSV.value = Date.now();
+        runOnJS(release)(v);
+      }
       draggingSV.value = false;
     });
 

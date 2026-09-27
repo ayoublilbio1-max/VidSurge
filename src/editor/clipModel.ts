@@ -33,7 +33,18 @@ export const TRACK_IDS: TrackId[] = [
   "effect",
 ];
 
-export type Rotation = 0 | 90 | 180 | 270;
+/**
+ * Picture rotation in degrees, clockwise, normalised to (-180, 180]
+ * (any angle — the Rotate tool has 90° buttons and a free slider).
+ */
+export type Rotation = number;
+
+/** An angle in degrees brought into (-180, 180]. */
+export function normalizeRotation(deg: number): number {
+  let a = ((deg % 360) + 360) % 360; // 0…360
+  if (a > 180) a -= 360;
+  return Math.round(a * 10) / 10;
+}
 
 /** Normalized crop rectangle (0–1 of the source frame). */
 export interface CropRect {
@@ -64,6 +75,8 @@ export interface Clip {
   volume: number;
   opacity: number;
   rotate: Rotation;
+  /** Picture mirrored left↔right (Rotate tool's Flip). */
+  flipX?: boolean;
   crop: CropRect | null;
   filter: string | null;
   reversed: boolean;
@@ -79,6 +92,51 @@ export interface Clip {
 export interface Project {
   /** One list per track, each kept sorted by `start`. */
   tracks: Record<TrackId, Clip[]>;
+  /** Output frame shape + background (Canvas tool). Missing = defaults. */
+  canvas?: CanvasSettings;
+}
+
+// ---- Canvas (the output frame) --------------------------------------------
+
+/** Frame shapes offered by the Canvas tool. "original" = the first video's. */
+export type CanvasRatio = "original" | "9:16" | "16:9" | "1:1" | "4:5" | "3:4";
+
+export const CANVAS_RATIOS: CanvasRatio[] = [
+  "original",
+  "9:16",
+  "16:9",
+  "1:1",
+  "4:5",
+  "3:4",
+];
+
+export interface CanvasSettings {
+  ratio: CanvasRatio;
+  /** Colour behind the pictures (hex). */
+  background: string;
+}
+
+export const DEFAULT_CANVAS: CanvasSettings = {
+  ratio: "original",
+  background: "#000000",
+};
+
+export function canvasOf(project: Project): CanvasSettings {
+  return project.canvas ?? DEFAULT_CANVAS;
+}
+
+/**
+ * Width ÷ height of the frame. "original" uses the video's own shape
+ * (`videoAspect`, or 9:16 while it isn't known yet).
+ */
+export function canvasAspect(
+  ratio: CanvasRatio,
+  videoAspect: number | null,
+): number {
+  if (ratio === "original")
+    return videoAspect && videoAspect > 0 ? videoAspect : 9 / 16;
+  const [w, h] = ratio.split(":").map(Number);
+  return w / h;
 }
 
 /** The part of a clip that trim/move edits change. */
@@ -492,7 +550,7 @@ export function describeClip(clip: Clip): string {
     const t = textDataOf(clip);
     return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s "${t.text.replace(/\s+/g, " ").slice(0, 24)}" (${t.font}, ${t.color}, size ${t.size.toFixed(3)}, at ${t.x.toFixed(2)},${t.y.toFixed(2)})`;
   }
-  return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s (src ${clip.trimIn.toFixed(2)}–${clip.trimOut.toFixed(2)}s, x${clip.speed}${clip.volume !== 1 ? `, vol ${Math.round(clip.volume * 100)}%` : ""}${clip.opacity !== 1 ? `, opacity ${Math.round(clip.opacity * 100)}%` : ""}, ${clip.linkId ? `locked ${clip.linkId}` : "unlocked"})`;
+  return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s (src ${clip.trimIn.toFixed(2)}–${clip.trimOut.toFixed(2)}s, x${clip.speed}${clip.volume !== 1 ? `, vol ${Math.round(clip.volume * 100)}%` : ""}${clip.opacity !== 1 ? `, opacity ${Math.round(clip.opacity * 100)}%` : ""}${clip.rotate ? `, rotate ${clip.rotate}°` : ""}${clip.flipX ? ", flipped" : ""}, ${clip.linkId ? `locked ${clip.linkId}` : "unlocked"})`;
 }
 
 // ---- Text clips -------------------------------------------------------------

@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSharedValue, type SharedValue } from "react-native-reanimated";
+import {
+  runOnJS,
+  runOnUI,
+  useSharedValue,
+  type SharedValue,
+} from "react-native-reanimated";
 
 // How close (in seconds) the playhead has to be to a clip's edge to still
 // count as "inside" it. Guards against float rounding at the boundary.
@@ -138,6 +143,10 @@ const LATENCY_MAX = 0.8;
  *   - uiTimeSV:  written BY the UI thread (EditorTimeline) — the playhead
  *                time it's actually drawing. Read back on pause so the
  *                playhead stays exactly where the user saw it stop.
+ *
+ * (The hook also returns `stopTimeRef` — NOT part of this object: this
+ * object is captured by worklets, which freezes everything inside it, and
+ * a ref in here could no longer be written.)
  */
 export type PlayheadSync = {
   targetSV: SharedValue<number>;
@@ -288,6 +297,14 @@ export function useTimelineClock({
   const snapSV = useSharedValue(0);
   const playingSV = useSharedValue(false);
   const uiTimeSV = useSharedValue(0);
+  // Plain JS copy of where the last playback stopped. Read this on the JS
+  // thread, not targetSV: a shared value written from JS can still read
+  // back its OLD value for a moment, and the pause then scrolled the
+  // timeline back to the stale time before jumping forward again.
+  const stopTimeRef = useRef(0);
+  // Bumped at every playback start and stop, so a stop that finishes late
+  // (it waits for the UI thread) can't overwrite a newer playback.
+  const stopSeqRef = useRef(0);
   const playhead = useMemo<PlayheadSync>(
     () => ({ targetSV, rateSV, snapSV, playingSV, uiTimeSV }),
     [targetSV, rateSV, snapSV, playingSV, uiTimeSV],
@@ -296,6 +313,7 @@ export function useTimelineClock({
   useEffect(() => {
     if (!isPlaying) return;
     haltedRef.current = false;
+    stopSeqRef.current++;
 
     let rafId: number | null = null;
     let lastTs = Date.now();
@@ -974,69 +992,86 @@ export function useTimelineClock({
       playingSV.value = false;
       rateSV.value = 0;
 
-      // Where did playback really stop? Pause the players under the
-      // playhead right now and read the picture's own position: that frame
-      // is what stays on screen, so the playhead goes there and nothing is
-      // seeked. (Before, the players were seeked to the drawn playhead —
-      // the picture jumped a little on every pause.) The drawn playhead is
-      // usually within a few hundredths of it, so the timeline barely moves.
+      // Where did playback really stop? The timeline must not step back.
+      // The players under the playhead are paused right now and the
+      // picture's position read. The decision is then made ON THE UI
+      // THREAD, against the playhead exactly as it is drawn: reading the
+      // drawn position from here (JS) could give a value a few frames old,
+      // and aligning to it moved the timeline back a pixel.
+      //   - picture at/ahead of the drawn playhead (a hair): go there —
+      //     the timeline moves forward a hair, nothing is seeked;
+      //   - otherwise: keep the drawn playhead (the timeline doesn't move)
+      //     and move the players to it.
       const clockTime = timeRef.current;
-      const drawnTime = uiTimeSV.value;
-      let stopMode: "player" | "drawn" | "clock" = "clock";
-      let leadLabel = "";
-      if (pausedMidway) {
-        const underPlayhead = tracksRef.current
-          .filter(
-            (o) =>
-              drawnTime >= o.clipStart - CLIP_EPSILON &&
-              drawnTime < o.clipEnd &&
-              !endPaused[o.label],
-          )
-          .sort((a, b) => a.priority - b.priority);
-        for (const o of underPlayhead) o.pause();
-        const lead = underPlayhead[0];
-        const playerTime = lead
-          ? decoderToTimeline(lead, lead.getCurrentTime())
-          : NaN;
-        if (
-          Number.isFinite(playerTime) &&
-          Math.abs(playerTime - drawnTime) <= PAUSE_ALIGN_MAX_AHEAD &&
-          playerTime < durationRef.current - END_EPSILON
-        ) {
-          timeRef.current = Math.max(0, playerTime);
-          stopMode = "player";
-          leadLabel = lead.label;
-        } else {
-          // No plausible player position: keep the drawn playhead (see
-          // PAUSE_ALIGN_MAX_AHEAD) and move the players there.
-          const ahead = drawnTime - clockTime;
-          if (
-            ahead > 0.001 &&
-            ahead <= PAUSE_ALIGN_MAX_AHEAD &&
-            drawnTime < durationRef.current - END_EPSILON
-          ) {
-            timeRef.current = drawnTime;
-            stopMode = "drawn";
-          }
+      const seq = ++stopSeqRef.current;
+      const finish = (finalTime: number, how: string, seek: boolean) => {
+        // A new playback started before this arrived: it owns the time now.
+        if (seq !== stopSeqRef.current) return;
+        timeRef.current = finalTime;
+        targetSV.value = finalTime;
+        stopTimeRef.current = finalTime;
+        // Commit the exact final position (the last few ticks may not have
+        // been committed because of the reduced commit rate).
+        setTimelineTime(finalTime);
+        if (seek) setSeekVersion((v) => v + 1);
+        if (__DEV__) {
+          console.log(
+            `[timelineClock] loop stop @ ${finalTime.toFixed(2)}s${how}`,
+          );
         }
+      };
+
+      if (!pausedMidway) {
+        finish(timeRef.current, halted ? " (halted by gesture)" : "", false);
+        return;
       }
 
-      targetSV.value = timeRef.current;
-      // Commit the exact final position (the last few ticks may not have
-      // been committed because of the reduced commit rate).
-      setTimelineTime(timeRef.current);
-      if (stopMode === "drawn") setSeekVersion((v) => v + 1);
-      if (__DEV__) {
-        console.log(
-          stopMode === "player"
-            ? `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s (where ${leadLabel}'s picture stopped; drawn playhead ${drawnTime.toFixed(2)}s, clock ${clockTime.toFixed(2)}s — no seek)`
-            : stopMode === "drawn"
-              ? `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s (kept drawn playhead; clock was ${clockTime.toFixed(2)}s)`
-              : halted
-                ? `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s (halted by gesture)`
-                : `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s`,
+      // Being decided (see EditorTimeline's pause follow).
+      stopTimeRef.current = NaN;
+      const guess = uiTimeSV.value;
+      const underPlayhead = tracksRef.current
+        .filter(
+          (o) =>
+            guess >= o.clipStart - CLIP_EPSILON &&
+            guess < o.clipEnd &&
+            !endPaused[o.label],
+        )
+        .sort((a, b) => a.priority - b.priority);
+      for (const o of underPlayhead) o.pause();
+      const lead = underPlayhead[0];
+      const playerTime = lead
+        ? decoderToTimeline(lead, lead.getCurrentTime())
+        : NaN;
+      const leadLabel = lead?.label ?? "";
+      const maxTime = durationRef.current - END_EPSILON;
+
+      const onUiDecided = (
+        finalTime: number,
+        usedPlayer: boolean,
+        drawn: number,
+      ) => {
+        finish(
+          finalTime,
+          usedPlayer
+            ? ` (where ${leadLabel}'s picture stopped; drawn playhead ${drawn.toFixed(2)}s, clock ${clockTime.toFixed(2)}s — no seek)`
+            : ` (kept drawn playhead; picture ${Number.isFinite(playerTime) ? `${playerTime.toFixed(2)}s` : "?"}, clock ${clockTime.toFixed(2)}s)`,
+          // Players moved only when the picture is visibly elsewhere.
+          !usedPlayer && !(Math.abs(playerTime - finalTime) < 0.02),
         );
-      }
+      };
+      runOnUI((pt: number) => {
+        "worklet";
+        const drawn = uiTimeSV.value;
+        const usable =
+          pt === pt && // not NaN
+          pt >= drawn &&
+          pt - drawn <= PAUSE_ALIGN_MAX_AHEAD &&
+          pt < maxTime;
+        const finalTime = usable ? pt : Math.max(0, drawn);
+        uiTimeSV.value = finalTime;
+        targetSV.value = finalTime;
+        runOnJS(onUiDecided)(finalTime, usable, drawn);
+      })(playerTime);
     };
   }, [isPlaying]);
 
@@ -1080,5 +1115,5 @@ export function useTimelineClock({
     }
   }, [playingSV, rateSV, targetSV]);
 
-  return { timelineTime, seekVersion, seekTo, playhead, halt };
+  return { timelineTime, seekVersion, seekTo, playhead, stopTimeRef, halt };
 }

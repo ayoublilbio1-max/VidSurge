@@ -143,6 +143,9 @@ interface EditorTimelineProps {
   isPlaying: boolean;
   // Per-frame playhead info from useTimelineClock, read on the UI thread.
   playhead: PlayheadSync;
+  // Where the last playback stopped (plain JS ref — kept out of `playhead`,
+  // which worklets capture and freeze).
+  stopTimeRef: { current: number };
   // Full length of the project on the timeline (ruler, scroll range).
   timelineDuration: number;
   thumbnails: (string | null)[];
@@ -328,6 +331,15 @@ function waveAmplitudeAtTime(t: number): number {
 // many pixels, at most WAVE_MARGIN source seconds.
 const WAVE_MARGIN = 15;
 const WAVE_MARGIN_PX = 500;
+
+// Label of a video clip: the file name, plus the Rotate tool's settings
+// when they're used (e.g. "clip.mp4 · 90° · flipped").
+function videoClipLabel(clip: Clip, name: string): string {
+  const parts = [name];
+  if (clip.rotate) parts.push(`${clip.rotate}°`);
+  if (clip.flipX) parts.push("flipped");
+  return parts.join(" · ");
+}
 
 // Label of an audio clip: music added from the phone shows its file name;
 // the video's own sound says "Original audio".
@@ -535,6 +547,7 @@ export default function EditorTimeline({
   currentTime,
   isPlaying,
   playhead,
+  stopTimeRef,
   timelineDuration,
   thumbnails,
   videoClips,
@@ -862,16 +875,16 @@ export default function EditorTimeline({
     // playhead time (React only gets it every ~50ms, more when the JS
     // thread is busy), which can be ~0.2s behind where the timeline really
     // stopped. Scrolling to it made the timeline jump back and then forward
-    // again on every pause. The clock has already written the exact stop
-    // position to targetSV (its cleanup runs before this effect), and the
-    // timeline is already sitting there — so skip this stale value; the
-    // next render carries the exact time.
+    // again on every pause. A pause mid-play is decided a moment later (on
+    // the UI thread, where the timeline already sits; stopTimeRef is NaN
+    // until then) and committed — that render does the follow. So this one
+    // only scrolls if it already carries the exact stop time.
     if (justStopped) {
-      const stopTime = playhead.targetSV.value;
-      if (Math.abs(currentTime - stopTime) > 0.01) {
+      const stopTime = stopTimeRef.current;
+      if (!(Math.abs(currentTime - stopTime) <= 0.01)) {
         if (__DEV__) {
           console.log(
-            `[EditorTimeline] scroll-follow skipped — stale time ${currentTime.toFixed(2)}s on pause (stopped at ${stopTime.toFixed(2)}s)`,
+            `[EditorTimeline] scroll-follow skipped — stale time ${currentTime.toFixed(2)}s on pause (stop ${Number.isFinite(stopTime) ? `${stopTime.toFixed(2)}s` : "being decided"})`,
           );
         }
         return;
@@ -2124,7 +2137,7 @@ export default function EditorTimeline({
                               selectedBorderColor={colors.accentPurple}
                               inactiveBorderColor={colors.iconInactive}
                               labelIcon="film-outline"
-                              labelText={clipLabel}
+                              labelText={videoClipLabel(clip, clipLabel)}
                               onPress={() => onSelectClip(clip.id)}
                               moveGesture={moveGestures[clip.id]}
                               flashToken={
