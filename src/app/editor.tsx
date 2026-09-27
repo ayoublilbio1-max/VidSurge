@@ -6,10 +6,13 @@ import * as VideoThumbnails from "expo-video-thumbnails";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   Alert,
+  BackHandler,
+  Keyboard,
   Pressable,
   ScrollView,
   StyleSheet,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from "react-native";
 import Animated, {
@@ -24,21 +27,36 @@ import EditorToolbar, {
   type SelectionKind,
 } from "../components/editor/EditorToolbar";
 import EditorTopBar from "../components/editor/EditorTopBar";
+import TextEditorSheet, {
+  MIN_PANEL_HEIGHT,
+} from "../components/editor/TextEditorSheet";
+import TextOverlay, {
+  type FrameRect,
+  type TextTransform,
+} from "../components/editor/TextOverlay";
 import {
   canSplitAt,
+  clipContains,
   clipEnd,
+  DEFAULT_TEXT_DATA,
   describeClip,
   EMPTY_PROJECT,
   findClip,
   findLinkedPartner,
   projectEnd,
+  textDataOf,
   type Clip,
   type ClipRange,
   type Project,
+  type TextClipData,
 } from "../editor/clipModel";
+import { preloadAllFonts, useFontsVersion } from "../editor/fonts";
+import { createHistory, historyReducer } from "../editor/history";
 import { probeDuration } from "../editor/mediaProbe";
 import {
   addAudioClipAction,
+  addTextClipAction,
+  duplicateClipAction,
   initSourceAction,
   projectReducer,
   splitClipAction,
@@ -56,7 +74,7 @@ function clampJS(value: number, min: number, max: number): number {
 }
 
 function summarizeProject(project: Project): string {
-  const lines = (["video", "audio"] as const).map((track) => {
+  const lines = (["video", "audio", "text"] as const).map((track) => {
     const clips = project.tracks[track];
     return `  ${track}: ${clips.length === 0 ? "(empty)" : clips.map(describeClip).join(" | ")}`;
   });
@@ -86,11 +104,40 @@ export default function EditorScreen() {
   const [duration, setDuration] = useState(0);
   const [thumbnails, setThumbnails] = useState<(string | null)[]>([]);
   const [thumbnailsReady, setThumbnailsReady] = useState(false);
+  // The source video's picture size (from the first thumbnail), to know
+  // where the picture sits inside the preview box (texts are placed on it).
+  const [videoSize, setVideoSize] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
+  // The preview box's size on screen.
+  const [previewSize, setPreviewSize] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
   const thumbnailsGeneratedRef = useRef(false);
 
   // The whole edit: a list of clips per track (see src/editor/clipModel.ts).
   // Every change goes through projectReducer as one action.
-  const [project, dispatchProject] = useReducer(projectReducer, EMPTY_PROJECT);
+  // The project, with undo/redo history around it (src/editor/history.ts).
+  const [history, dispatchHistory] = useReducer(
+    historyReducer,
+    EMPTY_PROJECT,
+    createHistory,
+  );
+  // The latest history, also between a dispatch and the re-render it
+  // causes: two quick taps (redo, redo) both ran on the same stale
+  // `history`, so the second one logged the wrong step and checked the
+  // playhead against the wrong version. Handlers read and advance this.
+  const historyRef = useRef(history);
+  // Synced after each commit (not during render — the React Compiler
+  // doesn't allow writing refs while rendering).
+  useEffect(() => {
+    historyRef.current = history;
+  }, [history]);
+  const project = history.present;
+  const canUndo = history.past.length > 0;
+  const canRedo = history.future.length > 0;
   // The selected clip's id (null = nothing selected).
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   // Lock is NOT editor state: it lives in the clips (a shared linkId =
@@ -100,15 +147,20 @@ export default function EditorScreen() {
   // is the same result dispatch will produce), logs it, dispatches it, and
   // returns the new project so callers can react to it in the same tick.
   const commitProject = (action: ProjectAction, reason: string): Project => {
-    const next = projectReducer(project, action);
+    const current = historyRef.current;
+    const next = projectReducer(current.present, action);
     if (__DEV__) {
       console.log(
-        next === project
+        next === current.present
           ? `[project] ${action.type} (${reason}) — no change`
           : `[project] ${action.type} (${reason})`,
       );
     }
-    if (next !== project) dispatchProject(action);
+    if (next !== current.present) {
+      const historyAction = { type: "APPLY", action, label: reason } as const;
+      historyRef.current = historyReducer(current, historyAction);
+      dispatchHistory(historyAction);
+    }
     return next;
   };
 
@@ -203,10 +255,16 @@ export default function EditorScreen() {
           if (i >= THUMBNAIL_COUNT) return;
           const segmentMidpoint = ((i + 0.5) * duration) / THUMBNAIL_COUNT;
           try {
-            const { uri } = await VideoThumbnails.getThumbnailAsync(videoUri, {
-              time: Math.floor(segmentMidpoint * 1000),
-            });
+            const { uri, width, height } =
+              await VideoThumbnails.getThumbnailAsync(videoUri, {
+                time: Math.floor(segmentMidpoint * 1000),
+              });
             results[i] = uri;
+            if (i === 0 && width > 0 && height > 0) {
+              setVideoSize({ width, height });
+              if (__DEV__)
+                console.log(`[editor] video picture size ${width}x${height}`);
+            }
           } catch {
             results[i] = null;
           }
@@ -228,6 +286,7 @@ export default function EditorScreen() {
   // ---- Clips on each track -------------------------------------------
   const videoClips = project.tracks.video;
   const audioClips = project.tracks.audio;
+  const textClips = project.tracks.text;
 
   // The timeline ends where the last clip ends (after trimming everything
   // shorter, playback stops there instead of running on through black to
@@ -255,11 +314,13 @@ export default function EditorScreen() {
   // picture tools).
   const selectionKind: SelectionKind = !selectedClip
     ? "none"
-    : selectedPartner
-      ? "locked"
-      : selectedClip.track === "audio"
-        ? "audio"
-        : "video";
+    : selectedClip.track === "text"
+      ? "text"
+      : selectedPartner
+        ? "locked"
+        : selectedClip.track === "audio"
+          ? "audio"
+          : "video";
 
   // ---- Clips per player -------------------------------------------------
   // Consecutive clips on a track alternate between the track's two players
@@ -426,9 +487,12 @@ export default function EditorScreen() {
   // Delete is usable on any selected clip, unless it (with its locked
   // partner) is everything left in the project: an empty project has no way
   // to add media back yet (that comes with an "add clip" tool).
+  // (Texts can always be deleted.)
   const clipCount = project.tracks.video.length + project.tracks.audio.length;
   const deleteEnabled =
-    selectedClip !== null && clipCount - (selectedPartner ? 2 : 1) > 0;
+    selectedClip !== null &&
+    (selectedClip.track === "text" ||
+      clipCount - (selectedPartner ? 2 : 1) > 0);
 
   // ---- Transport handlers (thin — the hooks above react to the state
   // changes these make, so there's no manual player.play()/currentTime
@@ -530,8 +594,12 @@ export default function EditorScreen() {
   // Buttons (toolbar, play, zoom...) are touchables of their own, so they
   // take the tap first and never reach this — the selection survives them,
   // which tools like Split/Delete will need.
+  // A tap on a text on the preview also reaches the preview's own
+  // "tap background = deselect" — ignore that one.
+  const lastTextTapAtRef = useRef(0);
   const clearSelection = (reason: string) => {
     if (selectedClip === null) return;
+    if (Date.now() - lastTextTapAtRef.current < 700) return;
     if (__DEV__)
       console.log(
         `[editor] ${reason} tapped — deselecting ${selectedClip.track} (${selectedClip.id})`,
@@ -700,10 +768,321 @@ export default function EditorScreen() {
     }
   };
 
-  // Tools that aren't built yet.
+  // Undo / redo: step back / forward through the edits (history.ts). Like
+  // any edit, it pauses first and clears the selection (the selected clip
+  // may not exist in the other version). The playhead stays, unless the
+  // timeline gets shorter than where it sits.
+  const handleHistory = (direction: "undo" | "redo") => {
+    const current = historyRef.current;
+    const entry =
+      direction === "undo"
+        ? current.past[current.past.length - 1]
+        : current.future[0];
+    if (!entry) {
+      if (__DEV__)
+        console.log(`[editor] ${direction} — nothing to ${direction}`);
+      return;
+    }
+    const at = isPlaying ? playhead.uiTimeSV.get() : timelineTime;
+    pauseForGesture(direction);
+    setSelectedClipId(null);
+    const historyAction = {
+      type: direction === "undo" ? "UNDO" : "REDO",
+    } as const;
+    const after = historyReducer(current, historyAction);
+    historyRef.current = after;
+    dispatchHistory(historyAction);
+    const target = after.present;
+    const end = projectEnd(target);
+    if (__DEV__)
+      console.log(
+        `[editor] ${direction} "${entry.label}" — ${after.past.length} step(s) back available, ${after.future.length} forward`,
+      );
+    if (at > end) {
+      if (__DEV__)
+        console.log(
+          `[editor] ${direction} — timeline now ${end.toFixed(2)}s, playhead ${at.toFixed(2)}s was past the end → moved to end`,
+        );
+      seekTo(end);
+    } else if (isPlaying) {
+      seekTo(at);
+    }
+  };
+
+  // ---- Text (step 5a / 5a.1) --------------------------------------------
+  // The text sheet: adding a new text at `at`, or editing an existing one.
+  // `draft` is what the sheet shows — drawn live on the preview.
+  const [textEditor, setTextEditor] = useState<
+    | { mode: "add"; at: number; draft: TextClipData }
+    | { mode: "edit"; clipId: string; draft: TextClipData }
+    | null
+  >(null);
+  // The sheet's height (the preview shrinks to fit above it) and whether a
+  // text is being dragged / rotated on the preview (page scroll paused).
+  const [sheetHeight, setSheetHeight] = useState(0);
+  const [textGestureActive, setTextGestureActive] = useState(false);
+  const [topOffset, setTopOffset] = useState(0);
+  const scrollRef = useRef<ScrollView>(null);
+  const { width: windowWidth } = useWindowDimensions();
+  useFontsVersion(); // redraw texts when a downloaded font is ready
+
+  const patchDraft = (patch: Partial<TextClipData>) =>
+    setTextEditor((t) => (t ? { ...t, draft: { ...t.draft, ...patch } } : t));
+
+  const openAddText = (from: string) => {
+    const at = isPlaying ? playhead.uiTimeSV.get() : timelineTime;
+    pauseForGesture("add text");
+    if (isPlaying) seekTo(at);
+    setSelectedClipId(null);
+    scrollRef.current?.scrollTo({ y: 0, animated: true });
+    if (__DEV__)
+      console.log(
+        `[editor] add text (${from}) @ ${at.toFixed(2)}s — sheet open`,
+      );
+    setTextEditor({ mode: "add", at, draft: { ...DEFAULT_TEXT_DATA } });
+  };
+
+  const openEditText = (clipId?: string) => {
+    const clip = clipId ? findClip(project, clipId) : selectedClip;
+    if (!clip || clip.track !== "text") return;
+    pauseForGesture("edit text");
+    setSelectedClipId(clip.id);
+    scrollRef.current?.scrollTo({ y: 0, animated: true });
+    if (__DEV__) console.log(`[editor] edit text ${clip.id} — sheet open`);
+    setTextEditor({ mode: "edit", clipId: clip.id, draft: textDataOf(clip) });
+  };
+
+  const closeTextEditor = (why: string) => {
+    Keyboard.dismiss();
+    if (__DEV__) console.log(`[editor] text sheet closed (${why})`);
+    setTextEditor(null);
+    setSheetHeight(0);
+  };
+
+  const handleTextDone = () => {
+    if (!textEditor) return;
+    const draft = { ...textEditor.draft, text: textEditor.draft.text.trim() };
+    if (!draft.text) {
+      closeTextEditor("empty text — nothing saved");
+      return;
+    }
+    if (textEditor.mode === "add") {
+      const action = addTextClipAction(draft, textEditor.at);
+      commitProject(action, "add text");
+      if (action.type === "ADD_CLIP") {
+        // Select it (its tools show) and flash it.
+        setSelectedClipId(action.clip.id);
+        flashClips([action.clip.id]);
+      }
+    } else {
+      const next = commitProject(
+        { type: "UPDATE_CLIP_DATA", clipId: textEditor.clipId, data: draft },
+        "edit text",
+      );
+      if (next !== project) flashClips([textEditor.clipId]);
+    }
+    closeTextEditor("done");
+  };
+
+  const handleDuplicate = () => {
+    if (!selectedClip || selectedClip.track !== "text") return;
+    pauseForGesture("duplicate");
+    const action = duplicateClipAction(selectedClip);
+    commitProject(action, "duplicate text");
+    if (action.type === "ADD_CLIP") {
+      setSelectedClipId(action.clip.id);
+      flashClips([action.clip.id]);
+    }
+  };
+
+  // Android back button closes the sheet without saving.
+  useEffect(() => {
+    if (!textEditor) return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      closeTextEditor("back button");
+      return true;
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [textEditor !== null]);
+
+  // The Google fonts ship with the app: load them all once, so every font
+  // is ready (offline too) by the time a text uses it.
+  useEffect(() => {
+    preloadAllFonts();
+  }, []);
+
+  // ---- Texts on the preview ------------------------------------------------
+  const DRAFT_ID = "__draft__";
+  const selectedTextId = textEditor
+    ? textEditor.mode === "add"
+      ? DRAFT_ID
+      : textEditor.clipId
+    : selectedClip?.track === "text"
+      ? selectedClip.id
+      : null;
+
+  const handleTextSelect = (id: string) => {
+    lastTextTapAtRef.current = Date.now();
+    if (textEditor) return; // finish the open text first
+    pauseForGesture("text tap");
+    if (__DEV__)
+      console.log(`[editor] select text ${id} (tapped on the preview)`);
+    setSelectedClipId(id);
+  };
+
+  const handleTextEditSelected = (id: string) => {
+    lastTextTapAtRef.current = Date.now();
+    if (textEditor) return;
+    openEditText(id);
+  };
+
+  const handleTextDelete = (id: string) => {
+    if (id === DRAFT_ID) {
+      closeTextEditor("draft deleted (✕)");
+      return;
+    }
+    if (textEditor) closeTextEditor("text deleted (✕)");
+    pauseForGesture("delete text");
+    commitProject(
+      { type: "DELETE_CLIP", clipId: id },
+      "delete text (✕ on preview)",
+    );
+    setSelectedClipId(null);
+  };
+
+  const handleTextTransform = (id: string, t: TextTransform) => {
+    lastTextTapAtRef.current = Date.now();
+    const editingThis =
+      textEditor &&
+      ((textEditor.mode === "add" && id === DRAFT_ID) ||
+        (textEditor.mode === "edit" && textEditor.clipId === id));
+    if (editingThis) {
+      patchDraft(t); // saved with the sheet's ✓
+      return;
+    }
+    const clip = findClip(project, id);
+    if (!clip) return;
+    commitProject(
+      {
+        type: "UPDATE_CLIP_DATA",
+        clipId: id,
+        data: { ...textDataOf(clip), ...t },
+      },
+      "move / resize text",
+    );
+  };
+
+  // Keyboard: lift the text sheet above it. If Android already shrank the
+  // screen for the keyboard (adjustResize), only the part it didn't cover.
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+  // The keyboard's height the last time it was open: the text sheet's
+  // panel gets the same height, so it takes the keyboard's place exactly
+  // and the sheet / preview don't jump when the keyboard closes.
+  const [lastKeyboardHeight, setLastKeyboardHeight] = useState(0);
+  const [rootHeight, setRootHeight] = useState(0);
+  // The screen's full height (the most it has been — the keyboard can only
+  // make it smaller).
+  const [maxRootHeight, setMaxRootHeight] = useState(0);
+  useEffect(() => {
+    // Android often reports the keyboard twice while it opens (e.g. 302px,
+    // then 255px once the suggestion bar settles): the panel height follows
+    // only the settled value, so the preview doesn't resize twice.
+    let settle: ReturnType<typeof setTimeout> | null = null;
+    const show = Keyboard.addListener("keyboardDidShow", (e) => {
+      const h = e.endCoordinates.height;
+      setKeyboardHeight(h);
+      if (settle) clearTimeout(settle);
+      settle = setTimeout(() => setLastKeyboardHeight(h), 300);
+      if (__DEV__) console.log(`[editor] keyboard open (${Math.round(h)}px)`);
+    });
+    const hide = Keyboard.addListener("keyboardDidHide", () =>
+      setKeyboardHeight(0),
+    );
+    return () => {
+      if (settle) clearTimeout(settle);
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+  const sheetBottom = Math.max(
+    0,
+    keyboardHeight - Math.max(0, maxRootHeight - rootHeight),
+  );
+
+  // While the sheet is open, the preview shrinks to fit above it (CapCut
+  // style): as tall as the space left, never bigger than normal.
+  const normalPreviewHeight = ((windowWidth - 24) * 0.75 * 16) / 9;
+  // Computed from things that DON'T change when the keyboard opens or
+  // closes: the screen's full height, the sheet's top part and the panel
+  // height (= the keyboard's height). Before, it used the live sheet height
+  // and screen height, which change at slightly different moments when the
+  // keyboard opens — the preview jumped small and back.
+  const panelSpace = Math.max(MIN_PANEL_HEIGHT, lastKeyboardHeight);
+  const editingPreviewHeight =
+    textEditor && sheetHeight > 0 && maxRootHeight > 0
+      ? Math.max(
+          120,
+          Math.min(
+            normalPreviewHeight,
+            maxRootHeight - topOffset - sheetHeight - panelSpace - 16,
+          ),
+        )
+      : null;
+
+  // Texts drawn on the preview: those under the playhead, plus the one in
+  // the sheet (always shown while it's being written / edited).
+  const visibleTexts: { id: string; data: TextClipData }[] = [];
+  for (const clip of textClips) {
+    if (textEditor?.mode === "edit" && textEditor.clipId === clip.id) {
+      visibleTexts.push({ id: clip.id, data: textEditor.draft });
+    } else if (clipContains(clip, timelineTime)) {
+      visibleTexts.push({ id: clip.id, data: textDataOf(clip) });
+    }
+  }
+  if (textEditor?.mode === "add") {
+    visibleTexts.push({
+      id: DRAFT_ID,
+      data: textEditor.draft.text
+        ? textEditor.draft
+        : { ...textEditor.draft, text: "Enter text" },
+    });
+  }
+
+  // Where the video picture sits in the preview box (contentFit "contain").
+  let frame: FrameRect | null = null;
+  if (previewSize) {
+    const { width: bw, height: bh } = previewSize;
+    if (videoSize) {
+      const aspect = videoSize.width / videoSize.height;
+      if (aspect > bw / bh) {
+        const h = bw / aspect;
+        frame = { left: 0, top: (bh - h) / 2, width: bw, height: h };
+      } else {
+        const w = bh * aspect;
+        frame = { left: (bw - w) / 2, top: 0, width: w, height: bh };
+      }
+    } else {
+      frame = { left: 0, top: 0, width: bw, height: bh };
+    }
+  }
+
+  // Tools that aren't built yet (and the ones routed from here).
   const handleComingSoonTool = (key: string) => {
     if (key === "music") {
       void handleAddAudio("Music tool");
+      return;
+    }
+    if (key === "addText") {
+      openAddText("Add text tool");
+      return;
+    }
+    if (key === "editText") {
+      openEditText();
+      return;
+    }
+    if (key === "duplicate") {
+      handleDuplicate();
       return;
     }
     if (__DEV__)
@@ -791,7 +1170,14 @@ export default function EditorScreen() {
   }
 
   return (
-    <View style={[styles.root, { backgroundColor: colors.background }]}>
+    <View
+      style={[styles.root, { backgroundColor: colors.background }]}
+      onLayout={(e: { nativeEvent: { layout: { height: number } } }) => {
+        const h = e.nativeEvent.layout.height;
+        setMaxRootHeight((m) => Math.max(m, h));
+        setRootHeight(h);
+      }}
+    >
       <EditorTopBar
         resolution="1080P"
         onBack={() => router.back()}
@@ -801,13 +1187,33 @@ export default function EditorScreen() {
       />
 
       <ScrollView
+        ref={scrollRef}
         showsVerticalScrollIndicator={false}
         contentContainerStyle={styles.scrollContent}
+        scrollEnabled={!textGestureActive && !textEditor}
+        onLayout={(e: { nativeEvent: { layout: { y: number } } }) =>
+          setTopOffset(e.nativeEvent.layout.y)
+        }
       >
         <Pressable onPress={() => clearSelection("background")}>
           <View style={styles.previewArea}>
             <View
-              style={[styles.previewBox, { backgroundColor: colors.surface }]}
+              style={[
+                styles.previewBox,
+                { backgroundColor: colors.surface },
+                editingPreviewHeight !== null && {
+                  width: (editingPreviewHeight * 9) / 16,
+                  height: editingPreviewHeight,
+                },
+              ]}
+              onLayout={(e: {
+                nativeEvent: { layout: { width: number; height: number } };
+              }) =>
+                setPreviewSize({
+                  width: e.nativeEvent.layout.width,
+                  height: e.nativeEvent.layout.height,
+                })
+              }
             >
               {/* Two stacked video views, one per video player; only the
                   active one is visible. TextureView (not the default
@@ -839,22 +1245,53 @@ export default function EditorScreen() {
               {isVoidNow && (
                 <View pointerEvents="none" style={styles.voidOverlay} />
               )}
+              <TextOverlay
+                texts={visibleTexts}
+                frame={frame}
+                selectedId={selectedTextId}
+                onSelect={handleTextSelect}
+                onEditSelected={handleTextEditSelected}
+                onDelete={handleTextDelete}
+                onTransform={handleTextTransform}
+                onGestureActive={(active) => {
+                  // A drag / rotate on a text also ends as a "tap" on the
+                  // preview behind it — don't let that deselect the text.
+                  lastTextTapAtRef.current = Date.now();
+                  setTextGestureActive(active);
+                }}
+              />
             </View>
           </View>
 
           <View style={styles.transportRow}>
-            <TouchableOpacity onPress={() => setComingSoonVisible(true)}>
+            <TouchableOpacity
+              onPress={() => handleHistory("undo")}
+              disabled={!canUndo}
+              accessibilityRole="button"
+              accessibilityLabel="Undo"
+              accessibilityState={{ disabled: !canUndo }}
+              hitSlop={8}
+            >
               <Ionicons
                 name="arrow-undo-outline"
                 size={20}
-                color={colors.iconInactive}
+                color={canUndo ? colors.textPrimary : colors.iconInactive}
+                style={!canUndo && styles.historyDisabled}
               />
             </TouchableOpacity>
-            <TouchableOpacity onPress={() => setComingSoonVisible(true)}>
+            <TouchableOpacity
+              onPress={() => handleHistory("redo")}
+              disabled={!canRedo}
+              accessibilityRole="button"
+              accessibilityLabel="Redo"
+              accessibilityState={{ disabled: !canRedo }}
+              hitSlop={8}
+            >
               <Ionicons
                 name="arrow-redo-outline"
                 size={20}
-                color={colors.iconInactive}
+                color={canRedo ? colors.textPrimary : colors.iconInactive}
+                style={!canRedo && styles.historyDisabled}
               />
             </TouchableOpacity>
 
@@ -926,10 +1363,11 @@ export default function EditorScreen() {
               thumbnails={thumbnails}
               videoClips={videoClips}
               audioClips={audioClips}
+              textClips={textClips}
               selectedClipId={selectedClip?.id ?? null}
               onMutePress={() => setComingSoonVisible(true)}
               onSelectClip={handleSelectClip}
-              onAddTextPress={() => setComingSoonVisible(true)}
+              onAddTextPress={() => openAddText("empty text row")}
               onAddAudioPress={() => void handleAddAudio("empty audio row")}
               addingAudio={addingAudio}
               flash={flash}
@@ -947,6 +1385,19 @@ export default function EditorScreen() {
         </Pressable>
       </ScrollView>
 
+      {textEditor && (
+        <TextEditorSheet
+          mode={textEditor.mode}
+          value={textEditor.draft}
+          keyboardOpen={keyboardHeight > 0}
+          bottomOffset={sheetBottom}
+          panelHeight={lastKeyboardHeight}
+          onPatch={patchDraft}
+          onDone={handleTextDone}
+          onHeight={setSheetHeight}
+        />
+      )}
+
       <ComingSoonModal
         visible={comingSoonVisible}
         onClose={() => setComingSoonVisible(false)}
@@ -956,6 +1407,8 @@ export default function EditorScreen() {
 }
 
 const styles = StyleSheet.create({
+  // Undo / redo with nothing to undo / redo: dimmed.
+  historyDisabled: { opacity: 0.4 },
   root: { flex: 1 },
   scrollContent: { paddingBottom: 32 },
   previewArea: {

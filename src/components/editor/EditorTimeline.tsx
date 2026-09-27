@@ -25,7 +25,13 @@ import Animated, {
   withTiming,
   type SharedValue,
 } from "react-native-reanimated";
-import { clipLength, type Clip, type ClipRange } from "../../editor/clipModel";
+import {
+  clipLength,
+  textDataOf,
+  textLanes,
+  type Clip,
+  type ClipRange,
+} from "../../editor/clipModel";
 import { useTheme } from "../../hooks/useTheme";
 import type { PlayheadSync } from "../../hooks/useTimelineClock";
 import AppText from "../AppText";
@@ -38,6 +44,10 @@ const MAX_PIXELS_PER_SECOND = 200;
 const INITIAL_PIXELS_PER_SECOND = MIN_PIXELS_PER_SECOND;
 
 const TRACK_HEIGHT = 56;
+// Text clips are filled boxes (like CapCut's), so they read as clips next
+// to the video thumbnails and audio waveforms.
+const TEXT_CLIP_COLOR = "#8A5516";
+const TEXT_CLIP_BORDER = "#B8772A";
 const TRACK_GAP = 4;
 const LEADING_WIDTH = 60;
 const RULER_HEIGHT = 16;
@@ -128,6 +138,8 @@ interface EditorTimelineProps {
   // The clips on each track row, sorted by start (from the project).
   videoClips: Clip[];
   audioClips: Clip[];
+  /** Text clips — they may overlap, and are stacked in lanes (rows). */
+  textClips: Clip[];
   selectedClipId: string | null;
   onMutePress: () => void;
   onSelectClip: (clipId: string) => void;
@@ -455,6 +467,7 @@ export default function EditorTimeline({
   thumbnails,
   videoClips,
   audioClips,
+  textClips,
   selectedClipId,
   onMutePress,
   onSelectClip,
@@ -668,9 +681,12 @@ export default function EditorTimeline({
   // Selection. A clip locked to a partner (same linkId on the other track)
   // is highlighted, trimmed and moved together with it.
   const allClips = useMemo(
-    () => [...videoClips, ...audioClips],
-    [videoClips, audioClips],
+    () => [...videoClips, ...audioClips, ...textClips],
+    [videoClips, audioClips, textClips],
   );
+  // Text lanes: overlapping texts go on separate rows under the audio row.
+  const lanes = useMemo(() => textLanes(textClips), [textClips]);
+  const textRowCount = lanes.count;
   const partnerOf = (clip: Clip): Clip | null => {
     if (clip.linkId === null) return null;
     return (
@@ -696,7 +712,7 @@ export default function EditorTimeline({
   useEffect(() => {
     dragBasesSV.value = {};
     dragDeltaSV.value = 0;
-  }, [videoClips, audioClips, dragBasesSV, dragDeltaSV]);
+  }, [videoClips, audioClips, textClips, dragBasesSV, dragDeltaSV]);
 
   // NOTE: the zoom's source of truth is pixelsPerSecondSV (UI thread);
   // `pixelsPerSecond` state is only its mirror for rendering, updated via
@@ -1406,13 +1422,18 @@ export default function EditorTimeline({
     );
   };
 
-  const tracksBlockHeight = RULER_HEIGHT + TRACK_HEIGHT * 3 + TRACK_GAP * 3;
+  // Rows: video, audio, then one per text lane (at least one — the "Add
+  // text" row when there's no text yet).
+  const rowCount = 2 + textRowCount;
+  const tracksBlockHeight =
+    RULER_HEIGHT + TRACK_HEIGHT * rowCount + TRACK_GAP * rowCount;
 
-  // One panel top offset per track row (video, audio, text) — rows are
-  // stacked vertically with a TRACK_GAP margin above each one, so row i's
-  // top is RULER_HEIGHT + i*TRACK_HEIGHT + (i+1)*TRACK_GAP.
-  const trackPanelTops = [0, 1, 2].map(
-    (i) => RULER_HEIGHT + i * TRACK_HEIGHT + (i + 1) * TRACK_GAP,
+  // One panel top offset per row — rows are stacked vertically with a
+  // TRACK_GAP margin above each one, so row i's top is
+  // RULER_HEIGHT + i*TRACK_HEIGHT + (i+1)*TRACK_GAP.
+  const trackPanelTops = Array.from(
+    { length: rowCount },
+    (_, i) => RULER_HEIGHT + i * TRACK_HEIGHT + (i + 1) * TRACK_GAP,
   );
 
   // Trim handles sit on the selected clip. If it's locked to a partner, one
@@ -1420,8 +1441,12 @@ export default function EditorTimeline({
   // the parent applies the same range to the partner). Otherwise the
   // handles cover only the selected clip's own row.
   const showHandles = selectedClip !== null;
-  const rowTop = (track: Clip["track"]) =>
-    track === "audio" ? trackPanelTops[1] : trackPanelTops[0];
+  const rowTop = (clip: Clip) =>
+    clip.track === "audio"
+      ? trackPanelTops[1]
+      : clip.track === "text"
+        ? trackPanelTops[2 + (lanes.laneOf[clip.id] ?? 0)]
+        : trackPanelTops[0];
   let handleTop = 0;
   let handleHeight = 0;
   if (selectedClip) {
@@ -1429,7 +1454,7 @@ export default function EditorTimeline({
       handleTop = trackPanelTops[0];
       handleHeight = trackPanelTops[1] + TRACK_HEIGHT - trackPanelTops[0];
     } else {
-      handleTop = rowTop(selectedClip.track);
+      handleTop = rowTop(selectedClip);
       handleHeight = TRACK_HEIGHT;
     }
   }
@@ -1440,11 +1465,17 @@ export default function EditorTimeline({
   const handleSpeed = selectedClip?.speed ?? 1;
   const handleSourceDuration = selectedClip?.sourceDuration ?? 0;
 
-  // Clips on the same track as `clip`, other than the ones in `exclude`.
+  // Clips on the same track as `clip`, other than the ones in `exclude`,
+  // that it can't overlap. Texts: only the ones in its own row (texts in
+  // other rows may overlap it in time).
   const neighboursOf = (clip: Clip, exclude: Set<string>) =>
-    (clip.track === "audio" ? audioClips : videoClips).filter(
-      (c) => !exclude.has(c.id),
-    );
+    clip.track === "text"
+      ? textClips.filter(
+          (c) => !exclude.has(c.id) && (c.lane ?? 0) === (clip.lane ?? 0),
+        )
+      : (clip.track === "audio" ? audioClips : videoClips).filter(
+          (c) => !exclude.has(c.id),
+        );
 
   // How far the selected clip's edges may go before touching a neighbour
   // (checked on its track and on its locked partner's track).
@@ -1695,7 +1726,7 @@ export default function EditorTimeline({
     }
     // Row(s) the landing line covers: the clip's row, or both rows when
     // it's locked (both move).
-    const landingTop = partner ? trackPanelTops[0] : rowTop(clip.track);
+    const landingTop = partner ? trackPanelTops[0] : rowTop(clip);
     const landingHeight = partner
       ? trackPanelTops[1] + TRACK_HEIGHT - trackPanelTops[0]
       : TRACK_HEIGHT;
@@ -1703,6 +1734,14 @@ export default function EditorTimeline({
     for (const g of partner ? [clip, partner] : [clip]) {
       for (const o of neighboursOf(g, moving)) {
         snapPoints.push(o.start, o.start + clipLength(o));
+      }
+    }
+    // A text snaps to every other clip's edges (video, audio, text), so it
+    // can be lined up with a cut.
+    const isText = clip.track === "text";
+    if (isText) {
+      for (const o of allClips) {
+        if (o.id !== clip.id) snapPoints.push(o.start, o.start + clipLength(o));
       }
     }
 
@@ -1765,7 +1804,8 @@ export default function EditorTimeline({
         landingSV.value = landing;
         landingTopSV.value = landingTop;
         landingHeightSV.value = landingHeight;
-        landingVisibleSV.value = true;
+        // Texts land exactly where dropped (they may overlap): no line.
+        landingVisibleSV.value = !isText;
       })
       .onEnd(() => {
         // Exactly where the box was last drawn (snapping included).
@@ -2083,28 +2123,74 @@ export default function EditorTimeline({
                           </View>
                         )}
 
-                        <Animated.View
-                          style={[styles.emptyTrackRow, trackWidthStyle]}
-                        >
-                          <TouchableOpacity
-                            style={styles.trackRowTouchable}
-                            onPress={onAddTextPress}
+                        {textClips.length === 0 ? (
+                          <Animated.View
+                            style={[styles.emptyTrackRow, trackWidthStyle]}
                           >
-                            <Ionicons
-                              name="add"
-                              size={16}
-                              color={colors.textMuted}
-                            />
-                            <AppText
-                              style={[
-                                styles.trackLabel,
-                                { color: colors.textMuted },
-                              ]}
+                            <TouchableOpacity
+                              style={styles.trackRowTouchable}
+                              onPress={onAddTextPress}
                             >
-                              Add text
-                            </AppText>
-                          </TouchableOpacity>
-                        </Animated.View>
+                              <Ionicons
+                                name="add"
+                                size={16}
+                                color={colors.textMuted}
+                              />
+                              <AppText
+                                style={[
+                                  styles.trackLabel,
+                                  { color: colors.textMuted },
+                                ]}
+                              >
+                                Add text
+                              </AppText>
+                            </TouchableOpacity>
+                          </Animated.View>
+                        ) : (
+                          // One row per text lane (texts that overlap in
+                          // time sit on separate rows).
+                          Array.from({ length: textRowCount }, (_, lane) => (
+                            <View
+                              key={`text-lane-${lane}`}
+                              style={styles.clipRow}
+                            >
+                              {textClips
+                                .filter(
+                                  (clip) =>
+                                    (lanes.laneOf[clip.id] ?? 0) === lane,
+                                )
+                                .map((clip) => (
+                                  <TimelineClipBox
+                                    key={clip.id}
+                                    clipId={clip.id}
+                                    start={clip.start}
+                                    lengthSeconds={clipLength(clip)}
+                                    height={TRACK_HEIGHT}
+                                    pixelsPerSecondSV={pixelsPerSecondSV}
+                                    drag={drag}
+                                    selected={isClipHighlighted(clip)}
+                                    backgroundColor={TEXT_CLIP_COLOR}
+                                    selectedBorderColor={colors.accentPurple}
+                                    inactiveBorderColor={TEXT_CLIP_BORDER}
+                                    labelIcon="text-outline"
+                                    labelText={
+                                      textDataOf(clip)
+                                        .text.replace(/\s+/g, " ")
+                                        .trim() || "Text"
+                                    }
+                                    onPress={() => onSelectClip(clip.id)}
+                                    moveGesture={moveGestures[clip.id]}
+                                    flashToken={
+                                      flash.ids.includes(clip.id)
+                                        ? flash.token
+                                        : 0
+                                    }
+                                    flashColor={colors.accentPurple}
+                                  />
+                                ))}
+                            </View>
+                          ))
+                        )}
                       </Animated.View>
 
                       <Animated.View

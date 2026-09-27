@@ -85,14 +85,23 @@ const PICTURE_TOOLS: EditorTool[] = [
   { key: "reverse", icon: "play-back-outline", label: "Reverse" },
 ];
 
+// A text clip selected: Edit (words + style), Split, Delete, Duplicate.
+const TEXT_TOOLS: EditorTool[] = [
+  { key: "editText", icon: "create-outline", label: "Edit" },
+  SPLIT,
+  DELETE,
+  { key: "duplicate", icon: "duplicate-outline", label: "Duplicate" },
+];
+
 /** What is selected, for choosing the tools. */
-export type SelectionKind = "none" | "locked" | "video" | "audio";
+export type SelectionKind = "none" | "locked" | "video" | "audio" | "text";
 
 const TOOLS_BY_SELECTION: Record<SelectionKind, EditorTool[]> = {
   none: PROJECT_TOOLS,
   locked: [SPLIT, DELETE, SPEED, VOLUME, ...PICTURE_TOOLS],
   video: [SPLIT, DELETE, SPEED, ...PICTURE_TOOLS],
   audio: [SPLIT, DELETE, SPEED, VOLUME],
+  text: TEXT_TOOLS,
 };
 
 interface EditorToolbarProps {
@@ -137,7 +146,8 @@ export default function EditorToolbar({
 }: EditorToolbarProps) {
   const colors = useTheme();
   const lockActive = lockMode === "locked";
-  const hasSelection = selectionKind !== "none";
+  // The Lock button is for video/audio pairs only — not shown for text.
+  const hasSelection = selectionKind !== "none" && selectionKind !== "text";
   const scrollRef = useRef<ScrollView>(null);
 
   // A different tool set: start it from the first tool. Otherwise the old
@@ -199,7 +209,7 @@ export default function EditorToolbar({
       if (deleteEnabled) runWithSpinner("delete", onDelete);
       return;
     }
-    if (__DEV__) console.log(`[EditorToolbar] ${key} pressed (coming soon)`);
+    if (__DEV__) console.log(`[EditorToolbar] ${key} pressed`);
     onToolPress(key);
   };
 

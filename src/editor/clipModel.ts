@@ -69,6 +69,11 @@ export interface Clip {
   reversed: boolean;
   /** Track-specific payload (text content, sticker id...). */
   data?: unknown;
+  /**
+   * Row on the timeline for tracks whose clips may overlap in time (text):
+   * each clip keeps its own row, so moving one never shuffles the others.
+   */
+  lane?: number;
 }
 
 export interface Project {
@@ -303,6 +308,15 @@ export function sameRange(clip: Clip, range: ClipRange): boolean {
 const PLACE_EPSILON = 0.001;
 
 /**
+ * Tracks whose clips MAY overlap in time (shown in stacked lanes on the
+ * timeline, see textLanes): text. Every other track keeps the no-overlap
+ * rules above.
+ */
+export function allowsOverlap(track: TrackId): boolean {
+  return track === "text";
+}
+
+/**
  * Where a clip dropped at `start` actually goes on a track: `start` itself,
  * unless that falls inside one of `others` — then that clip's nearer edge.
  */
@@ -333,6 +347,7 @@ export function resolveOverlaps(
     let changed = false;
 
     for (const track of TRACK_IDS) {
+      if (allowsOverlap(track)) continue;
       const clips = next.tracks[track];
       if (clips.length < 2) continue;
       const occupied = clips
@@ -431,5 +446,168 @@ export function splitClip(
 
 /** One-line summary of a clip, for [project] logs. */
 export function describeClip(clip: Clip): string {
+  if (clip.track === "text") {
+    const t = textDataOf(clip);
+    return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s "${t.text.replace(/\s+/g, " ").slice(0, 24)}" (${t.font}, ${t.color}, size ${t.size.toFixed(3)}, at ${t.x.toFixed(2)},${t.y.toFixed(2)})`;
+  }
   return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s (src ${clip.trimIn.toFixed(2)}–${clip.trimOut.toFixed(2)}s, x${clip.speed}, ${clip.linkId ? `locked ${clip.linkId}` : "unlocked"})`;
+}
+
+// ---- Text clips -------------------------------------------------------------
+//
+// A text clip has no media file. Its words and look live in `data`
+// (TextClipData); its time range uses the same start / trimIn / trimOut as
+// every clip, over a made-up "source" of TEXT_SOURCE_LENGTH seconds. New
+// texts start in the MIDDLE of that range (TEXT_SOURCE_ORIGIN) so the left
+// trim handle can also make them longer, not only shorter.
+
+export const TEXT_SOURCE_LENGTH = 7200;
+export const TEXT_SOURCE_ORIGIN = 3600;
+/** Length of a new text on the timeline (seconds). */
+export const TEXT_DEFAULT_LENGTH = 3;
+
+/**
+ * Font id: one of the phone's built-in fonts ("normal", "bold", "serif",
+ * "mono") or a downloadable Google font (see src/editor/fonts.ts).
+ */
+export type TextFont = string;
+export type TextAlign = "left" | "center" | "right";
+
+export interface TextClipData {
+  text: string;
+  font: TextFont;
+  /** Text colour, "#RRGGBB", and how opaque the whole text is (0–1). */
+  color: string;
+  opacity: number;
+  /** Font size as a fraction of the video frame's height (0.05 = 5%). */
+  size: number;
+  align: TextAlign;
+  /** Outline (null = none); width as a fraction of the font size. */
+  strokeColor: string | null;
+  strokeWidth: number;
+  /** Soft glow around the letters (null = none); radius × font size. */
+  glowColor: string | null;
+  glowRadius: number;
+  /** Box behind the text (null = none); corner radius × font size. */
+  bgColor: string | null;
+  bgOpacity: number;
+  bgRadius: number;
+  /** Drop shadow (null = none); distance and blur × font size. */
+  shadowColor: string | null;
+  shadowDistance: number;
+  shadowBlur: number;
+  /** Centre of the text on the video frame, 0–1 of its width / height. */
+  x: number;
+  y: number;
+  /** Extra scale (resize handle) and rotation in degrees. */
+  scale: number;
+  rotation: number;
+}
+
+export const DEFAULT_TEXT_DATA: TextClipData = {
+  text: "",
+  font: "bold",
+  color: "#FFFFFF",
+  opacity: 1,
+  size: 0.05,
+  align: "center",
+  strokeColor: null,
+  strokeWidth: 0.08,
+  glowColor: null,
+  glowRadius: 0.5,
+  bgColor: null,
+  bgOpacity: 0.7,
+  bgRadius: 0.25,
+  shadowColor: null,
+  shadowDistance: 0.08,
+  shadowBlur: 0.15,
+  x: 0.5,
+  y: 0.5,
+  scale: 1,
+  rotation: 0,
+};
+
+/** The text settings of a text clip (defaults for anything missing). */
+export function textDataOf(clip: Clip): TextClipData {
+  const raw = (clip.data ?? {}) as Partial<TextClipData> & {
+    background?: boolean;
+  };
+  const data = { ...DEFAULT_TEXT_DATA, ...raw };
+  // Texts made before the style panel had `background: true`.
+  if (raw.background === true && raw.bgColor === undefined) {
+    data.bgColor = "#000000";
+  }
+  delete (data as { background?: boolean }).background;
+  return data;
+}
+
+/** A new text clip at timeline time `start`. */
+export function createTextClip(
+  id: string,
+  start: number,
+  data: TextClipData,
+  length = TEXT_DEFAULT_LENGTH,
+): Clip {
+  return createClip({
+    id,
+    track: "text",
+    sourceUri: "",
+    sourceDuration: TEXT_SOURCE_LENGTH,
+    linkId: null,
+    start: Math.max(0, start),
+    trimIn: TEXT_SOURCE_ORIGIN,
+    trimOut: TEXT_SOURCE_ORIGIN + length,
+    data,
+  });
+}
+
+/** Whether `lane` has room for [start, end) among `clips` (except one). */
+export function laneIsFree(
+  clips: Clip[],
+  lane: number,
+  start: number,
+  end: number,
+  exceptId?: string,
+): boolean {
+  return !clips.some(
+    (c) =>
+      c.id !== exceptId &&
+      (c.lane ?? 0) === lane &&
+      start < clipEnd(c) - PLACE_EPSILON &&
+      end > c.start + PLACE_EPSILON,
+  );
+}
+
+/**
+ * The lane a clip goes into: `preferred` if it fits there, otherwise the
+ * first lane (from the top) where it fits — a new one below if none does.
+ */
+export function pickLane(clips: Clip[], clip: Clip, preferred: number): number {
+  const start = clip.start;
+  const end = clipEnd(clip);
+  if (laneIsFree(clips, preferred, start, end, clip.id)) return preferred;
+  const maxLane = clips.reduce((m, c) => Math.max(m, c.lane ?? 0), 0);
+  for (let lane = 0; lane <= maxLane + 1; lane++) {
+    if (laneIsFree(clips, lane, start, end, clip.id)) return lane;
+  }
+  return maxLane + 1;
+}
+
+/**
+ * Timeline rows for clips that may overlap (text): each clip's own `lane`,
+ * with empty lanes skipped (rows are packed top-down). Returns the row per
+ * clip id and how many rows there are (at least 1).
+ */
+export function textLanes(clips: Clip[]): {
+  laneOf: Record<string, number>;
+  count: number;
+} {
+  const used = [...new Set(clips.map((c) => c.lane ?? 0))].sort(
+    (a, b) => a - b,
+  );
+  const rowOfLane = new Map(used.map((lane, row) => [lane, row]));
+  const laneOf: Record<string, number> = {};
+  for (const clip of clips)
+    laneOf[clip.id] = rowOfLane.get(clip.lane ?? 0) ?? 0;
+  return { laneOf, count: Math.max(1, used.length) };
 }

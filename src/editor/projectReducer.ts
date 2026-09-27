@@ -25,11 +25,15 @@
 
 import {
   addClips,
+  allowsOverlap,
+  clipEnd,
   createClip,
+  createTextClip,
   findClip,
   findLinkedPartner,
   insertionPoint,
   newId,
+  pickLane,
   removeClips,
   replaceClip,
   resolveOverlaps,
@@ -39,6 +43,7 @@ import {
   type Clip,
   type ClipRange,
   type Project,
+  type TextClipData,
 } from "./clipModel";
 
 export type ProjectAction =
@@ -111,7 +116,41 @@ export type ProjectAction =
       /** A new clip (made by addAudioClipAction). See the note at the top. */
       type: "ADD_CLIP";
       clip: Clip;
+    }
+  | {
+      /**
+       * Replaces a clip's `data` (e.g. a text's words / colour / size).
+       * Same content → same state (no undo step).
+       */
+      type: "UPDATE_CLIP_DATA";
+      clipId: string;
+      data: unknown;
     };
+
+/** A new text at timeline time `at` (TEXT_DEFAULT_LENGTH long). */
+export function addTextClipAction(
+  data: TextClipData,
+  at: number,
+): ProjectAction {
+  return { type: "ADD_CLIP", clip: createTextClip(newId("text"), at, data) };
+}
+
+/**
+ * A copy of `clip` right after it (same length and settings, new id).
+ * Only for tracks that allow overlaps (text); elsewhere ADD_CLIP's
+ * insertion rules would apply.
+ */
+export function duplicateClipAction(clip: Clip): ProjectAction {
+  return {
+    type: "ADD_CLIP",
+    clip: {
+      ...clip,
+      id: newId(clip.track),
+      linkId: null,
+      start: clipEnd(clip),
+    },
+  };
+}
 
 /** What an added music clip keeps in `data`: its file name, for the label. */
 export type AudioClipData = { title: string };
@@ -218,6 +257,16 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
     case "MOVE_CLIP": {
       const clip = findClip(state, action.clipId);
       if (!clip) return state;
+      // Text may overlap other texts: it goes exactly where it was dropped
+      // and keeps its row — unless another text is in the way there, then
+      // it takes the first row with room (the others never move).
+      if (allowsOverlap(clip.track)) {
+        const start = Math.max(0, action.start);
+        if (Math.abs(start - clip.start) < 1e-6) return state;
+        const moved = { ...clip, start };
+        const lane = pickLane(state.tracks[clip.track], moved, clip.lane ?? 0);
+        return replaceClip(state, { ...moved, lane });
+      }
       const partner = findLinkedPartner(state, clip);
       const group = partner ? [clip, partner] : [clip];
       const groupIds = new Set(group.map((c) => c.id));
@@ -277,12 +326,28 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
     case "ADD_CLIP": {
       const clip = action.clip;
       if (findClip(state, clip.id)) return state;
+      // Text may overlap other texts: placed exactly where asked, in the
+      // first row (lane) with room at that time.
+      if (allowsOverlap(clip.track)) {
+        const placed = { ...clip, start: Math.max(0, clip.start) };
+        const lane = pickLane(state.tracks[clip.track], placed, clip.lane ?? 0);
+        return addClips(state, [{ ...placed, lane }]);
+      }
       const start = insertionPoint(
         state.tracks[clip.track],
         Math.max(0, clip.start),
       );
       const next = addClips(state, [{ ...clip, start }]);
       return resolveOverlaps(next, [clip.id]);
+    }
+
+    case "UPDATE_CLIP_DATA": {
+      const clip = findClip(state, action.clipId);
+      if (!clip) return state;
+      if (JSON.stringify(clip.data) === JSON.stringify(action.data)) {
+        return state;
+      }
+      return replaceClip(state, { ...clip, data: action.data });
     }
 
     case "DELETE_CLIP": {
