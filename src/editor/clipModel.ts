@@ -178,6 +178,48 @@ export function clipContains(clip: Clip, time: number): boolean {
   return time >= clip.start - TIME_EPSILON && time < clipEnd(clip);
 }
 
+// Two clips "continue" each other when the second picks up the same file
+// exactly where the first stops, right where it ends on the timeline (e.g.
+// the two halves of a split, untouched).
+const CONTINUE_EPSILON = 0.02;
+
+/**
+ * True when `next` plays on straight from `prev`: same file, same speed and
+ * volume, `next` starts in the source where `prev` stops and on the
+ * timeline where `prev` ends. One player can then simply keep playing
+ * across the cut — no hand-over to another player, nothing to seek.
+ */
+export function isContinuation(prev: Clip, next: Clip): boolean {
+  return (
+    prev.sourceUri === next.sourceUri &&
+    prev.speed === next.speed &&
+    prev.volume === next.volume &&
+    prev.reversed === next.reversed &&
+    Math.abs(prev.trimOut - next.trimIn) < CONTINUE_EPSILON &&
+    Math.abs(clipEnd(prev) - next.start) < CONTINUE_EPSILON
+  );
+}
+
+/**
+ * Share a track's clips (sorted by start) between its two players, 0 and 1.
+ * Normally they alternate, so the next clip's player is free to get ready
+ * during the current one. A clip that continues the previous one
+ * (isContinuation) stays on the same player instead: that player just
+ * plays on across the cut, which is seamless even when the JS thread is
+ * too busy to start another player on time.
+ */
+export function splitIntoPlayerSlots(clips: Clip[]): [Clip[], Clip[]] {
+  const slots: [Clip[], Clip[]] = [[], []];
+  let slot = 1;
+  let prev: Clip | null = null;
+  for (const clip of clips) {
+    slot = prev && isContinuation(prev, clip) ? slot : 1 - slot;
+    slots[slot].push(clip);
+    prev = clip;
+  }
+  return slots;
+}
+
 /**
  * The clip on this track under the playhead, or null in a gap. If clips
  * ever overlap, the one that starts latest wins (it sits "on top").
@@ -450,7 +492,7 @@ export function describeClip(clip: Clip): string {
     const t = textDataOf(clip);
     return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s "${t.text.replace(/\s+/g, " ").slice(0, 24)}" (${t.font}, ${t.color}, size ${t.size.toFixed(3)}, at ${t.x.toFixed(2)},${t.y.toFixed(2)})`;
   }
-  return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s (src ${clip.trimIn.toFixed(2)}–${clip.trimOut.toFixed(2)}s, x${clip.speed}${clip.volume !== 1 ? `, vol ${Math.round(clip.volume * 100)}%` : ""}, ${clip.linkId ? `locked ${clip.linkId}` : "unlocked"})`;
+  return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s (src ${clip.trimIn.toFixed(2)}–${clip.trimOut.toFixed(2)}s, x${clip.speed}${clip.volume !== 1 ? `, vol ${Math.round(clip.volume * 100)}%` : ""}${clip.opacity !== 1 ? `, opacity ${Math.round(clip.opacity * 100)}%` : ""}, ${clip.linkId ? `locked ${clip.linkId}` : "unlocked"})`;
 }
 
 // ---- Text clips -------------------------------------------------------------

@@ -44,8 +44,9 @@ const CONTINUOUS_EPSILON = 0.02;
 // usually a little ahead of the clock's last decoder report — up to ~0.2s.
 // Committing the older clock value made the timeline jump BACK a bit on
 // every pause (very visible when zoomed in). If the drawn playhead is ahead
-// by no more than this, the pause keeps the drawn position instead, and the
-// players are seeked there so the preview frame matches it.
+// by no more than this, the pause keeps the position where the picture
+// really stopped (read from the player) — or, if that can't be read, the
+// drawn position (players seeked there).
 const PAUSE_ALIGN_MAX_AHEAD = 0.4;
 // Drift correction for the OTHER playing tracks (not the one the playhead
 // follows). If one stays off by more than DRIFT_MAX for DRIFT_GRACE_MS, it
@@ -973,35 +974,67 @@ export function useTimelineClock({
       playingSV.value = false;
       rateSV.value = 0;
 
-      // Keep the playhead where the user saw it stop (see
-      // PAUSE_ALIGN_MAX_AHEAD) instead of snapping back to the last,
-      // slightly stale decoder report.
+      // Where did playback really stop? Pause the players under the
+      // playhead right now and read the picture's own position: that frame
+      // is what stays on screen, so the playhead goes there and nothing is
+      // seeked. (Before, the players were seeked to the drawn playhead —
+      // the picture jumped a little on every pause.) The drawn playhead is
+      // usually within a few hundredths of it, so the timeline barely moves.
       const clockTime = timeRef.current;
       const drawnTime = uiTimeSV.value;
-      const ahead = drawnTime - clockTime;
-      const alignToDrawn =
-        pausedMidway &&
-        ahead > 0.001 &&
-        ahead <= PAUSE_ALIGN_MAX_AHEAD &&
-        drawnTime < durationRef.current - END_EPSILON;
-      if (alignToDrawn) {
-        timeRef.current = drawnTime;
+      let stopMode: "player" | "drawn" | "clock" = "clock";
+      let leadLabel = "";
+      if (pausedMidway) {
+        const underPlayhead = tracksRef.current
+          .filter(
+            (o) =>
+              drawnTime >= o.clipStart - CLIP_EPSILON &&
+              drawnTime < o.clipEnd &&
+              !endPaused[o.label],
+          )
+          .sort((a, b) => a.priority - b.priority);
+        for (const o of underPlayhead) o.pause();
+        const lead = underPlayhead[0];
+        const playerTime = lead
+          ? decoderToTimeline(lead, lead.getCurrentTime())
+          : NaN;
+        if (
+          Number.isFinite(playerTime) &&
+          Math.abs(playerTime - drawnTime) <= PAUSE_ALIGN_MAX_AHEAD &&
+          playerTime < durationRef.current - END_EPSILON
+        ) {
+          timeRef.current = Math.max(0, playerTime);
+          stopMode = "player";
+          leadLabel = lead.label;
+        } else {
+          // No plausible player position: keep the drawn playhead (see
+          // PAUSE_ALIGN_MAX_AHEAD) and move the players there.
+          const ahead = drawnTime - clockTime;
+          if (
+            ahead > 0.001 &&
+            ahead <= PAUSE_ALIGN_MAX_AHEAD &&
+            drawnTime < durationRef.current - END_EPSILON
+          ) {
+            timeRef.current = drawnTime;
+            stopMode = "drawn";
+          }
+        }
       }
 
       targetSV.value = timeRef.current;
       // Commit the exact final position (the last few ticks may not have
       // been committed because of the reduced commit rate).
       setTimelineTime(timeRef.current);
-      // Players are paused at roughly the clock time — move them to the
-      // drawn position so the preview frame matches the playhead.
-      if (alignToDrawn) setSeekVersion((v) => v + 1);
+      if (stopMode === "drawn") setSeekVersion((v) => v + 1);
       if (__DEV__) {
         console.log(
-          alignToDrawn
-            ? `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s (kept drawn playhead; clock was ${clockTime.toFixed(2)}s, ${ahead.toFixed(2)}s behind)`
-            : halted
-              ? `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s (halted by gesture)`
-              : `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s`,
+          stopMode === "player"
+            ? `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s (where ${leadLabel}'s picture stopped; drawn playhead ${drawnTime.toFixed(2)}s, clock ${clockTime.toFixed(2)}s — no seek)`
+            : stopMode === "drawn"
+              ? `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s (kept drawn playhead; clock was ${clockTime.toFixed(2)}s)`
+              : halted
+                ? `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s (halted by gesture)`
+                : `[timelineClock] loop stop @ ${timeRef.current.toFixed(2)}s`,
         );
       }
     };

@@ -38,6 +38,7 @@ import TextOverlay, {
   type TextTransform,
 } from "../components/editor/TextOverlay";
 import {
+  activeClipAt,
   canSplitAt,
   clipContains,
   clipEnd,
@@ -47,6 +48,7 @@ import {
   findClip,
   findLinkedPartner,
   projectEnd,
+  splitIntoPlayerSlots,
   textDataOf,
   type Clip,
   type ClipRange,
@@ -215,11 +217,17 @@ export default function EditorScreen() {
   // thread at the exact cut (by the clock), so no React re-render sits
   // between the cut and the new picture.
   const visibleVideoSV = useSharedValue(0);
+  // Each video player's picture opacity = the Opacity setting of the clip
+  // it is showing (or about to show). Set ahead of the cut (see the
+  // effect near the clip settings), so the UI-thread switch shows the new
+  // clip at its own opacity straight away.
+  const opacityASV = useSharedValue(1);
+  const opacityBSV = useSharedValue(1);
   const videoAStyle = useAnimatedStyle(() => ({
-    opacity: visibleVideoSV.value === 0 ? 1 : 0,
+    opacity: visibleVideoSV.value === 0 ? opacityASV.value : 0,
   }));
   const videoBStyle = useAnimatedStyle(() => ({
-    opacity: visibleVideoSV.value === 1 ? 1 : 0,
+    opacity: visibleVideoSV.value === 1 ? opacityBSV.value : 0,
   }));
 
   // Note: there used to be two `useEvent(player, "timeUpdate")`
@@ -339,13 +347,19 @@ export default function EditorScreen() {
     ],
     [videoClips],
   );
-  const audioClipsBySlot = useMemo(
-    () => [
-      audioClips.filter((_, i) => i % 2 === 0),
-      audioClips.filter((_, i) => i % 2 === 1),
-    ],
-    [audioClips],
-  );
+  // Audio: a clip that simply continues the previous one (e.g. the two
+  // halves of a split) stays on the same player, which plays on across the
+  // cut — handing the sound to the other player there could start late
+  // (busy JS thread), heard as a short silence, a sped-up catch-up or a
+  // lag. See splitIntoPlayerSlots.
+  const audioClipsBySlot = useMemo(() => {
+    const slots = splitIntoPlayerSlots(audioClips);
+    if (__DEV__)
+      console.log(
+        `[editor] audio players — A: ${slots[0].map((c) => c.id).join(", ") || "-"} | B: ${slots[1].map((c) => c.id).join(", ") || "-"}`,
+      );
+    return slots;
+  }, [audioClips]);
 
   // Make a video player the one on screen.
   const showVideoSlot = (slot: number, why: string) => {
@@ -1109,22 +1123,42 @@ export default function EditorScreen() {
 
   const openClipSetting = (kind: ClipSettingKind) => {
     if (!selectedClip) return;
-    // Volume lives on the audio clip: for a locked pair, the audio half.
+    // Volume lives on the audio clip, Opacity on the video clip: for a
+    // locked pair, that half.
+    const halfOn = (track: "audio" | "video") =>
+      selectedClip.track === track
+        ? selectedClip
+        : selectedPartner?.track === track
+          ? selectedPartner
+          : null;
     const target =
       kind === "volume"
-        ? selectedClip.track === "audio"
-          ? selectedClip
-          : selectedPartner?.track === "audio"
-            ? selectedPartner
-            : null
-        : selectedClip;
+        ? halfOn("audio")
+        : kind === "opacity"
+          ? halfOn("video")
+          : selectedClip;
     if (!target) return;
     pauseForGesture(kind);
     if (__DEV__) console.log(`[editor] ${kind} sheet open for ${target.id}`);
+    // Opacity is judged by looking at the picture: bring the playhead into
+    // the clip if it's elsewhere, so the preview shows the change live.
+    if (kind === "opacity" && !clipContains(target, timelineTime)) {
+      const into = Math.min(clipEnd(target) - 0.05, target.start + 0.05);
+      if (__DEV__)
+        console.log(
+          `[editor] opacity — playhead ${timelineTime.toFixed(2)}s is outside ${target.id}, moved to ${into.toFixed(2)}s`,
+        );
+      seekTo(into);
+    }
     setClipSetting({
       kind,
       clipId: target.id,
-      value: kind === "speed" ? target.speed : target.volume,
+      value:
+        kind === "speed"
+          ? target.speed
+          : kind === "volume"
+            ? target.volume
+            : target.opacity,
     });
   };
 
@@ -1146,7 +1180,9 @@ export default function EditorScreen() {
     const next = commitProject(
       kind === "speed"
         ? { type: "SET_CLIP_SPEED", clipId, speed: value }
-        : { type: "SET_CLIP_VOLUME", clipId, volume: value },
+        : kind === "volume"
+          ? { type: "SET_CLIP_VOLUME", clipId, volume: value }
+          : { type: "SET_CLIP_OPACITY", clipId, opacity: value },
       `${kind} ${kind === "speed" ? `${value}×` : `${Math.round(value * 100)}%`}`,
     );
     if (next !== project) {
@@ -1172,9 +1208,47 @@ export default function EditorScreen() {
     ? findClip(project, clipSetting.clipId)
     : null;
 
+  // Picture opacity of each video player: the clip under the playhead on
+  // that player, or — in a gap — its next clip (the clock starts players
+  // early, before React knows the clip has begun). While the Opacity
+  // sheet is open, its draft value is shown live for that clip.
+  const opacityDraftId =
+    clipSetting?.kind === "opacity" ? clipSetting.clipId : null;
+  const opacityDraftValue =
+    clipSetting?.kind === "opacity" ? clipSetting.value : null;
+  useEffect(() => {
+    const svs = [opacityASV, opacityBSV];
+    for (const slot of [0, 1]) {
+      const clips = videoClipsBySlot[slot];
+      const clip =
+        activeClipAt(clips, timelineTime) ??
+        clips.find((c) => c.start > timelineTime) ??
+        null;
+      if (!clip) continue;
+      const opacity =
+        clip.id === opacityDraftId && opacityDraftValue !== null
+          ? opacityDraftValue
+          : clip.opacity;
+      if (Math.abs(svs[slot].get() - opacity) > 0.001) {
+        svs[slot].set(opacity);
+        if (__DEV__)
+          console.log(
+            `[editor] video player ${slot === 0 ? "A" : "B"} opacity → ${Math.round(opacity * 100)}% (${clip.id}${clip.id === opacityDraftId ? ", preview" : ""})`,
+          );
+      }
+    }
+  }, [
+    timelineTime,
+    videoClipsBySlot,
+    opacityDraftId,
+    opacityDraftValue,
+    opacityASV,
+    opacityBSV,
+  ]);
+
   // Tools that aren't built yet (and the ones routed from here).
   const handleComingSoonTool = (key: string) => {
-    if (key === "speed" || key === "volume") {
+    if (key === "speed" || key === "volume" || key === "opacity") {
       openClipSetting(key);
       return;
     }
@@ -1324,6 +1398,23 @@ export default function EditorScreen() {
                 })
               }
             >
+              {/* Black behind the picture (only where the picture is), so a
+                  clip with lowered Opacity fades to black — as it will in
+                  the exported video. */}
+              {frame && (
+                <View
+                  pointerEvents="none"
+                  style={[
+                    styles.pictureBackdrop,
+                    {
+                      left: frame.left,
+                      top: frame.top,
+                      width: frame.width,
+                      height: frame.height,
+                    },
+                  ]}
+                />
+              )}
               {/* Two stacked video views, one per video player; only the
                   active one is visible. TextureView (not the default
                   SurfaceView) so they can be layered and faded on Android. */}
@@ -1545,6 +1636,7 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
   video: { width: "100%", height: "100%" },
+  pictureBackdrop: { position: "absolute", backgroundColor: "#000000" },
   voidOverlay: {
     position: "absolute",
     top: 0,

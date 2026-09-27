@@ -102,12 +102,20 @@ const MOMENTUM_IDLE_END_MS = 300;
 const POST_SCRUB_FOLLOW_GUARD_MS = 400;
 
 // UI-thread playhead smoothing (see the frame callback in the component).
-// If the UI-thread time drifts further than this from the clock's time, it
-// jumps straight to it (a real jump, e.g. after a seek); below it, it eases
-// back gently so the movement stays smooth.
-const UI_SNAP_THRESHOLD = 0.3;
-// Fraction of the remaining error corrected per frame.
+// Real jumps (seek, play start) come as a snap from the clock; any other
+// difference is a correction, eased so the playhead never visibly jumps:
+//   - clock ahead by up to UI_SNAP_THRESHOLD: speed up to catch it (the
+//     picture started ~0.2–0.3s before the slow dev JS thread noticed —
+//     this used to be a visible jump forward at the start of playback);
+//   - clock behind: slow down / wait for it (never draw it moving back).
+// Only a difference beyond UI_SNAP_THRESHOLD jumps.
+const UI_SNAP_THRESHOLD = 1.0;
+// Fraction of the remaining error corrected per frame (small differences).
 const UI_CORRECTION = 0.08;
+// Behind the clock by more than this: catch up faster (fraction per frame,
+// ~0.25s to close the gap at 60fps).
+const UI_FAST_CATCH_UP_FROM = 0.15;
+const UI_FAST_CORRECTION = 0.15;
 
 export interface TrimRange {
   start: number;
@@ -316,6 +324,11 @@ function waveAmplitudeAtTime(t: number): number {
 // tick (currentTime changes), but the waveform only depends on zoom/width,
 // so it can skip all of those re-renders instead of rebuilding hundreds of
 // bar Views each time.
+// Waveform drawn beyond each end of an audio clip (see ClipWaveform): this
+// many pixels, at most WAVE_MARGIN source seconds.
+const WAVE_MARGIN = 15;
+const WAVE_MARGIN_PX = 500;
+
 // Label of an audio clip: music added from the phone shows its file name;
 // the video's own sound says "Original audio".
 function audioClipLabel(clip: Clip, originalUri: string): string {
@@ -335,10 +348,13 @@ const WaveformBars = memo(function WaveformBars({
   pixelsPerSecond,
   volume,
   flat = false,
+  startSeconds = 0,
 }: {
   color: string;
   contentWidth: number;
   pixelsPerSecond: number;
+  /** Source time of the first bar (the bars cover only part of the file). */
+  startSeconds?: number;
   /** Clip volume (0–2): louder = taller bars, 0 = flat line. */
   volume: number;
   /** Track muted: every bar the same thin line (silence). */
@@ -356,9 +372,12 @@ const WaveformBars = memo(function WaveformBars({
       Array.from({ length: count }, (_, i) =>
         flat
           ? MUTED_BAR_HEIGHT
-          : Math.min(1, waveAmplitudeAtTime(i * secondsPerBar) * volume),
+          : Math.min(
+              1,
+              waveAmplitudeAtTime(startSeconds + i * secondsPerBar) * volume,
+            ),
       ),
-    [count, secondsPerBar, volume, flat],
+    [count, secondsPerBar, volume, flat, startSeconds],
   );
 
   return (
@@ -430,9 +449,12 @@ function ClipThumbnails({
     ),
   }));
   if (thumbnails.length === 0) return null;
+  // Lowered Opacity shows on the timeline too: the thumbnails fade (never
+  // fully, so the clip stays recognisable).
+  const fade = 0.25 + 0.75 * clip.opacity;
   return (
     <Animated.View
-      style={[styles.thumbLayer, windowStyle]}
+      style={[styles.thumbLayer, windowStyle, { opacity: fade }]}
       pointerEvents="none"
     >
       {thumbnails.map((uri, i) => (
@@ -458,24 +480,37 @@ function ClipWaveform({
   color: string;
   muted?: boolean;
 }) {
-  const { sourceDuration, speed, volume } = clip;
-  const trimInSV = useSyncedValue(clip.trimIn);
-  const sourceDurationSV = useSyncedValue(sourceDuration);
+  const { sourceDuration, speed, volume, trimIn, trimOut } = clip;
+  // Bars sampled in SOURCE time, so a sped-up clip shows the same waveform
+  // squeezed rather than a different one.
+  const sourcePPS = committedPPS / speed;
+  // Only the clip's own part of the file (plus WAVE_MARGIN each side, for
+  // dragging a trim handle out) gets bars — not the whole song. A 2-minute
+  // song split in two used to draw ~1,300 bar views for a few seconds of
+  // timeline, and the UI thread dropped to ~35 fps while playing. The
+  // window starts on a whole bar, so the pattern doesn't shift after a trim.
+  const secondsPerBar = (WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP) / sourcePPS;
+  const margin = Math.min(WAVE_MARGIN, WAVE_MARGIN_PX / sourcePPS);
+  const from =
+    Math.floor(Math.max(0, trimIn - margin) / secondsPerBar) * secondsPerBar;
+  const to = Math.min(sourceDuration, trimOut + margin);
+  const trimInSV = useSyncedValue(trimIn);
+  const fromSV = useSyncedValue(from);
+  const toSV = useSyncedValue(to);
   const speedSV = useSyncedValue(speed);
   const committedPPSSV = useSyncedValue(committedPPS);
   const windowStyle = useAnimatedStyle(() => ({
-    left: (-trimInSV.value / speedSV.value) * pixelsPerSecondSV.value,
+    left:
+      ((fromSV.value - trimInSV.value) / speedSV.value) *
+      pixelsPerSecondSV.value,
     width: Math.max(
-      (sourceDurationSV.value / speedSV.value) * pixelsPerSecondSV.value,
+      ((toSV.value - fromSV.value) / speedSV.value) * pixelsPerSecondSV.value,
       2,
     ),
   }));
   const stretchStyle = useAnimatedStyle(() => ({
     transform: [{ scaleX: pixelsPerSecondSV.value / committedPPSSV.value }],
   }));
-  // Bars sampled in SOURCE time, so a sped-up clip shows the same waveform
-  // squeezed rather than a different one.
-  const sourcePPS = committedPPS / speed;
   return (
     <Animated.View
       style={[styles.waveformWindow, windowStyle]}
@@ -484,8 +519,9 @@ function ClipWaveform({
       <Animated.View style={[styles.waveformStretch, stretchStyle]}>
         <WaveformBars
           color={color}
-          contentWidth={Math.max(sourceDuration * sourcePPS, 2)}
+          contentWidth={Math.max((to - from) * sourcePPS, 2)}
           pixelsPerSecond={sourcePPS}
+          startSeconds={from}
           volume={volume}
           flat={muted}
         />
@@ -919,8 +955,11 @@ export default function EditorTimeline({
       const predicted = target + targetAgeSV.value * rate;
       const err = predicted - advanced;
       if (Math.abs(err) > UI_SNAP_THRESHOLD) {
-        // A real jump (seek, big correction): go straight there.
+        // A real jump (big correction): go straight there.
         t = predicted;
+      } else if (err > UI_FAST_CATCH_UP_FROM) {
+        // Clearly behind the clock: catch up quickly, but smoothly.
+        t = advanced + err * UI_FAST_CORRECTION;
       } else {
         // Ease toward the clock, but never draw the playhead moving
         // backwards while playing. The drawn playhead runs slightly ahead

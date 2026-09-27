@@ -142,6 +142,13 @@ export type ProjectAction =
       type: "SET_CLIP_VOLUME";
       clipId: string;
       volume: number;
+    }
+  | {
+      // Opacity of a video clip's picture (0 = invisible, 1 = solid).
+      // Only this clip — a locked audio partner has no picture.
+      type: "SET_CLIP_OPACITY";
+      clipId: string;
+      opacity: number;
     };
 
 export const MIN_SPEED = 0.1;
@@ -389,6 +396,15 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
         100;
       if (Math.abs(volume - clip.volume) < 1e-6) return state;
       return replaceClip(state, { ...clip, volume });
+    }
+
+    case "SET_CLIP_OPACITY": {
+      const clip = findClip(state, action.clipId);
+      if (!clip || clip.track !== "video") return state;
+      const opacity =
+        Math.round(Math.max(0, Math.min(1, action.opacity)) * 100) / 100;
+      if (Math.abs(opacity - clip.opacity) < 1e-6) return state;
+      return replaceClip(state, { ...clip, opacity });
     }
 
     case "UPDATE_CLIP_DATA": {

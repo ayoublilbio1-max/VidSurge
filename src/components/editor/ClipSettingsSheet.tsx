@@ -6,7 +6,7 @@ import { useTheme } from "../../hooks/useTheme";
 import AppText from "../AppText";
 import SliderBar from "./SliderBar";
 
-export type ClipSettingKind = "speed" | "volume";
+export type ClipSettingKind = "speed" | "volume" | "opacity";
 
 // Speed has two separate sliders (two tabs): "Speed" 1×–10× and "Slow
 // motion" 0.1×–1×. Both are logarithmic (each step feels the same), and
@@ -40,9 +40,28 @@ const fromSlider = (f: number, min: number, max: number, presets: number[]) => {
 };
 
 const VOLUME_PRESETS = [0, 0.5, 1, 1.5, 2];
+const OPACITY_PRESETS = [0, 0.25, 0.5, 0.75, 1];
+
+// Volume and Opacity: a plain linear 0…max slider shown in percent.
+const PERCENT_SETTINGS = {
+  volume: { title: "Volume", max: MAX_VOLUME, presets: VOLUME_PRESETS },
+  opacity: { title: "Opacity", max: 1, presets: OPACITY_PRESETS },
+} as const;
+
+function noteFor(kind: ClipSettingKind, value: number, sourceLength: number) {
+  if (kind === "speed")
+    return `Duration ${sourceLength.toFixed(1)}s → ${(sourceLength / value).toFixed(1)}s`;
+  if (kind === "volume")
+    return value > 1
+      ? "Above 100%: the boost is heard in the exported video"
+      : value === 0
+        ? "Muted"
+        : " ";
+  return value === 0 ? "Invisible — the black background shows" : " ";
+}
 
 /**
- * Bottom sheet for one clip setting (Speed or Volume): a big value, a
+ * Bottom sheet for one clip setting (Speed, Volume or Opacity): a big value, a
  * slider, quick presets, ✓ to apply and ✕ to cancel. The value is a draft
  * until ✓ — one undo step per change.
  */
@@ -67,7 +86,9 @@ export default function ClipSettingsSheet({
   // Which speed slider shows: slow motion if the clip is already slowed.
   const [tab, setTab] = useState<SpeedTab>(value < 1 ? "slow" : "fast");
   const range = SPEED_RANGES[tab];
-  const presets = isSpeed ? range.presets : VOLUME_PRESETS;
+  const percent = kind === "speed" ? null : PERCENT_SETTINGS[kind];
+  const presets: readonly number[] = percent ? percent.presets : range.presets;
+  const maxValue = percent ? percent.max : range.max;
   const label = isSpeed ? `${value}×` : `${Math.round(value * 100)}%`;
 
   return (
@@ -81,7 +102,7 @@ export default function ClipSettingsSheet({
           <Ionicons name="close" size={26} color={colors.textPrimary} />
         </TouchableOpacity>
         <AppText style={[styles.title, { color: colors.textPrimary }]}>
-          {isSpeed ? "Speed" : "Volume"}
+          {percent ? percent.title : "Speed"}
         </AppText>
         <TouchableOpacity
           onPress={onDone}
@@ -135,13 +156,7 @@ export default function ClipSettingsSheet({
         {label}
       </AppText>
       <AppText style={[styles.note, { color: colors.textMuted }]}>
-        {isSpeed
-          ? `Duration ${sourceLength.toFixed(1)}s → ${(sourceLength / value).toFixed(1)}s`
-          : value > 1
-            ? "Above 100%: the boost is heard in the exported video"
-            : value === 0
-              ? "Muted"
-              : " "}
+        {noteFor(kind, value, sourceLength)}
       </AppText>
 
       <View style={styles.sliderRow}>
@@ -150,21 +165,21 @@ export default function ClipSettingsSheet({
         </AppText>
         <SliderBar
           value={
-            isSpeed ? toSlider(value, range.min, range.max) : value / MAX_VOLUME
+            isSpeed ? toSlider(value, range.min, range.max) : value / maxValue
           }
           onChange={(f) =>
             onChange(
               isSpeed
                 ? fromSlider(f, range.min, range.max, range.presets)
-                : Math.round(f * MAX_VOLUME * 100) / 100,
+                : Math.round(f * maxValue * 100) / 100,
             )
           }
           trackColor={colors.surface}
           fillColor={colors.accentPurple}
-          accessibilityLabel={isSpeed ? range.label : "Volume"}
+          accessibilityLabel={percent ? percent.title : range.label}
         />
         <AppText style={[styles.edge, { color: colors.textMuted }]}>
-          {isSpeed ? `${range.max}×` : "200%"}
+          {isSpeed ? `${range.max}×` : `${Math.round(maxValue * 100)}%`}
         </AppText>
       </View>
 
