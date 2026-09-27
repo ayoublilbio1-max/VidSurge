@@ -21,6 +21,9 @@ import Animated, {
 } from "react-native-reanimated";
 import ComingSoonModal from "../components/ComingSoonModal";
 import EditorScreenSkeleton from "../components/EditorScreenSkeleton";
+import ClipSettingsSheet, {
+  type ClipSettingKind,
+} from "../components/editor/ClipSettingsSheet";
 import EditorTimeline from "../components/editor/EditorTimeline";
 import EditorToolbar, {
   type LockMode,
@@ -80,6 +83,9 @@ function summarizeProject(project: Project): string {
   });
   return `end ${projectEnd(project).toFixed(2)}s\n${lines.join("\n")}`;
 }
+
+// How long the mute button shows its spinner before the mute applies.
+const MUTE_SPINNER_MS = 250;
 
 export default function EditorScreen() {
   const colors = useTheme();
@@ -361,6 +367,28 @@ export default function EditorScreen() {
       );
   };
 
+  // Timeline mute button: silences the whole audio track (both audio
+  // players) without touching any clip's volume. Not an undo step.
+  // The button shows a spinner first (same idea as Split/Delete): the
+  // spinner is drawn right away, then the mute is applied — the editor's
+  // re-render takes a moment in the dev build, so the tap never looks
+  // ignored.
+  const [audioMuted, setAudioMuted] = useState(false);
+  const [muteBusy, setMuteBusy] = useState(false);
+  const toggleAudioMuted = () => {
+    if (muteBusy) return;
+    setMuteBusy(true);
+    if (__DEV__) console.log("[editor] mute pressed — spinner");
+    setTimeout(() => {
+      setAudioMuted((m) => {
+        if (__DEV__)
+          console.log(`[editor] audio track ${m ? "unmuted" : "muted"}`);
+        return !m;
+      });
+      setMuteBusy(false);
+    }, MUTE_SPINNER_MS);
+  };
+
   // ---- Shared clock + per-player sync -----------------------------------
   // One clock entry per clip, reading the player that clip plays on.
   const clockEntries = (
@@ -452,6 +480,7 @@ export default function EditorScreen() {
     timelineTime,
     seekVersion,
     clips: audioClipsBySlot[0],
+    trackMuted: audioMuted,
     initialUri: videoUri ?? "",
     holdSeeks: isScrubbing,
     onEnterClip: () => hearAudioSlot(0, "playhead entered its clip"),
@@ -463,6 +492,7 @@ export default function EditorScreen() {
     timelineTime,
     seekVersion,
     clips: audioClipsBySlot[1],
+    trackMuted: audioMuted,
     initialUri: videoUri ?? "",
     holdSeeks: isScrubbing,
     onEnterClip: () => hearAudioSlot(1, "playhead entered its clip"),
@@ -785,7 +815,9 @@ export default function EditorScreen() {
     }
     const at = isPlaying ? playhead.uiTimeSV.get() : timelineTime;
     pauseForGesture(direction);
-    setSelectedClipId(null);
+    // (Only when something is selected: an extra re-render of the whole
+    // editor per tap made fast undo / redo feel slower.)
+    if (selectedClipId !== null) setSelectedClipId(null);
     const historyAction = {
       type: direction === "undo" ? "UNDO" : "REDO",
     } as const;
@@ -1067,8 +1099,85 @@ export default function EditorScreen() {
     }
   }
 
+  // ---- Clip settings: Speed / Volume (step 7) --------------------------
+  // The open settings sheet: which setting, which clip, the draft value.
+  const [clipSetting, setClipSetting] = useState<{
+    kind: ClipSettingKind;
+    clipId: string;
+    value: number;
+  } | null>(null);
+
+  const openClipSetting = (kind: ClipSettingKind) => {
+    if (!selectedClip) return;
+    // Volume lives on the audio clip: for a locked pair, the audio half.
+    const target =
+      kind === "volume"
+        ? selectedClip.track === "audio"
+          ? selectedClip
+          : selectedPartner?.track === "audio"
+            ? selectedPartner
+            : null
+        : selectedClip;
+    if (!target) return;
+    pauseForGesture(kind);
+    if (__DEV__) console.log(`[editor] ${kind} sheet open for ${target.id}`);
+    setClipSetting({
+      kind,
+      clipId: target.id,
+      value: kind === "speed" ? target.speed : target.volume,
+    });
+  };
+
+  const closeClipSetting = (why: string) => {
+    if (__DEV__)
+      console.log(
+        `[editor] ${clipSetting?.kind ?? "setting"} sheet closed (${why})`,
+      );
+    setClipSetting(null);
+  };
+
+  const applyClipSetting = () => {
+    if (!clipSetting) return;
+    const { kind, clipId, value } = clipSetting;
+    const partner = (() => {
+      const c = findClip(project, clipId);
+      return c ? findLinkedPartner(project, c) : null;
+    })();
+    const next = commitProject(
+      kind === "speed"
+        ? { type: "SET_CLIP_SPEED", clipId, speed: value }
+        : { type: "SET_CLIP_VOLUME", clipId, volume: value },
+      `${kind} ${kind === "speed" ? `${value}×` : `${Math.round(value * 100)}%`}`,
+    );
+    if (next !== project) {
+      flashClips(kind === "speed" && partner ? [clipId, partner.id] : [clipId]);
+      const end = projectEnd(next);
+      if (timelineTime > end) seekTo(end);
+    }
+    closeClipSetting("applied");
+  };
+
+  // Android back closes the settings sheet without applying.
+  useEffect(() => {
+    if (!clipSetting) return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      closeClipSetting("back button");
+      return true;
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clipSetting !== null]);
+
+  const settingClip = clipSetting
+    ? findClip(project, clipSetting.clipId)
+    : null;
+
   // Tools that aren't built yet (and the ones routed from here).
   const handleComingSoonTool = (key: string) => {
+    if (key === "speed" || key === "volume") {
+      openClipSetting(key);
+      return;
+    }
     if (key === "music") {
       void handleAddAudio("Music tool");
       return;
@@ -1365,7 +1474,9 @@ export default function EditorScreen() {
               audioClips={audioClips}
               textClips={textClips}
               selectedClipId={selectedClip?.id ?? null}
-              onMutePress={() => setComingSoonVisible(true)}
+              onMutePress={toggleAudioMuted}
+              audioMuted={audioMuted}
+              muteBusy={muteBusy}
               onSelectClip={handleSelectClip}
               onAddTextPress={() => openAddText("empty text row")}
               onAddAudioPress={() => void handleAddAudio("empty audio row")}
@@ -1395,6 +1506,17 @@ export default function EditorScreen() {
           onPatch={patchDraft}
           onDone={handleTextDone}
           onHeight={setSheetHeight}
+        />
+      )}
+
+      {clipSetting && settingClip && (
+        <ClipSettingsSheet
+          kind={clipSetting.kind}
+          value={clipSetting.value}
+          sourceLength={settingClip.trimOut - settingClip.trimIn}
+          onChange={(value) => setClipSetting((c) => (c ? { ...c, value } : c))}
+          onCancel={() => closeClipSetting("cancelled")}
+          onDone={applyClipSetting}
         />
       )}
 

@@ -450,7 +450,7 @@ export function describeClip(clip: Clip): string {
     const t = textDataOf(clip);
     return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s "${t.text.replace(/\s+/g, " ").slice(0, 24)}" (${t.font}, ${t.color}, size ${t.size.toFixed(3)}, at ${t.x.toFixed(2)},${t.y.toFixed(2)})`;
   }
-  return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s (src ${clip.trimIn.toFixed(2)}–${clip.trimOut.toFixed(2)}s, x${clip.speed}, ${clip.linkId ? `locked ${clip.linkId}` : "unlocked"})`;
+  return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s (src ${clip.trimIn.toFixed(2)}–${clip.trimOut.toFixed(2)}s, x${clip.speed}${clip.volume !== 1 ? `, vol ${Math.round(clip.volume * 100)}%` : ""}, ${clip.linkId ? `locked ${clip.linkId}` : "unlocked"})`;
 }
 
 // ---- Text clips -------------------------------------------------------------

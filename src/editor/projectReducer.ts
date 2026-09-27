@@ -125,7 +125,28 @@ export type ProjectAction =
       type: "UPDATE_CLIP_DATA";
       clipId: string;
       data: unknown;
+    }
+  | {
+      /**
+       * Speed (0.1×–10×) of a clip — and its locked partner. The clip gets
+       * shorter / longer on the timeline (same part of the source, played
+       * faster / slower). Longer: later clips are pushed right if needed;
+       * shorter: the space after it stays (free-form timeline).
+       */
+      type: "SET_CLIP_SPEED";
+      clipId: string;
+      speed: number;
+    }
+  | {
+      /** Volume of an audio clip, 0–2 (0–200%). */
+      type: "SET_CLIP_VOLUME";
+      clipId: string;
+      volume: number;
     };
+
+export const MIN_SPEED = 0.1;
+export const MAX_SPEED = 10;
+export const MAX_VOLUME = 2;
 
 /** A new text at timeline time `at` (TEXT_DEFAULT_LENGTH long). */
 export function addTextClipAction(
@@ -339,6 +360,35 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
       );
       const next = addClips(state, [{ ...clip, start }]);
       return resolveOverlaps(next, [clip.id]);
+    }
+
+    case "SET_CLIP_SPEED": {
+      const clip = findClip(state, action.clipId);
+      if (!clip) return state;
+      const speed =
+        Math.round(
+          Math.max(MIN_SPEED, Math.min(MAX_SPEED, action.speed)) * 100,
+        ) / 100;
+      if (Math.abs(speed - clip.speed) < 1e-6) return state;
+      const partner = findLinkedPartner(state, clip);
+      const group = partner ? [clip, partner] : [clip];
+      let next = state;
+      for (const c of group) next = replaceClip(next, { ...c, speed });
+      if (allowsOverlap(clip.track)) return next;
+      return resolveOverlaps(
+        next,
+        group.map((c) => c.id),
+      );
+    }
+
+    case "SET_CLIP_VOLUME": {
+      const clip = findClip(state, action.clipId);
+      if (!clip) return state;
+      const volume =
+        Math.round(Math.max(0, Math.min(MAX_VOLUME, action.volume)) * 100) /
+        100;
+      if (Math.abs(volume - clip.volume) < 1e-6) return state;
+      return replaceClip(state, { ...clip, volume });
     }
 
     case "UPDATE_CLIP_DATA": {

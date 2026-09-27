@@ -35,7 +35,10 @@ import {
 import { useTheme } from "../../hooks/useTheme";
 import type { PlayheadSync } from "../../hooks/useTimelineClock";
 import AppText from "../AppText";
-import TimelineClipBox, { type ClipDragState } from "./TimelineClipBox";
+import TimelineClipBox, {
+  useSyncedValue,
+  type ClipDragState,
+} from "./TimelineClipBox";
 
 const MIN_PIXELS_PER_SECOND = 20;
 const MAX_PIXELS_PER_SECOND = 200;
@@ -142,6 +145,10 @@ interface EditorTimelineProps {
   textClips: Clip[];
   selectedClipId: string | null;
   onMutePress: () => void;
+  /** The audio track is muted (the mute button shows it). */
+  audioMuted: boolean;
+  /** The mute toggle is being applied — spinner on the button. */
+  muteBusy?: boolean;
   onSelectClip: (clipId: string) => void;
   onAddTextPress: () => void;
   /** The empty audio row was tapped: add music from the phone. */
@@ -319,14 +326,23 @@ function audioClipLabel(clip: Clip, originalUri: string): string {
   return "Original audio";
 }
 
+// Bar height (fraction of the row) of a muted track's flat waveform.
+const MUTED_BAR_HEIGHT = 0.06;
+
 const WaveformBars = memo(function WaveformBars({
   color,
   contentWidth,
   pixelsPerSecond,
+  volume,
+  flat = false,
 }: {
   color: string;
   contentWidth: number;
   pixelsPerSecond: number;
+  /** Clip volume (0–2): louder = taller bars, 0 = flat line. */
+  volume: number;
+  /** Track muted: every bar the same thin line (silence). */
+  flat?: boolean;
 }) {
   const pitch = WAVEFORM_BAR_WIDTH + WAVEFORM_BAR_GAP;
   const count = Math.max(
@@ -338,9 +354,11 @@ const WaveformBars = memo(function WaveformBars({
   const heights = useMemo(
     () =>
       Array.from({ length: count }, (_, i) =>
-        waveAmplitudeAtTime(i * secondsPerBar),
+        flat
+          ? MUTED_BAR_HEIGHT
+          : Math.min(1, waveAmplitudeAtTime(i * secondsPerBar) * volume),
       ),
-    [count, secondsPerBar],
+    [count, secondsPerBar, volume, flat],
   );
 
   return (
@@ -399,10 +417,17 @@ function ClipThumbnails({
   pixelsPerSecondSV: SharedValue<number>;
   placeholderColor: string;
 }) {
-  const { trimIn, sourceDuration, speed } = clip;
+  // Shared values, not closure constants (see useSyncedValue): undo/redo
+  // changes these on the same clip id and the window must follow.
+  const trimInSV = useSyncedValue(clip.trimIn);
+  const sourceDurationSV = useSyncedValue(clip.sourceDuration);
+  const speedSV = useSyncedValue(clip.speed);
   const windowStyle = useAnimatedStyle(() => ({
-    left: (-trimIn / speed) * pixelsPerSecondSV.value,
-    width: Math.max((sourceDuration / speed) * pixelsPerSecondSV.value, 2),
+    left: (-trimInSV.value / speedSV.value) * pixelsPerSecondSV.value,
+    width: Math.max(
+      (sourceDurationSV.value / speedSV.value) * pixelsPerSecondSV.value,
+      2,
+    ),
   }));
   if (thumbnails.length === 0) return null;
   return (
@@ -425,19 +450,28 @@ function ClipWaveform({
   pixelsPerSecondSV,
   committedPPS,
   color,
+  muted = false,
 }: {
   clip: Clip;
   pixelsPerSecondSV: SharedValue<number>;
   committedPPS: number;
   color: string;
+  muted?: boolean;
 }) {
-  const { trimIn, sourceDuration, speed } = clip;
+  const { sourceDuration, speed, volume } = clip;
+  const trimInSV = useSyncedValue(clip.trimIn);
+  const sourceDurationSV = useSyncedValue(sourceDuration);
+  const speedSV = useSyncedValue(speed);
+  const committedPPSSV = useSyncedValue(committedPPS);
   const windowStyle = useAnimatedStyle(() => ({
-    left: (-trimIn / speed) * pixelsPerSecondSV.value,
-    width: Math.max((sourceDuration / speed) * pixelsPerSecondSV.value, 2),
+    left: (-trimInSV.value / speedSV.value) * pixelsPerSecondSV.value,
+    width: Math.max(
+      (sourceDurationSV.value / speedSV.value) * pixelsPerSecondSV.value,
+      2,
+    ),
   }));
   const stretchStyle = useAnimatedStyle(() => ({
-    transform: [{ scaleX: pixelsPerSecondSV.value / committedPPS }],
+    transform: [{ scaleX: pixelsPerSecondSV.value / committedPPSSV.value }],
   }));
   // Bars sampled in SOURCE time, so a sped-up clip shows the same waveform
   // squeezed rather than a different one.
@@ -452,6 +486,8 @@ function ClipWaveform({
           color={color}
           contentWidth={Math.max(sourceDuration * sourcePPS, 2)}
           pixelsPerSecond={sourcePPS}
+          volume={volume}
+          flat={muted}
         />
       </Animated.View>
     </Animated.View>
@@ -470,6 +506,8 @@ export default function EditorTimeline({
   textClips,
   selectedClipId,
   onMutePress,
+  audioMuted,
+  muteBusy = false,
   onSelectClip,
   onAddTextPress,
   onAddAudioPress,
@@ -1983,6 +2021,7 @@ export default function EditorTimeline({
                         <TouchableOpacity
                           style={[styles.muteButton, { height: TRACK_HEIGHT }]}
                           onPress={onMutePress}
+                          disabled={muteBusy}
                         >
                           <View
                             style={[
@@ -1990,11 +2029,26 @@ export default function EditorTimeline({
                               { backgroundColor: colors.surface },
                             ]}
                           >
-                            <Ionicons
-                              name="volume-mute-outline"
-                              size={18}
-                              color={colors.textPrimary}
-                            />
+                            {muteBusy ? (
+                              <ActivityIndicator
+                                size="small"
+                                color={colors.accentPurple}
+                              />
+                            ) : (
+                              <Ionicons
+                                name={
+                                  audioMuted
+                                    ? "volume-mute"
+                                    : "volume-high-outline"
+                                }
+                                size={18}
+                                color={
+                                  audioMuted
+                                    ? colors.accentPurple
+                                    : colors.textPrimary
+                                }
+                              />
+                            )}
                           </View>
                         </TouchableOpacity>
                       </View>
@@ -2105,6 +2159,7 @@ export default function EditorTimeline({
                                 inactiveBorderColor={colors.iconInactive}
                                 labelIcon="musical-notes-outline"
                                 labelText={audioClipLabel(clip, originalUri)}
+                                muted={audioMuted}
                                 onPress={() => onSelectClip(clip.id)}
                                 moveGesture={moveGestures[clip.id]}
                                 flashToken={
@@ -2117,6 +2172,7 @@ export default function EditorTimeline({
                                   pixelsPerSecondSV={pixelsPerSecondSV}
                                   committedPPS={committedPPS}
                                   color={colors.iconInactive}
+                                  muted={audioMuted}
                                 />
                               </TimelineClipBox>
                             ))}

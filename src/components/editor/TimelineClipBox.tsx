@@ -74,7 +74,32 @@ interface TimelineClipBoxProps {
    */
   flashToken?: number;
   flashColor?: string;
+  /**
+   * The whole track is muted (audio row's mute button): the box is drawn
+   * greyed out — dashed border, faded content, a mute icon on the label.
+   */
+  muted?: boolean;
   children?: ReactNode;
+}
+
+// Muted look: a soft grey, not black — the clip stays easy to see.
+const MUTED_BACKGROUND = "#3A3A42";
+const MUTED_BORDER = "#7A7A86";
+const MUTED_CONTENT_OPACITY = 0.5;
+const MUTED_TEXT = "#D0D0D8";
+
+/**
+ * A prop mirrored to the UI thread as a shared value. Animated styles read
+ * the shared value instead of capturing the prop in their closure: with the
+ * React Compiler a captured number could stay stale (redo "split" drew the
+ * left half at its old full length), a shared value can't.
+ */
+export function useSyncedValue(value: number): SharedValue<number> {
+  const sv = useSharedValue(value);
+  useEffect(() => {
+    sv.set(value);
+  }, [value, sv]);
+  return sv;
 }
 
 export default function TimelineClipBox({
@@ -94,8 +119,16 @@ export default function TimelineClipBox({
   moveGesture,
   flashToken = 0,
   flashColor = "#FFFFFF",
+  muted = false,
   children,
 }: TimelineClipBoxProps) {
+  const lengthSV = useSyncedValue(lengthSeconds);
+  useEffect(() => {
+    if (__DEV__)
+      console.log(
+        `[TimelineClipBox] ${clipId} length → ${lengthSeconds.toFixed(2)}s`,
+      );
+  }, [clipId, lengthSeconds]);
   const flashSV = useSharedValue(0);
   useEffect(() => {
     if (flashToken <= 0) return;
@@ -128,7 +161,7 @@ export default function TimelineClipBox({
         : startSV.value;
     return {
       left: t * pixelsPerSecondSV.value,
-      width: Math.max(lengthSeconds * pixelsPerSecondSV.value, 2),
+      width: Math.max(lengthSV.value * pixelsPerSecondSV.value, 2),
     };
   });
 
@@ -154,12 +187,25 @@ export default function TimelineClipBox({
         holdStyle,
         {
           height,
-          backgroundColor,
-          borderColor: selected ? selectedBorderColor : inactiveBorderColor,
+          backgroundColor: muted ? MUTED_BACKGROUND : backgroundColor,
+          borderColor: selected
+            ? selectedBorderColor
+            : muted
+              ? MUTED_BORDER
+              : inactiveBorderColor,
+          borderStyle: muted ? "dashed" : "solid",
         },
       ]}
     >
-      {children}
+      <View
+        pointerEvents="none"
+        style={[
+          StyleSheet.absoluteFill,
+          muted && { opacity: MUTED_CONTENT_OPACITY },
+        ]}
+      >
+        {children}
+      </View>
 
       <Animated.View
         pointerEvents="none"
@@ -175,10 +221,17 @@ export default function TimelineClipBox({
         style={styles.touchable}
         onPress={onPress}
       >
-        <View style={styles.labelChip}>
-          <Ionicons name={labelIcon} size={14} color="#FFFFFF" />
-          <AppText style={styles.labelText} numberOfLines={1}>
-            {labelText}
+        <View style={[styles.labelChip, muted && styles.labelChipMuted]}>
+          <Ionicons
+            name={muted ? "volume-mute" : labelIcon}
+            size={14}
+            color={muted ? MUTED_TEXT : "#FFFFFF"}
+          />
+          <AppText
+            style={[styles.labelText, muted && styles.labelTextMuted]}
+            numberOfLines={1}
+          >
+            {muted ? `${labelText} · Muted` : labelText}
           </AppText>
         </View>
       </TouchableOpacity>
@@ -222,4 +275,6 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     flexShrink: 1,
   },
+  labelChipMuted: { backgroundColor: "rgba(0,0,0,0.35)" },
+  labelTextMuted: { color: MUTED_TEXT },
 });

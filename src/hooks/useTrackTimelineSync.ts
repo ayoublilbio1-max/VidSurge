@@ -51,6 +51,11 @@ type UseTrackTimelineSyncParams = {
    */
   initialUri: string;
   /**
+   * The whole track is muted (the timeline's mute button): the player is
+   * silent, but the clips keep their own volume setting.
+   */
+  trackMuted?: boolean;
+  /**
    * While true, this track does NOT seek its player — it only remembers
    * that a seek is owed, and does it (once, to the exact position) as soon
    * as this goes back to false. Used for the audio track while the user
@@ -98,6 +103,7 @@ export function useTrackTimelineSync({
   seekVersion,
   clips,
   initialUri,
+  trackMuted = false,
   holdSeeks = false,
   onEnterClip,
 }: UseTrackTimelineSyncParams) {
@@ -143,6 +149,26 @@ export function useTrackTimelineSync({
     };
 
     const active = activeClipAt(clips, timelineTime);
+
+    // Volume first, for the clip under the playhead OR — in a gap — the
+    // next clip. The clock can start this player a little before its clip
+    // begins (early start, useTimelineClock); the volume used to be set
+    // only on entering the clip, so a muted track played ~0.3s of sound
+    // at every such clip start. Above 100% is only possible in the export
+    // (a player can't go louder than its source).
+    const volumeClip = active ?? clips.find((c) => c.start > timelineTime);
+    const volume = trackMuted
+      ? 0
+      : volumeClip
+        ? Math.max(0, Math.min(1, volumeClip.volume))
+        : player.volume;
+    if (Math.abs(player.volume - volume) > 0.001) {
+      player.volume = volume;
+      if (__DEV__)
+        console.log(
+          `[trackSync:${label}] volume → ${Math.round(volume * 100)}%${trackMuted ? " (track muted)" : volumeClip ? ` (${volumeClip.id})` : ""}`,
+        );
+    }
 
     if (!active) {
       if (activeIdRef.current !== null) {
@@ -347,10 +373,31 @@ export function useTrackTimelineSync({
     }
 
     if (!playingRef.current) {
+      // Some players forget the rate after a file switch or a seek while
+      // paused (slow-motion music played at normal speed): set it again
+      // right before playing.
+      if (Math.abs(player.playbackRate - active.speed) > 0.001) {
+        if (__DEV__)
+          console.log(
+            `[trackSync:${label}] rate was x${player.playbackRate}, should be x${active.speed} — set again`,
+          );
+        player.playbackRate = active.speed;
+      }
       player.play();
       playingRef.current = true;
       if (__DEV__)
-        console.log(`[trackSync:${label}] play @ ${timelineTime.toFixed(2)}s`);
+        console.log(
+          `[trackSync:${label}] play @ ${timelineTime.toFixed(2)}s (x${active.speed})`,
+        );
     }
-  }, [timelineTime, seekVersion, isPlaying, clips, player, label, holdSeeks]);
+  }, [
+    timelineTime,
+    seekVersion,
+    isPlaying,
+    clips,
+    player,
+    label,
+    holdSeeks,
+    trackMuted,
+  ]);
 }
