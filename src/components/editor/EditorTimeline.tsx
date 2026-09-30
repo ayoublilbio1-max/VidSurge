@@ -60,6 +60,11 @@ const PIP_CLIP_COLOR = "#3E2A6B";
 const PIP_CLIP_BORDER = "#6B4FB0";
 const STICKER_CLIP_BORDER = "#2F8FA3";
 const TRACK_GAP = 4;
+// A video file whose thumbnails aren't made yet.
+const NO_THUMBNAILS: (string | null)[] = [];
+// The "+" (add a video at 0s) and mute buttons, stacked in the space left of
+// the ruler + video row.
+const SIDE_BUTTON = 32;
 const LEADING_WIDTH = 60;
 const RULER_HEIGHT = 16;
 
@@ -157,6 +162,24 @@ interface EditorTimelineProps {
   // Full length of the project on the timeline (ruler, scroll range).
   timelineDuration: number;
   thumbnails: (string | null)[];
+  /**
+   * Thumbnails of the OTHER video files (videos added later, e.g. with the
+   * "+" button), by file. `thumbnails` is the original video's.
+   */
+  thumbnailsBySource?: Record<string, (string | null)[]>;
+  /**
+   * Multi-select mode (the ☑ button under mute): taps pick / unpick clips
+   * (`multiSelectedIds`), and dragging a picked clip moves them all.
+   */
+  multiSelect?: boolean;
+  multiSelectedIds?: string[];
+  onToggleMultiSelect?: () => void;
+  /** A multi-select drag was dropped: move these clips by `delta` seconds. */
+  onMoveClips?: (clipIds: string[], delta: number) => boolean;
+  /** The "+" above the mute button: add a video from the phone at 0s. */
+  onAddVideoAtStartPress?: () => void;
+  /** A picked video is being read: the "+" shows a spinner. */
+  addingVideo?: boolean;
   // The clips on each track row, sorted by start (from the project).
   videoClips: Clip[];
   audioClips: Clip[];
@@ -452,8 +475,8 @@ const ThumbnailTile = memo(function ThumbnailTile({
 // Widths follow the live zoom on the UI thread (keeps up with a pinch
 // frame by frame) and are divided by the clip's speed.
 //
-// NOTE: `thumbnails` are generated from the one loaded source. Clips from
-// other files (PIP, a second video) will need their own set later.
+// `thumbnails` are the clip's own file's (the original video's, or those of
+// a video added later — see thumbnailsBySource).
 function ClipThumbnails({
   clip,
   thumbnails,
@@ -584,6 +607,13 @@ function EditorTimelineView({
   addingAudio,
   flash,
   originalUri,
+  thumbnailsBySource,
+  onAddVideoAtStartPress,
+  addingVideo = false,
+  multiSelect = false,
+  multiSelectedIds,
+  onToggleMultiSelect,
+  onMoveClips,
   onScrub,
   onScrubStart,
   onScrubEnd,
@@ -823,8 +853,18 @@ function EditorTimelineView({
       ? (allClips.find((c) => c.id === selectedClipId) ?? null)
       : null;
   const selectedPartner = selectedClip ? partnerOf(selectedClip) : null;
+  // Multi-select: the picked clips (a locked pair counts as picked when
+  // either half is).
+  const multiSet = new Set(multiSelect ? (multiSelectedIds ?? []) : []);
+  const isMultiPicked = (clip: Clip) => {
+    if (multiSet.has(clip.id)) return true;
+    const p = partnerOf(clip);
+    return p !== null && multiSet.has(p.id);
+  };
   const isClipHighlighted = (clip: Clip) =>
-    clip.id === selectedClip?.id || clip.id === selectedPartner?.id;
+    multiSelect
+      ? isMultiPicked(clip)
+      : clip.id === selectedClip?.id || clip.id === selectedPartner?.id;
 
   // A committed edit arrived as new clip props: drop the finished move's
   // drag state. Each box has already picked up its new start (child effects
@@ -1835,6 +1875,22 @@ function EditorTimelineView({
     }
   };
 
+  // Multi-select drop: every picked clip moves by the same time.
+  const commitGroupMove = (ids: string[], delta: number) => {
+    if (__DEV__)
+      console.log(
+        `[EditorTimeline] commit group move — ${ids.length} clip(s) by ${delta >= 0 ? "+" : ""}${delta.toFixed(2)}s`,
+      );
+    const changed = onMoveClips ? onMoveClips(ids, delta) : false;
+    if (!changed) {
+      if (__DEV__)
+        console.log(
+          "[EditorTimeline] group landed back where it was — sliding back",
+        );
+      runOnUI(slideBack)(false, 0);
+    }
+  };
+
   const logMoveCancelled = (clipId: string) => {
     if (__DEV__)
       console.log(
@@ -1844,10 +1900,25 @@ function EditorTimelineView({
 
   const makeMoveGesture = (clip: Clip) => {
     const partner = partnerOf(clip);
+    // Multi-select: only picked clips can be dragged — and they take every
+    // other picked clip along.
+    const inGroup = multiSelect && isMultiPicked(clip);
+    if (multiSelect && !inGroup) return Gesture.Pan().enabled(false);
     // Starting positions of everything this drag moves: the clip and, if
-    // locked, its partner.
+    // locked, its partner (multi-select: every picked clip + partners).
     const bases: Record<string, number> = { [clip.id]: clip.start };
     if (partner) bases[partner.id] = partner.start;
+    if (inGroup) {
+      for (const c of allClips) {
+        if (!multiSet.has(c.id)) continue;
+        bases[c.id] = c.start;
+        const p = partnerOf(c);
+        if (p) bases[p.id] = p.start;
+      }
+    }
+    const groupIds = Object.keys(bases);
+    // The drag stops when the earliest moved clip reaches 0.
+    const minBase = Math.min(...Object.values(bases));
     // The trim handles slide along if they sit on one of the moved clips.
     const handlesMove =
       handleClipId !== null && bases[handleClipId] !== undefined;
@@ -1926,8 +1997,8 @@ function EditorTimelineView({
             adjust = toEnd;
           }
         }
-        // Never let the dragged clip go before timeline 0.
-        delta = Math.max(-clipStart, delta + adjust);
+        // Never let the dragged clip(s) go before timeline 0.
+        delta = Math.max(-minBase, delta + adjust);
         dragDeltaSV.value = delta;
         if (handlesMove) offsetSV.value = handleBase + delta;
         // Where it would land if dropped now: where it is, unless its start
@@ -1946,7 +2017,8 @@ function EditorTimelineView({
         landingTopSV.value = landingTop;
         landingHeightSV.value = landingHeight;
         // Texts land exactly where dropped (they may overlap): no line.
-        landingVisibleSV.value = !isText;
+        // A group has no single landing spot: no line either.
+        landingVisibleSV.value = !isText && !inGroup;
       })
       .onEnd(() => {
         // Exactly where the box was last drawn (snapping included).
@@ -1955,6 +2027,10 @@ function EditorTimelineView({
           // Dropped where it started: nothing to commit, so no new props
           // will arrive to clear the drag state — clear it here.
           dragBasesSV.value = {};
+          return;
+        }
+        if (inGroup) {
+          runOnJS(commitGroupMove)(groupIds, delta);
           return;
         }
         runOnJS(commitMove)(clip, clipStart + delta, handlesMove, handleBase);
@@ -2123,12 +2199,53 @@ function EditorTimelineView({
                         />
                       ))}
 
-                      <View style={{ width: LEADING_WIDTH }}>
-                        <View style={{ height: RULER_HEIGHT + TRACK_GAP }} />
+                      <View
+                        style={[
+                          styles.sideColumn,
+                          {
+                            width: LEADING_WIDTH,
+                            height:
+                              RULER_HEIGHT + 2 * TRACK_GAP + 2 * TRACK_HEIGHT,
+                          },
+                        ]}
+                      >
+                        {/* "+": a video from the phone, before every clip (0s). */}
                         <TouchableOpacity
-                          style={[styles.muteButton, { height: TRACK_HEIGHT }]}
+                          style={styles.muteButton}
+                          onPress={() => {
+                            if (__DEV__)
+                              console.log(
+                                "[EditorTimeline] + tapped — add a video at 0s",
+                              );
+                            onAddVideoAtStartPress?.();
+                          }}
+                          disabled={addingVideo || !onAddVideoAtStartPress}
+                          accessibilityRole="button"
+                          accessibilityLabel="Add a video at the start"
+                          hitSlop={4}
+                        >
+                          <View
+                            style={[
+                              styles.sideIconWrap,
+                              { backgroundColor: colors.accentPurple },
+                            ]}
+                          >
+                            {addingVideo ? (
+                              <ActivityIndicator size="small" color="#FFFFFF" />
+                            ) : (
+                              <Ionicons name="add" size={20} color="#FFFFFF" />
+                            )}
+                          </View>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={styles.muteButton}
                           onPress={onMutePress}
                           disabled={muteBusy}
+                          accessibilityRole="button"
+                          accessibilityLabel={
+                            audioMuted ? "Unmute audio" : "Mute audio"
+                          }
+                          hitSlop={4}
                         >
                           <View
                             style={[
@@ -2156,6 +2273,46 @@ function EditorTimelineView({
                                 }
                               />
                             )}
+                          </View>
+                        </TouchableOpacity>
+                        {/* ☑: multi-select mode (pick several clips, move them together). */}
+                        <TouchableOpacity
+                          style={styles.muteButton}
+                          onPress={() => {
+                            if (__DEV__)
+                              console.log(
+                                `[EditorTimeline] select button — multi-select ${multiSelect ? "off" : "on"}`,
+                              );
+                            onToggleMultiSelect?.();
+                          }}
+                          disabled={!onToggleMultiSelect}
+                          accessibilityRole="button"
+                          accessibilityLabel={
+                            multiSelect
+                              ? "End multi-select"
+                              : "Select several clips"
+                          }
+                          hitSlop={4}
+                        >
+                          <View
+                            style={[
+                              styles.sideIconWrap,
+                              {
+                                backgroundColor: multiSelect
+                                  ? colors.accentPurple
+                                  : colors.surface,
+                              },
+                            ]}
+                          >
+                            <Ionicons
+                              name={
+                                multiSelect ? "checkbox" : "checkbox-outline"
+                              }
+                              size={18}
+                              color={
+                                multiSelect ? "#FFFFFF" : colors.textPrimary
+                              }
+                            />
                           </View>
                         </TouchableOpacity>
                       </View>
@@ -2188,6 +2345,11 @@ function EditorTimelineView({
                               pixelsPerSecondSV={pixelsPerSecondSV}
                               drag={drag}
                               selected={isClipHighlighted(clip)}
+                              checked={
+                                multiSelect
+                                  ? isClipHighlighted(clip)
+                                  : undefined
+                              }
                               backgroundColor={colors.background}
                               selectedBorderColor={colors.accentPurple}
                               inactiveBorderColor={colors.iconInactive}
@@ -2202,7 +2364,12 @@ function EditorTimelineView({
                             >
                               <ClipThumbnails
                                 clip={clip}
-                                thumbnails={thumbnails}
+                                thumbnails={
+                                  clip.sourceUri === originalUri
+                                    ? thumbnails
+                                    : (thumbnailsBySource?.[clip.sourceUri] ??
+                                      NO_THUMBNAILS)
+                                }
                                 pixelsPerSecondSV={pixelsPerSecondSV}
                                 placeholderColor={colors.background}
                               />
@@ -2261,6 +2428,11 @@ function EditorTimelineView({
                                 pixelsPerSecondSV={pixelsPerSecondSV}
                                 drag={drag}
                                 selected={isClipHighlighted(clip)}
+                                checked={
+                                  multiSelect
+                                    ? isClipHighlighted(clip)
+                                    : undefined
+                                }
                                 backgroundColor={colors.background}
                                 selectedBorderColor={colors.accentPurple}
                                 inactiveBorderColor={colors.iconInactive}
@@ -2329,6 +2501,11 @@ function EditorTimelineView({
                                   pixelsPerSecondSV={pixelsPerSecondSV}
                                   drag={drag}
                                   selected={isClipHighlighted(clip)}
+                                  checked={
+                                    multiSelect
+                                      ? isClipHighlighted(clip)
+                                      : undefined
+                                  }
                                   backgroundColor={PIP_CLIP_COLOR}
                                   selectedBorderColor={colors.accentPurple}
                                   inactiveBorderColor={PIP_CLIP_BORDER}
@@ -2429,6 +2606,11 @@ function EditorTimelineView({
                                       pixelsPerSecondSV={pixelsPerSecondSV}
                                       drag={drag}
                                       selected={isClipHighlighted(clip)}
+                                      checked={
+                                        multiSelect
+                                          ? isClipHighlighted(clip)
+                                          : undefined
+                                      }
                                       backgroundColor={
                                         isSticker
                                           ? STICKER_CLIP_COLOR
@@ -2656,10 +2838,15 @@ const styles = StyleSheet.create({
   trackLabelFixed: { fontSize: 12 },
   playhead: { position: "absolute", top: 0, width: 2 },
   muteButton: { alignItems: "center", justifyContent: "center" },
+  sideColumn: {
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+  },
   sideIconWrap: {
-    width: 40,
-    height: 40,
-    borderRadius: 12,
+    width: SIDE_BUTTON,
+    height: SIDE_BUTTON,
+    borderRadius: 10,
     alignItems: "center",
     justifyContent: "center",
   },

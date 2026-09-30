@@ -19,7 +19,8 @@
 //
 // Add audio: ADD_CLIP puts a new clip (e.g. music from the phone) on its
 // track at the given time — or, if that's inside another clip, at that
-// clip's nearer edge — and pushes later clips right (clips never overlap).
+// clip's nearer edge — shortened to fit before the next clip (clips never
+// overlap, and the clips already there never move).
 // Delete (step 3): DELETE_CLIP removes a clip — and its locked partner.
 // The timeline is free-form, so the gap it leaves stays; nothing moves.
 
@@ -28,6 +29,7 @@ import {
   allowsOverlap,
   canvasOf,
   clipEnd,
+  clipLength,
   createClip,
   createPipClip,
   createStickerClip,
@@ -61,6 +63,46 @@ import {
 export type ProjectAction =
   | {
       type: "INIT_SOURCE";
+      sourceUri: string;
+      sourceDuration: number;
+      videoClipId: string;
+      audioClipId: string;
+      linkId: string;
+    }
+  | {
+      /**
+       * Multi-select: move every picked clip (and their locked partners)
+       * by the same time, keeping their spacing. The earliest one stops at
+       * 0. Clips they land on are pushed right (clips never overlap on a
+       * track); texts / stickers take a row with room.
+       */
+      type: "MOVE_CLIPS";
+      clipIds: string[];
+      delta: number;
+    }
+  | {
+      /** Multi-select: delete every picked clip (and locked partners). */
+      type: "DELETE_CLIPS";
+      clipIds: string[];
+    }
+  | {
+      /**
+       * Multi-select: copy the picked clips (and locked partners) and put
+       * the copy right after the group, same spacing. Later clips are
+       * pushed right. Copied locked pairs stay locked to each other.
+       * `copies` (made by duplicateClipsAction) gives each copy its id.
+       */
+      type: "DUPLICATE_CLIPS";
+      copies: { fromId: string; id: string; linkId: string | null }[];
+    }
+  | {
+      /**
+       * The timeline's "+": a new video from the phone goes first, at 0s —
+       * one video clip and its linked audio clip, the whole file. Everything
+       * already in the project (every track) moves right by its length, so
+       * the edit after it stays exactly as it was.
+       */
+      type: "INSERT_VIDEO_AT_START";
       sourceUri: string;
       sourceDuration: number;
       videoClipId: string;
@@ -291,6 +333,79 @@ export function initSourceAction(
   };
 }
 
+/**
+ * The clips with these ids plus their locked partners, each once (in
+ * timeline order). Unknown ids are ignored.
+ */
+export function withPartners(project: Project, ids: string[]): Clip[] {
+  const out = new Map<string, Clip>();
+  for (const id of ids) {
+    const clip = findClip(project, id);
+    if (!clip) continue;
+    out.set(clip.id, clip);
+    const partner = findLinkedPartner(project, clip);
+    if (partner) out.set(partner.id, partner);
+  }
+  return [...out.values()].sort((a, b) => a.start - b.start);
+}
+
+/** Multi-select Duplicate: new ids (and links) for the copies. */
+export function duplicateClipsAction(
+  project: Project,
+  ids: string[],
+): ProjectAction {
+  const group = withPartners(project, ids);
+  const groupIds = new Set(group.map((c) => c.id));
+  const newLinks = new Map<string, string>();
+  const copies = group.map((c) => {
+    // A pair copied together stays a pair (a new link of its own); a clip
+    // copied without its partner is a free clip.
+    const partner = findLinkedPartner(project, c);
+    let linkId: string | null = null;
+    if (c.linkId && partner && groupIds.has(partner.id)) {
+      linkId = newLinks.get(c.linkId) ?? newId("link");
+      newLinks.set(c.linkId, linkId);
+    }
+    return {
+      fromId: c.id,
+      id: newId(c.track === "video" || c.track === "audio" ? "clip" : c.track),
+      linkId,
+    };
+  });
+  return { type: "DUPLICATE_CLIPS", copies };
+}
+
+/** Texts / stickers just placed: each in a row with room (it may overlap). */
+function relane(state: Project, ids: string[]): Project {
+  let next = state;
+  for (const id of ids) {
+    const c = findClip(next, id);
+    if (!c || !allowsOverlap(c.track)) continue;
+    const lane = pickLane(laneClips(next, c.track), c, c.lane ?? 0);
+    if (lane !== (c.lane ?? 0)) next = replaceClip(next, { ...c, lane });
+  }
+  return next;
+}
+
+// A new clip is shortened to fit before the next clip only if at least
+// this much room (seconds) is free there.
+const MIN_FIT_ROOM = 0.5;
+
+/** A video from the phone put first, at 0s (see INSERT_VIDEO_AT_START). */
+export function insertVideoAtStartAction(
+  sourceUri: string,
+  sourceDuration: number,
+): ProjectAction {
+  return {
+    type: "INSERT_VIDEO_AT_START",
+    sourceUri,
+    sourceDuration,
+    videoClipId: newId("video"),
+    audioClipId: newId("audio"),
+    linkId: newId("link"),
+  };
+}
+
 /** Split the clip at timeline time `at` (see SPLIT_CLIP). */
 export function splitClipAction(clipId: string, at: number): ProjectAction {
   return {
@@ -318,6 +433,92 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
         trimOut: action.sourceDuration,
       };
       return addClips(state, [
+        createClip({ ...common, id: action.videoClipId, track: "video" }),
+        createClip({ ...common, id: action.audioClipId, track: "audio" }),
+      ]);
+    }
+
+    case "MOVE_CLIPS": {
+      const group = withPartners(state, action.clipIds);
+      if (group.length === 0) return state;
+      const earliest = Math.min(...group.map((c) => c.start));
+      let delta = Math.max(-earliest, action.delta);
+      // Like a single move: a clip of the group whose start lands INSIDE
+      // another clip goes to that clip's nearer edge (the whole group
+      // shifts with it) — dropping music over the video mustn't shove the
+      // video away.
+      const ids = group.map((c) => c.id);
+      const idSet = new Set(ids);
+      for (const c of group) {
+        if (allowsOverlap(c.track)) continue;
+        const others = state.tracks[c.track].filter((o) => !idSet.has(o.id));
+        const wanted = c.start + delta;
+        const at = insertionPoint(others, Math.max(0, wanted));
+        if (Math.abs(at - wanted) > 1e-6) {
+          delta = Math.max(-earliest, at - c.start);
+          break;
+        }
+      }
+      if (Math.abs(delta) < 1e-6) return state;
+      let next = state;
+      for (const c of group)
+        next = replaceClip(next, { ...c, start: c.start + delta });
+      next = relane(next, ids);
+      return resolveOverlaps(next, ids);
+    }
+
+    case "DELETE_CLIPS": {
+      const group = withPartners(state, action.clipIds);
+      if (group.length === 0) return state;
+      return removeClips(
+        state,
+        group.map((c) => c.id),
+      );
+    }
+
+    case "DUPLICATE_CLIPS": {
+      const sources = action.copies
+        .map((cp) => ({ cp, clip: findClip(state, cp.fromId) }))
+        .filter(
+          (x): x is { cp: (typeof action.copies)[number]; clip: Clip } =>
+            x.clip !== null,
+        );
+      if (sources.length === 0) return state;
+      const groupStart = Math.min(...sources.map((x) => x.clip.start));
+      const groupEnd = Math.max(...sources.map((x) => clipEnd(x.clip)));
+      const shift = groupEnd - groupStart;
+      const copies = sources.map(({ cp, clip }) => ({
+        ...clip,
+        id: cp.id,
+        linkId: cp.linkId,
+        start: clip.start + shift,
+      }));
+      if (copies.some((c) => findClip(state, c.id))) return state;
+      let next = addClips(state, copies);
+      const ids = copies.map((c) => c.id);
+      next = relane(next, ids);
+      return resolveOverlaps(next, ids);
+    }
+
+    case "INSERT_VIDEO_AT_START": {
+      const length = action.sourceDuration;
+      if (!(length > 0) || findClip(state, action.videoClipId)) return state;
+      const tracks = { ...state.tracks };
+      for (const key of Object.keys(tracks) as (keyof typeof tracks)[]) {
+        tracks[key] = tracks[key].map((c) => ({
+          ...c,
+          start: c.start + length,
+        }));
+      }
+      const common = {
+        sourceUri: action.sourceUri,
+        sourceDuration: action.sourceDuration,
+        linkId: action.linkId,
+        start: 0,
+        trimIn: 0,
+        trimOut: action.sourceDuration,
+      };
+      return addClips({ ...state, tracks }, [
         createClip({ ...common, id: action.videoClipId, track: "video" }),
         createClip({ ...common, id: action.audioClipId, track: "audio" }),
       ]);
@@ -430,11 +631,38 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
         );
         return addClips(state, [{ ...placed, lane }]);
       }
-      const start = insertionPoint(
-        state.tracks[clip.track],
-        Math.max(0, clip.start),
-      );
-      const next = addClips(state, [{ ...clip, start }]);
+      const others = state.tracks[clip.track];
+      let start = insertionPoint(others, Math.max(0, clip.start));
+      // Music / PIP longer than the free space before the next clip on its
+      // track is shortened to fit there (the rest of the file is kept — a
+      // trim, not a cut). Less than MIN_FIT_ROOM free there: it goes after
+      // that clip instead (and so on). Clips already on the track are never
+      // pushed: before, a 2-minute song added at 0.5s threw the video's own
+      // sound 2 minutes away from its picture.
+      const nextStartAfter = (t: number) =>
+        others
+          .filter((o) => o.start >= t - 0.001)
+          .reduce((m, o) => Math.min(m, o.start), Infinity);
+      for (let guard = 0; guard < others.length + 1; guard++) {
+        const ns = nextStartAfter(start);
+        if (!Number.isFinite(ns) || ns - start >= MIN_FIT_ROOM) break;
+        const blocker = others.find((o) => Math.abs(o.start - ns) < 0.001);
+        if (!blocker) break;
+        start = clipEnd(blocker);
+      }
+      let placed: Clip = { ...clip, start };
+      const nextStart = nextStartAfter(start);
+      if (
+        Number.isFinite(nextStart) &&
+        start + clipLength(clip) > nextStart + 0.001
+      ) {
+        const speed = clip.speed > 0 ? clip.speed : 1;
+        placed = {
+          ...placed,
+          trimOut: clip.trimIn + (nextStart - start) * speed,
+        };
+      }
+      const next = addClips(state, [placed]);
       return resolveOverlaps(next, [clip.id]);
     }
 

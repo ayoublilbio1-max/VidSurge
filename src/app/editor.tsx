@@ -49,6 +49,7 @@ import EditorTopBar, {
 } from "../components/editor/EditorTopBar";
 import ExportModal from "../components/editor/ExportModal";
 import ExportSettingsSheet from "../components/editor/ExportSettingsSheet";
+import MultiSelectBar from "../components/editor/MultiSelectBar";
 import OverlayRenderer, {
   type OverlayJob,
   type OverlayResult,
@@ -71,6 +72,7 @@ import {
   canvasOf,
   clipContains,
   clipEnd,
+  clipLength,
   DEFAULT_STICKER_DATA,
   DEFAULT_TEXT_DATA,
   describeCanvas,
@@ -109,7 +111,9 @@ import {
   addStickerClipAction,
   addTextClipAction,
   duplicateClipAction,
+  duplicateClipsAction,
   initSourceAction,
+  insertVideoAtStartAction,
   projectReducer,
   splitClipAction,
   type ProjectAction,
@@ -353,6 +357,8 @@ export default function EditorScreen() {
   // and the version last saved / opened — nothing is written again while
   // the edit is unchanged.
   const projectIdRef = useRef<string | null>(projectId ?? null);
+  // Its name (for the Exports screen): from the saved project.
+  const projectNameRef = useRef<string | null>(null);
   const lastSavedRef = useRef<Project | null>(null);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   // Capture in progress: the preview is briefly laid out for the picture
@@ -404,6 +410,7 @@ export default function EditorScreen() {
       lastSavedRef.current = saved.project;
       historyRef.current = createHistory(saved.project);
       dispatchHistory({ type: "RESET", project: saved.project });
+      projectNameRef.current = saved.name;
       if (__DEV__)
         console.log(`[editor] opened project "${saved.name}" (${projectId})`);
     })();
@@ -428,6 +435,7 @@ export default function EditorScreen() {
         project: current,
       });
       projectIdRef.current = item.id;
+      projectNameRef.current = item.name;
       lastSavedRef.current = current;
       if (__DEV__) console.log(`[editor] saved (${why})`);
       return true;
@@ -722,6 +730,59 @@ export default function EditorScreen() {
 
     generate();
   }, [videoUri, duration]);
+
+  // Thumbnails of the other video files (added with the timeline's "+"),
+  // by file — the original video's are `thumbnails` above.
+  const [thumbnailsBySource, setThumbnailsBySource] = useState<
+    Record<string, (string | null)[]>
+  >({});
+  const thumbsStartedRef = useRef(new Set<string>());
+  const otherVideoSources = useMemo(() => {
+    const seen = new Map<string, number>();
+    for (const c of project.tracks.video) {
+      if (c.sourceUri && c.sourceUri !== videoUri && !seen.has(c.sourceUri)) {
+        seen.set(c.sourceUri, c.sourceDuration);
+      }
+    }
+    return [...seen.entries()];
+  }, [project.tracks.video, videoUri]);
+  useEffect(() => {
+    for (const [uri, length] of otherVideoSources) {
+      if (thumbsStartedRef.current.has(uri) || !(length > 0)) continue;
+      thumbsStartedRef.current.add(uri);
+      void (async () => {
+        const startedAt = Date.now();
+        const results: (string | null)[] = new Array(THUMBNAIL_COUNT).fill(
+          null,
+        );
+        let next = 0;
+        const worker = async () => {
+          while (true) {
+            const i = next++;
+            if (i >= THUMBNAIL_COUNT) return;
+            try {
+              const shot = await VideoThumbnails.getThumbnailAsync(uri, {
+                time: Math.floor(
+                  (((i + 0.5) * length) / THUMBNAIL_COUNT) * 1000,
+                ),
+              });
+              results[i] = shot.uri;
+            } catch {
+              results[i] = null;
+            }
+          }
+        };
+        await Promise.all(
+          Array.from({ length: THUMBNAIL_CONCURRENCY }, () => worker()),
+        );
+        if (__DEV__)
+          console.log(
+            `[editor] thumbnails for ${uri.split("/").pop()} — ${results.filter(Boolean).length}/${THUMBNAIL_COUNT} in ${Date.now() - startedAt}ms`,
+          );
+        setThumbnailsBySource((m) => ({ ...m, [uri]: results }));
+      })();
+    }
+  }, [otherVideoSources]);
 
   // ---- Clips on each track -------------------------------------------
   const videoClips = project.tracks.video;
@@ -1160,10 +1221,82 @@ export default function EditorScreen() {
   // deselects both. Otherwise tapping another clip switches the selection
   // to it. Either way, a tap on a clip means "I'm editing now", so playback
   // pauses first.
+  // ---- Multi-select (the timeline's ☑ button) ---------------------------
+  // Taps pick / unpick clips; dragging a picked clip moves them all
+  // (MOVE_CLIPS); the bar under the preview has Duplicate / Delete / Done.
+  const [multiSelect, setMultiSelect] = useState(false);
+  const [multiIds, setMultiIds] = useState<string[]>([]);
+  // Picks that no longer exist (undo, delete) are dropped.
+  const liveMultiIds = multiIds.filter((id) => findClip(project, id) !== null);
+  const toggleMultiSelect = () => {
+    pauseForGesture("multi-select");
+    if (multiSelect) {
+      if (__DEV__) console.log("[editor] multi-select off");
+      setMultiSelect(false);
+      setMultiIds([]);
+      return;
+    }
+    // The clip selected right now becomes the first pick.
+    const first = selectedClipId ? [selectedClipId] : [];
+    if (__DEV__)
+      console.log(
+        `[editor] multi-select on${first.length ? ` (starting with ${first[0]})` : ""}`,
+      );
+    setSelectedClipId(null);
+    setMultiIds(first);
+    setMultiSelect(true);
+  };
+  const toggleMultiPick = (clipId: string) => {
+    const clip = findClip(project, clipId);
+    if (!clip) return;
+    const partner = findLinkedPartner(project, clip);
+    const picked =
+      multiIds.includes(clip.id) ||
+      (partner !== null && multiIds.includes(partner.id));
+    const next = picked
+      ? multiIds.filter((id) => id !== clip.id && id !== partner?.id)
+      : [...multiIds, clip.id];
+    if (__DEV__)
+      console.log(
+        `[editor] multi-select ${picked ? "unpick" : "pick"} ${clip.track} ${clip.id}${partner ? ` (+ locked ${partner.id})` : ""} — ${next.length} picked`,
+      );
+    setMultiIds(next);
+  };
+  const handleMoveClips = (ids: string[], delta: number): boolean => {
+    const next = commitProject(
+      { type: "MOVE_CLIPS", clipIds: ids, delta },
+      `move ${ids.length} clips`,
+    );
+    return next !== project;
+  };
+  const handleDeletePicked = () => {
+    if (liveMultiIds.length === 0) return;
+    pauseForGesture("delete picked");
+    commitProject(
+      { type: "DELETE_CLIPS", clipIds: liveMultiIds },
+      `delete ${liveMultiIds.length} clips`,
+    );
+    setMultiIds([]);
+    const end = projectEnd(historyRef.current.present);
+    if (timelineTime > end) seekTo(end);
+  };
+  const handleDuplicatePicked = () => {
+    if (liveMultiIds.length === 0) return;
+    pauseForGesture("duplicate picked");
+    const action = duplicateClipsAction(project, liveMultiIds);
+    commitProject(action, `duplicate ${liveMultiIds.length} clips`);
+    if (action.type === "DUPLICATE_CLIPS")
+      flashClips(action.copies.map((c) => c.id));
+  };
+
   const handleSelectClip = (clipId: string) => {
     const target = findClip(project, clipId);
     pauseForGesture(`${target?.track ?? "clip"} clip tap`);
     if (!target) return;
+    if (multiSelect) {
+      toggleMultiPick(target.id);
+      return;
+    }
     const alreadySelected =
       selectedClipId === target.id || selectedPartner?.id === target.id;
     if (alreadySelected) {
@@ -1339,7 +1472,7 @@ export default function EditorScreen() {
           (c) => c.sourceUri === asset.uri && !findClip(project, c.id),
         );
         console.log(
-          `[editor] add audio — "${title}" (${duration.toFixed(2)}s) wanted @ ${at.toFixed(2)}s, placed @ ${added?.start.toFixed(2) ?? "?"}s`,
+          `[editor] add audio — "${title}" (${duration.toFixed(2)}s) wanted @ ${at.toFixed(2)}s, placed @ ${added?.start.toFixed(2) ?? "?"}s${added && clipLength(added) < duration - 0.01 ? `, shortened to ${clipLength(added).toFixed(2)}s to fit before the next clip` : ""}`,
         );
       }
     } catch (error) {
@@ -1351,6 +1484,60 @@ export default function EditorScreen() {
     } finally {
       addingAudioRef.current = false;
       setAddingAudio(false);
+    }
+  };
+
+  // The timeline's "+" (above the mute button): a video from the phone put
+  // FIRST, at 0s. Everything already on the timeline moves right by its
+  // length (INSERT_VIDEO_AT_START); the playhead goes to 0 to show it.
+  const addingVideoRef = useRef(false);
+  const [addingVideo, setAddingVideo] = useState(false);
+  const handleAddVideoAtStart = async () => {
+    if (addingVideoRef.current) return;
+    addingVideoRef.current = true;
+    pauseForGesture("add video at start");
+    if (__DEV__) console.log("[editor] add video at 0s — opening the gallery");
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["videos"],
+        allowsEditing: false,
+        quality: 1,
+      });
+      const asset = result.canceled ? null : result.assets?.[0];
+      if (!asset) {
+        if (__DEV__) console.log("[editor] add video at 0s — picker cancelled");
+        return;
+      }
+      setAddingVideo(true);
+      let length = asset.duration ? asset.duration / 1000 : 0;
+      if (!(length > 0)) length = await probeDuration(asset.uri);
+      if (!(length > 0)) {
+        Alert.alert(
+          "Couldn't add video",
+          "This video couldn't be read. Try another one.",
+        );
+        return;
+      }
+      const action = insertVideoAtStartAction(asset.uri, length);
+      commitProject(action, "add video at start");
+      if (action.type === "INSERT_VIDEO_AT_START") {
+        flashClips([action.videoClipId, action.audioClipId]);
+      }
+      setSelectedClipId(null);
+      seekTo(0);
+      if (__DEV__)
+        console.log(
+          `[editor] add video at 0s — ${asset.fileName ?? asset.uri.split("/").pop()} (${length.toFixed(2)}s, ${asset.width}×${asset.height}); everything else moved right by ${length.toFixed(2)}s`,
+        );
+    } catch (error) {
+      if (__DEV__) console.log("[editor] add video at 0s failed", error);
+      Alert.alert(
+        "Couldn't add video",
+        "Something went wrong opening the gallery.",
+      );
+    } finally {
+      addingVideoRef.current = false;
+      setAddingVideo(false);
     }
   };
 
@@ -3069,26 +3256,35 @@ export default function EditorScreen() {
             the wrapper competed with the toolbar's own horizontal scroll
             for the same touch, so scrolling sometimes didn't start or felt
             sticky. Taps on the toolbar never deselect anyway. */}
-          <EditorToolbar
-            selectionKind={selectionKind}
-            lockMode={lockMode}
-            splitEnabled={splitEnabled}
-            deleteEnabled={deleteEnabled}
-            onUnlock={handleUnlock}
-            onSplit={handleSplit}
-            onDelete={handleDelete}
-            busyToolKey={addingAudio ? "music" : null}
-            onEditStart={(key) => {
-              // Freeze playback at the tap; the edit lands there after the
-              // button's short spinner.
-              if (isPlaying) {
-                const at = playhead.uiTimeSV.get();
-                pauseForGesture(key);
-                seekTo(at);
-              }
-            }}
-            onToolPress={handleComingSoonTool}
-          />
+          {multiSelect ? (
+            <MultiSelectBar
+              count={liveMultiIds.length}
+              onDuplicate={handleDuplicatePicked}
+              onDelete={handleDeletePicked}
+              onDone={toggleMultiSelect}
+            />
+          ) : (
+            <EditorToolbar
+              selectionKind={selectionKind}
+              lockMode={lockMode}
+              splitEnabled={splitEnabled}
+              deleteEnabled={deleteEnabled}
+              onUnlock={handleUnlock}
+              onSplit={handleSplit}
+              onDelete={handleDelete}
+              busyToolKey={addingAudio ? "music" : null}
+              onEditStart={(key) => {
+                // Freeze playback at the tap; the edit lands there after the
+                // button's short spinner.
+                if (isPlaying) {
+                  const at = playhead.uiTimeSV.get();
+                  pauseForGesture(key);
+                  seekTo(at);
+                }
+              }}
+              onToolPress={handleComingSoonTool}
+            />
+          )}
 
           <Pressable onPress={() => clearSelection("background")}>
             <View style={styles.timelineWrap}>
@@ -3100,6 +3296,13 @@ export default function EditorScreen() {
                 stopTimeRef={stopTimeRef}
                 timelineDuration={timelineDuration}
                 thumbnails={thumbnails}
+                thumbnailsBySource={thumbnailsBySource}
+                onAddVideoAtStartPress={() => void handleAddVideoAtStart()}
+                multiSelect={multiSelect}
+                multiSelectedIds={liveMultiIds}
+                onToggleMultiSelect={toggleMultiSelect}
+                onMoveClips={handleMoveClips}
+                addingVideo={addingVideo}
                 videoClips={videoClips}
                 audioClips={audioClips}
                 textClips={textClips}
@@ -3202,6 +3405,10 @@ export default function EditorScreen() {
       <ExportModal
         plan={exportPlan}
         preparing={overlayJob !== null}
+        getProjectInfo={() => ({
+          id: projectIdRef.current,
+          name: projectNameRef.current,
+        })}
         onClose={closeExport}
       />
 

@@ -21,6 +21,15 @@ const PREROLL_TOLERANCE = 0.3;
 // should be (seconds of source).
 const RESUME_IN_PLACE = 0.08;
 
+/** Whether the player is really playing (false if it can't be asked). */
+function isPlayerPlaying(player: VideoPlayer): boolean {
+  try {
+    return player.playing === true;
+  } catch {
+    return false;
+  }
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(value, max));
 }
@@ -322,8 +331,12 @@ export function useTrackTimelineSync({
     if (holdSeeks && !isPlaying) {
       // Scrubbing always pauses playback first — make sure this player is
       // actually paused too (the pause and the hold arrive in the same
-      // render, and we return early below).
-      if (playingRef.current) {
+      // render, and we return early below). Asked of the player itself, not
+      // only `playingRef`: a scrub that lands in ANOTHER clip of this
+      // player resets `playingRef` (justEntered) — the player, still
+      // playing the old clip, was never paused. Silent while the track was
+      // muted, it was heard as soon as the mute was removed.
+      if (playingRef.current || isPlayerPlaying(player)) {
         player.pause();
         playingRef.current = false;
         if (__DEV__)
@@ -395,7 +408,7 @@ export function useTrackTimelineSync({
     }
 
     if (!isPlaying) {
-      if (playingRef.current) {
+      if (playingRef.current || isPlayerPlaying(player)) {
         player.pause();
         playingRef.current = false;
         if (__DEV__)

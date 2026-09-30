@@ -213,13 +213,11 @@ export function overlaySegments(
       ...texts
         .filter(on)
         .map((c) => ({ id: c.id, kind: "text" as const, data: textDataOf(c) })),
-      ...stickers
-        .filter(on)
-        .map((c) => ({
-          id: c.id,
-          kind: "sticker" as const,
-          data: stickerDataOf(c),
-        })),
+      ...stickers.filter(on).map((c) => ({
+        id: c.id,
+        kind: "sticker" as const,
+        data: stickerDataOf(c),
+      })),
     ];
     if (items.length === 0) {
       prevKey = "";

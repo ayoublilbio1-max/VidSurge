@@ -17,6 +17,7 @@ import {
   type ExportResult,
 } from "../../../modules/vidsurge-engine";
 import { useTheme } from "../../hooks/useTheme";
+import { addExport, markInGallery } from "../../lib/exportsStorage";
 import { allowSleep, keepScreenOn } from "../../lib/keepAwake";
 import AppText from "../AppText";
 
@@ -52,16 +53,23 @@ function deleteOverlayFiles(plan: ExportPlan) {
 export default function ExportModal({
   plan,
   preparing,
+  getProjectInfo,
   onClose,
 }: {
   plan: ExportPlan | null;
   preparing: boolean;
+  /** The project being exported (kept with the export, for the Exports screen). */
+  getProjectInfo?: () => { id: string | null; name: string | null };
   onClose: () => void;
 }) {
   const colors = useTheme();
   const [phase, setPhase] = useState<Phase>({ kind: "exporting" });
   const [progress, setProgress] = useState(0);
   const cancelledRef = useRef(false);
+  const getProjectInfoRef = useRef(getProjectInfo);
+  useEffect(() => {
+    getProjectInfoRef.current = getProjectInfo;
+  }, [getProjectInfo]);
 
   // A new export starts with a fresh screen (not the last one's result).
   useEffect(() => {
@@ -91,13 +99,37 @@ export default function ExportModal({
           );
         setProgress(1);
         setPhase({ kind: "saving" });
+        // Kept in the app (Exports screen): the file moves out of the cache.
+        let finalResult = result;
+        let keptId: string | null = null;
+        try {
+          const info = getProjectInfoRef.current?.() ?? {
+            id: null,
+            name: null,
+          };
+          const kept = await addExport({
+            fileUri: result.uri,
+            duration: result.durationMs / 1000,
+            sizeBytes: result.sizeBytes,
+            width: plan.width,
+            height: plan.height,
+            fps: plan.fps,
+            projectId: info.id,
+            projectName: info.name,
+          });
+          finalResult = { ...result, uri: kept.uri };
+          keptId = kept.id;
+        } catch (e) {
+          if (__DEV__) console.log("[export] couldn't keep it in Exports", e);
+        }
         let inGallery = false;
         try {
           const MediaLibrary = await import("expo-media-library/legacy");
           const permission = await MediaLibrary.requestPermissionsAsync(true);
           if (permission.granted) {
-            await MediaLibrary.saveToLibraryAsync(result.uri);
+            await MediaLibrary.saveToLibraryAsync(finalResult.uri);
             inGallery = true;
+            if (keptId) await markInGallery(keptId);
           } else if (__DEV__) {
             console.log(
               "[export] gallery permission refused — kept in the app only",
@@ -106,7 +138,7 @@ export default function ExportModal({
         } catch (e) {
           if (__DEV__) console.log("[export] saving to the gallery failed", e);
         }
-        if (alive) setPhase({ kind: "done", result, inGallery });
+        if (alive) setPhase({ kind: "done", result: finalResult, inGallery });
       } catch (e) {
         if (!alive) return;
         if (cancelledRef.current) {
@@ -245,8 +277,8 @@ export default function ExportModal({
               </AppText>
               <AppText style={[styles.hint, { color: colors.textMuted }]}>
                 {phase.inGallery
-                  ? "Saved to your gallery"
-                  : "Not saved to the gallery (no permission) — you can still share it"}
+                  ? "Saved to your gallery and Exports"
+                  : "Saved to Exports (not to the gallery: no permission) — you can still share it"}
                 {` · ${formatBytes(phase.result.sizeBytes)}`}
               </AppText>
               <View style={styles.row}>

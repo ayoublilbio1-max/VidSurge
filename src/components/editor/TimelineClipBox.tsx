@@ -79,6 +79,11 @@ interface TimelineClipBoxProps {
    * greyed out — dashed border, faded content, a mute icon on the label.
    */
   muted?: boolean;
+  /**
+   * Multi-select mode: a round check on the label — filled when this clip
+   * is picked. Undefined = not in multi-select (no check shown).
+   */
+  checked?: boolean;
   children?: ReactNode;
 }
 
@@ -120,6 +125,7 @@ export default function TimelineClipBox({
   flashToken = 0,
   flashColor = "#FFFFFF",
   muted = false,
+  checked,
   children,
 }: TimelineClipBoxProps) {
   const lengthSV = useSyncedValue(lengthSeconds);
@@ -221,6 +227,16 @@ export default function TimelineClipBox({
         style={styles.touchable}
         onPress={onPress}
       >
+        {checked !== undefined && (
+          <View
+            style={[
+              styles.check,
+              checked && { backgroundColor: selectedBorderColor },
+            ]}
+          >
+            {checked && <Ionicons name="checkmark" size={13} color="#FFFFFF" />}
+          </View>
+        )}
         <View style={[styles.labelChip, muted && styles.labelChipMuted]}>
           <Ionicons
             name={muted ? "volume-mute" : labelIcon}
@@ -276,5 +292,15 @@ const styles = StyleSheet.create({
     flexShrink: 1,
   },
   labelChipMuted: { backgroundColor: "rgba(0,0,0,0.35)" },
+  check: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: "#FFFFFF",
+    backgroundColor: "rgba(0,0,0,0.35)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
   labelTextMuted: { color: MUTED_TEXT },
 });
