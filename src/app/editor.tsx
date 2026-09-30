@@ -49,6 +49,10 @@ import EditorTopBar, {
 } from "../components/editor/EditorTopBar";
 import ExportModal from "../components/editor/ExportModal";
 import ExportSettingsSheet from "../components/editor/ExportSettingsSheet";
+import OverlayRenderer, {
+  type OverlayJob,
+  type OverlayResult,
+} from "../components/editor/OverlayRenderer";
 import RotateSheet from "../components/editor/RotateSheet";
 import StickerSheet from "../components/editor/StickerSheet";
 import TextEditorSheet, {
@@ -95,7 +99,7 @@ import {
   type Project,
   type TextClipData,
 } from "../editor/clipModel";
-import { buildExportPlan } from "../editor/exportPlan";
+import { buildExportPlan, overlaySegments } from "../editor/exportPlan";
 import { preloadAllFonts, useFontsVersion } from "../editor/fonts";
 import { createHistory, historyReducer } from "../editor/history";
 import { probeDuration } from "../editor/mediaProbe";
@@ -1973,6 +1977,38 @@ export default function EditorScreen() {
   // ---- Export (the Export button) ---------------------------------------
   // The plan being exported (ExportModal shows while it's set).
   const [exportPlan, setExportPlan] = useState<ExportPlan | null>(null);
+  // Before that, while the texts / stickers are drawn into pictures
+  // (OverlayRenderer): the plan waiting for them.
+  const [overlayJob, setOverlayJob] = useState<{
+    job: OverlayJob;
+    plan: ExportPlan;
+  } | null>(null);
+  const handleOverlaysDone = (result: OverlayResult) => {
+    const pending = overlayJob;
+    if (!pending) return;
+    setOverlayJob(null);
+    if ("error" in result) {
+      Alert.alert(
+        "Export failed",
+        `Couldn't prepare the texts and stickers: ${result.error}`,
+      );
+      return;
+    }
+    const overlays = pending.job.segments.map((seg, i) => ({
+      start: seg.start,
+      end: seg.end,
+      uri: result.uris[i],
+    }));
+    if (__DEV__)
+      console.log(
+        `[editor] export — ${overlays.length} text/sticker picture(s) ready`,
+      );
+    setExportPlan({ ...pending.plan, overlays });
+  };
+  const closeExport = () => {
+    setOverlayJob(null);
+    setExportPlan(null);
+  };
   const handleExport = () => {
     if (
       textEditor ||
@@ -1985,6 +2021,10 @@ export default function EditorScreen() {
     ) {
       if (__DEV__)
         console.log("[editor] export — ignored while a sheet is open");
+      return;
+    }
+    if (overlayJob || exportPlan) {
+      if (__DEV__) console.log("[editor] export — already running");
       return;
     }
     pauseForGesture("export");
@@ -2014,11 +2054,24 @@ export default function EditorScreen() {
       audioMuted,
       outputPath,
     });
+    const segments = overlaySegments(project, plan.duration);
     if (__DEV__)
       console.log(
-        `[editor] export start — ${plan.width}x${plan.height} ${plan.fps}fps`,
+        `[editor] export start — ${plan.width}x${plan.height} ${plan.fps}fps, ${plan.pip.length} PIP, ${segments.length} text/sticker stretch(es)`,
       );
-    setExportPlan(plan);
+    if (segments.length === 0) {
+      setExportPlan(plan);
+      return;
+    }
+    setOverlayJob({
+      job: {
+        id: Date.now(),
+        segments,
+        pixelWidth: plan.width,
+        pixelHeight: plan.height,
+      },
+      plan,
+    });
   };
 
   const openCanvas = () => {
@@ -3142,7 +3195,15 @@ export default function EditorScreen() {
         />
       )}
 
-      <ExportModal plan={exportPlan} onClose={() => setExportPlan(null)} />
+      <OverlayRenderer
+        job={overlayJob?.job ?? null}
+        onDone={handleOverlaysDone}
+      />
+      <ExportModal
+        plan={exportPlan}
+        preparing={overlayJob !== null}
+        onClose={closeExport}
+      />
 
       {exportDraft && (
         <ExportSettingsSheet

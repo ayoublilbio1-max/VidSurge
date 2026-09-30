@@ -20,6 +20,8 @@ export type PlanVideoItem =
       /** Degrees, clockwise (like the editor). */
       rotate: number;
       flipX: boolean;
+      /** 0–1 (Opacity tool); the canvas colour shows through. */
+      opacity: number;
     };
 
 /** One audio clip, placed at `start` on the timeline (seconds). */
@@ -31,6 +33,41 @@ export type PlanAudioItem = {
   speed: number;
   /** 0–1. */
   volume: number;
+};
+
+/**
+ * One PIP clip (video or photo) drawn over the main video. Sizes and
+ * positions are in pixels of the exported frame.
+ */
+export type PlanPipItem = {
+  kind: "video" | "image";
+  uri: string;
+  /** Timeline seconds where it starts. */
+  start: number;
+  /** Source seconds (a photo uses trimOut - trimIn as its length). */
+  trimIn: number;
+  trimOut: number;
+  speed: number;
+  /** 0–1. */
+  opacity: number;
+  /** Centre of the picture in the frame (px). */
+  cx: number;
+  cy: number;
+  /** Size of the picture (px), before turning. */
+  w: number;
+  h: number;
+  /** Degrees, clockwise. */
+  rotation: number;
+};
+
+/**
+ * A picture of every text / sticker shown during [start, end): a
+ * transparent PNG the size of the exported frame.
+ */
+export type PlanOverlay = {
+  start: number;
+  end: number;
+  uri: string;
 };
 
 export type ExportPlan = {
@@ -46,6 +83,10 @@ export type ExportPlan = {
   /** The whole video's crop (Crop tool), normalized 0–1; null = none. */
   crop: { x: number; y: number; w: number; h: number } | null;
   video: PlanVideoItem[];
+  /** PIP clips, in timeline order (they never overlap). */
+  pip: PlanPipItem[];
+  /** Texts + stickers, one picture per stretch of time. */
+  overlays: PlanOverlay[];
   audio: PlanAudioItem[];
   /** Length of the whole edit (seconds) — for logs / checks. */
   duration: number;
@@ -58,6 +99,8 @@ export type ExportResult = {
 };
 
 type NativeEngine = {
+  /** Missing in the first engine (v0.17 app builds). */
+  version?: () => number;
   exportVideo(planJson: string): Promise<ExportResult>;
   cancelExport(): Promise<boolean>;
   addListener(
@@ -68,9 +111,20 @@ type NativeEngine = {
 
 const native = requireOptionalNativeModule<NativeEngine>("VidsurgeEngine");
 
+/** The engine version this JS needs for texts, stickers, PIP, opacity, canvas colour. */
+export const REQUIRED_ENGINE_VERSION = 2;
+
+/** The native engine's version in this app build (0 = no engine). */
+export function engineVersion(): number {
+  if (!native) return 0;
+  return typeof native.version === "function" ? native.version() : 1;
+}
+
 if (__DEV__) {
   if (native) {
-    console.log("[engine] native export engine ready");
+    console.log(
+      `[engine] native export engine ready — engine v${engineVersion()}${engineVersion() < REQUIRED_ENGINE_VERSION ? ` (OLD: this app build must be rebuilt for engine v${REQUIRED_ENGINE_VERSION})` : ""}`,
+    );
   } else {
     // Diagnosis: which native Expo modules this app build does have.
     const all = Object.keys(
@@ -92,9 +146,14 @@ export async function exportVideo(plan: ExportPlan): Promise<ExportResult> {
   if (!native) {
     throw new Error("The export engine isn't in this app build yet.");
   }
+  if (engineVersion() < REQUIRED_ENGINE_VERSION) {
+    throw new Error(
+      `This app build has an old export engine (v${engineVersion()}) that can't export texts, stickers or PIP. Install the new app build.`,
+    );
+  }
   if (__DEV__)
     console.log(
-      `[engine] export ${plan.width}x${plan.height} @${plan.fps}fps, ${plan.video.length} video item(s), ${plan.audio.length} audio clip(s), ${plan.duration.toFixed(2)}s`,
+      `[engine] export ${plan.width}x${plan.height} @${plan.fps}fps, ${plan.video.length} video item(s), ${plan.pip.length} PIP, ${plan.overlays.length} text/sticker picture(s), ${plan.audio.length} audio clip(s), ${plan.duration.toFixed(2)}s`,
     );
   return native.exportVideo(JSON.stringify(plan));
 }

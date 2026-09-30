@@ -1,19 +1,20 @@
 import { Ionicons } from "@expo/vector-icons";
+import { File } from "expo-file-system";
 import * as Sharing from "expo-sharing";
 import { useEffect, useRef, useState } from "react";
 import {
-    ActivityIndicator,
-    Modal,
-    StyleSheet,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Modal,
+  StyleSheet,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import {
-    cancelExport,
-    exportVideo,
-    onExportProgress,
-    type ExportPlan,
-    type ExportResult,
+  cancelExport,
+  exportVideo,
+  onExportProgress,
+  type ExportPlan,
+  type ExportResult,
 } from "../../../modules/vidsurge-engine";
 import { useTheme } from "../../hooks/useTheme";
 import { allowSleep, keepScreenOn } from "../../lib/keepAwake";
@@ -30,22 +31,44 @@ function formatBytes(bytes: number): string {
   return mb < 1 ? `${Math.round(bytes / 1000)} KB` : `${mb.toFixed(1)} MB`;
 }
 
+/** Deletes the texts / stickers pictures made for this export. */
+function deleteOverlayFiles(plan: ExportPlan) {
+  for (const o of plan.overlays) {
+    try {
+      const f = new File(o.uri);
+      if (f.exists) f.delete();
+    } catch (e) {
+      if (__DEV__) console.log("[export] couldn't delete", o.uri, e);
+    }
+  }
+}
+
 /**
- * The export screen: progress (with Cancel) while the engine writes the
+ * The export screen: "Preparing…" while the texts / stickers are drawn
+ * (`preparing`), then progress (with Cancel) while the engine writes the
  * video, then it's saved to the gallery — Share / Done. The screen stays
- * on meanwhile. Opens when `plan` is set; `onClose` hides it.
+ * on meanwhile. Opens when `preparing` or `plan` is set; `onClose` hides it.
  */
 export default function ExportModal({
   plan,
+  preparing,
   onClose,
 }: {
   plan: ExportPlan | null;
+  preparing: boolean;
   onClose: () => void;
 }) {
   const colors = useTheme();
   const [phase, setPhase] = useState<Phase>({ kind: "exporting" });
   const [progress, setProgress] = useState(0);
   const cancelledRef = useRef(false);
+
+  // A new export starts with a fresh screen (not the last one's result).
+  useEffect(() => {
+    if (!preparing) return;
+    setPhase({ kind: "exporting" });
+    setProgress(0);
+  }, [preparing]);
 
   useEffect(() => {
     if (!plan) return;
@@ -95,6 +118,7 @@ export default function ExportModal({
         setPhase({ kind: "error", message });
       } finally {
         allowSleep("export");
+        deleteOverlayFiles(plan);
       }
     })();
     return () => {
@@ -123,19 +147,48 @@ export default function ExportModal({
     }
   };
 
-  const busy = phase.kind === "exporting" || phase.kind === "saving";
+  const busy = !plan || phase.kind === "exporting" || phase.kind === "saving";
   const percent = Math.round(progress * 100);
+
+  const handleCancelPrepare = () => {
+    if (__DEV__) console.log("[export] cancel pressed while preparing");
+    onClose();
+  };
 
   return (
     <Modal
-      visible={plan !== null}
+      visible={plan !== null || preparing}
       transparent
       animationType="fade"
-      onRequestClose={() => (busy ? handleCancel() : onClose())}
+      onRequestClose={() =>
+        !plan ? handleCancelPrepare() : busy ? handleCancel() : onClose()
+      }
     >
       <View style={styles.backdrop}>
         <View style={[styles.card, { backgroundColor: colors.background }]}>
-          {busy && (
+          {!plan && (
+            <>
+              <AppText style={[styles.title, { color: colors.textPrimary }]}>
+                Preparing texts…
+              </AppText>
+              <ActivityIndicator color={colors.accentPurple} />
+              <AppText style={[styles.hint, { color: colors.textMuted }]}>
+                Keep the app open until it's done.
+              </AppText>
+              <TouchableOpacity
+                onPress={handleCancelPrepare}
+                style={[styles.button, { backgroundColor: colors.surface }]}
+              >
+                <AppText
+                  style={[styles.buttonText, { color: colors.textPrimary }]}
+                >
+                  Cancel
+                </AppText>
+              </TouchableOpacity>
+            </>
+          )}
+
+          {plan && busy && (
             <>
               <AppText style={[styles.title, { color: colors.textPrimary }]}>
                 {phase.kind === "saving"
@@ -178,7 +231,7 @@ export default function ExportModal({
             </>
           )}
 
-          {phase.kind === "done" && (
+          {plan && phase.kind === "done" && (
             <>
               <View style={[styles.icon, { backgroundColor: colors.surface }]}>
                 <Ionicons
@@ -232,7 +285,7 @@ export default function ExportModal({
             </>
           )}
 
-          {phase.kind === "error" && (
+          {plan && phase.kind === "error" && (
             <>
               <View style={[styles.icon, { backgroundColor: colors.surface }]}>
                 <Ionicons name="alert" size={30} color="#FF5A5F" />

@@ -102,11 +102,13 @@ const LATENCY_LEARN_WEIGHT = 0.7;
 //   max:  late by more than this → seek as before (catching up would take
 //         too long).
 const CATCH_UP: Record<string, { rate: number; max: number }> = {
-  video: { rate: 1.5, max: 0.45 },
+  // Video / PIP catch up from further behind: a seek on a video with few
+  // keyframes takes ~0.5–1.7s to start (the decoder starts at the last
+  // keyframe) — a frozen picture, then more lag. Playing a little faster
+  // for a moment is much less visible. (PIP is silent, so no sped-up sound.)
+  video: { rate: 1.5, max: 0.8 },
   audio: { rate: 1.2, max: 0.2 },
-  // PIP: has sound, so gentler than video — but a seek there took ~1s to
-  // start (then 0.9s behind, resync, lag), so it catches up from further.
-  pip: { rate: 1.25, max: 0.45 },
+  pip: { rate: 1.5, max: 0.8 },
   other: { rate: 1.2, max: 0.2 },
 };
 /**

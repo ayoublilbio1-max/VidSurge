@@ -17,6 +17,10 @@ const PREROLL_WINDOW = 1.5;
 // holds the playhead until the picture catches up.
 const PREROLL_TOLERANCE = 0.3;
 
+// Resume without a seek when the player is already this close to where it
+// should be (seconds of source).
+const RESUME_IN_PLACE = 0.08;
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(value, max));
 }
@@ -262,6 +266,27 @@ export function useTrackTimelineSync({
       mappingChanged ||
       resuming ||
       switchedSource;
+
+    // Play after a pause: the pause already put this player exactly on the
+    // stop frame, so seeking it there again is pure cost — and on a video
+    // with few keyframes a seek takes ~0.5–1.5s (the decoder starts from the
+    // last keyframe), which made every play press slow. Only when resuming
+    // is the one reason and the player is already in place.
+    if (
+      wantsSeek &&
+      resuming &&
+      !justEntered &&
+      !explicitSeek &&
+      !mappingChanged &&
+      !switchedSource &&
+      Math.abs(player.currentTime - targetTime) < RESUME_IN_PLACE
+    ) {
+      wantsSeek = false;
+      if (__DEV__)
+        console.log(
+          `[trackSync:${label}] resume in place — no seek (player @ ${player.currentTime.toFixed(2)}s)`,
+        );
+    }
 
     // Entering a clip the player is already at: no seek needed. Either it
     // was parked there during a gap (preroll), or playback just crossed a
