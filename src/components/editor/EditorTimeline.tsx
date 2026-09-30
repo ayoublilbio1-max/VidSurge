@@ -7,6 +7,7 @@ import {
   Pressable,
   StyleSheet,
   TouchableOpacity,
+  useWindowDimensions,
   View,
   type StyleProp,
   type TextStyle,
@@ -60,6 +61,11 @@ const PIP_CLIP_COLOR = "#3E2A6B";
 const PIP_CLIP_BORDER = "#6B4FB0";
 const STICKER_CLIP_BORDER = "#2F8FA3";
 const TRACK_GAP = 4;
+// Dragging a clip near a screen edge scrolls the timeline that way: the
+// edge zone (px) and the top speed (px per 60fps frame, reached at the
+// very edge).
+const AUTO_SCROLL_ZONE = 56;
+const AUTO_SCROLL_MAX_SPEED = 14;
 // A video file whose thumbnails aren't made yet.
 const NO_THUMBNAILS: (string | null)[] = [];
 // The "+" (add a video at 0s) and mute buttons, stacked in the space left of
@@ -625,6 +631,8 @@ function EditorTimelineView({
 }: EditorTimelineProps) {
   const colors = useTheme();
   const scrollRef = useAnimatedRef<Animated.ScrollView>();
+  // For auto-scroll during a clip drag (edge zones).
+  const { width: screenWidth } = useWindowDimensions();
 
   useEffect(() => {
     if (__DEV__) {
@@ -767,6 +775,15 @@ function EditorTimelineView({
   // nothing the ScrollView does can sneak the timeline out from under you.
   const isMovingSV = useSharedValue(false);
   const scrollLockXSV = useSharedValue(0);
+  // Auto-scroll while a clip is dragged near a screen edge (see
+  // AUTO_SCROLL_ZONE): its speed (px/frame, <0 = left), how far it has
+  // scrolled during this drag (added to the finger's travel), and what the
+  // frame callback needs to keep the dragged clip(s) under the finger.
+  const autoScrollSpeedSV = useSharedValue(0);
+  const autoScrollPxSV = useSharedValue(0);
+  const dragMinBaseSV = useSharedValue(0);
+  const moveHandlesSV = useSharedValue(false);
+  const moveHandleBaseSV = useSharedValue(0);
   // UI-thread mirrors of isScrubbing / isPinching, so the per-frame
   // playhead callback (and onScroll) can check them without touching JS.
   const isScrubbingSV = useSharedValue(false);
@@ -1013,6 +1030,35 @@ function EditorTimelineView({
       );
     }
   };
+
+  // Auto-scroll during a clip drag: every frame the finger rests in an
+  // edge zone, the timeline scrolls that way and the dragged clip(s) move
+  // along by the same time, so they stay under the finger.
+  useFrameCallback((frame) => {
+    "worklet";
+    const speed = autoScrollSpeedSV.value;
+    if (speed === 0 || !isMovingSV.value || !dragActiveSV.value) return;
+    const dtMs = Math.min(frame.timeSincePreviousFrame ?? 16, 50);
+    const from = scrollLockXSV.value;
+    const to = clampWorklet(
+      from + speed * (dtMs / 16.67),
+      0,
+      contentWidthSV.value,
+    );
+    const applied = to - from;
+    if (Math.abs(applied) < 0.01) return;
+    scrollLockXSV.value = to;
+    scrollX.value = to;
+    scrollTo(scrollRef, to, 0, false);
+    autoScrollPxSV.value += applied;
+    const pps = pixelsPerSecondSV.value;
+    const delta = Math.max(
+      -dragMinBaseSV.value,
+      dragDeltaSV.value + applied / pps,
+    );
+    dragDeltaSV.value = delta;
+    if (moveHandlesSV.value) offsetSV.value = moveHandleBaseSV.value + delta;
+  });
 
   // Moves the timeline under the playhead on the UI thread, every screen
   // frame, while playing. It advances its own time by the frame duration
@@ -1891,6 +1937,16 @@ function EditorTimelineView({
     }
   };
 
+  // After a drag that auto-scrolled: the playhead line sits at a new time.
+  const syncTimeAfterAutoScroll = (time: number) => {
+    if (__DEV__)
+      console.log(
+        `[EditorTimeline] drag auto-scrolled — playhead now @ ${time.toFixed(2)}s`,
+      );
+    onScrub(time);
+    onScrubEnd?.();
+  };
+
   const logMoveCancelled = (clipId: string) => {
     if (__DEV__)
       console.log(
@@ -1963,6 +2019,11 @@ function EditorTimelineView({
         dragBasesSV.value = bases;
         dragDeltaSV.value = 0;
         dragActiveSV.value = true;
+        autoScrollSpeedSV.value = 0;
+        autoScrollPxSV.value = 0;
+        dragMinBaseSV.value = minBase;
+        moveHandlesSV.value = handlesMove;
+        moveHandleBaseSV.value = handleBase;
         // Lock the scroll to wherever it happens to be right now, before
         // the drag can nudge it at all.
         isMovingSV.value = true;
@@ -1980,7 +2041,19 @@ function EditorTimelineView({
       })
       .onUpdate((event) => {
         const pps = pixelsPerSecondSV.value;
-        let delta = event.translationX / pps;
+        // Near a screen edge: scroll that way (faster closer to the edge).
+        const fromLeft = event.absoluteX;
+        const fromRight = screenWidth - event.absoluteX;
+        autoScrollSpeedSV.value =
+          fromLeft < AUTO_SCROLL_ZONE
+            ? -AUTO_SCROLL_MAX_SPEED *
+              (1 - Math.max(0, fromLeft) / AUTO_SCROLL_ZONE)
+            : fromRight < AUTO_SCROLL_ZONE
+              ? AUTO_SCROLL_MAX_SPEED *
+                (1 - Math.max(0, fromRight) / AUTO_SCROLL_ZONE)
+              : 0;
+        // The finger's travel plus how far the timeline has auto-scrolled.
+        let delta = (event.translationX + autoScrollPxSV.value) / pps;
         // Snap the start or the end to the nearest snap point in reach.
         const start = clipStart + delta;
         let best = SNAP_PX / pps;
@@ -2036,6 +2109,15 @@ function EditorTimelineView({
         runOnJS(commitMove)(clip, clipStart + delta, handlesMove, handleBase);
       })
       .onFinalize((_event, success) => {
+        autoScrollSpeedSV.value = 0;
+        // The timeline scrolled during the drag: the playhead (the middle
+        // line) now points at another time — make that the current time.
+        if (autoScrollPxSV.value !== 0) {
+          runOnJS(syncTimeAfterAutoScroll)(
+            scrollX.value / pixelsPerSecondSV.value,
+          );
+          autoScrollPxSV.value = 0;
+        }
         dragActiveSV.value = false;
         isMovingSV.value = false;
         landingVisibleSV.value = false;
