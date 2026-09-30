@@ -1,0 +1,28 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.vidsurgeengine'
+version = '0.1.0'
+
+// Media3 (Google's video library). MUST be the same version expo-video uses
+// (all Media3 parts in one app have to match): expo-video 57 uses 1.9.0.
+def media3Version = "1.9.0"
+
+android {
+  namespace "expo.modules.vidsurgeengine"
+  defaultConfig {
+    versionCode 1
+    versionName "0.1.0"
+  }
+  lintOptions {
+    abortOnError false
+  }
+}
+
+dependencies {
+  implementation "androidx.media3:media3-transformer:$media3Version"
+  implementation "androidx.media3:media3-effect:$media3Version"
+  implementation "androidx.media3:media3-common:$media3Version"
+}

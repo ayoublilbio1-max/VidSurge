@@ -30,7 +30,10 @@ export type History = {
 export type HistoryAction =
   | { type: "APPLY"; action: ProjectAction; label: string }
   | { type: "UNDO" }
-  | { type: "REDO" };
+  | { type: "REDO" }
+  // A saved project was opened: it becomes the present, with a fresh
+  // history (undo doesn't go back past the moment it was opened).
+  | { type: "RESET"; project: Project };
 
 export function createHistory(project: Project): History {
   return { past: [], present: project, future: [] };
@@ -80,6 +83,9 @@ export function historyReducer(
         future: history.future.slice(1),
       };
     }
+
+    case "RESET":
+      return createHistory(action.project);
 
     default:
       return history;

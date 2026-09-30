@@ -69,6 +69,9 @@ const PRESTART_WINDOW = 1.0;
 // The early start fires this much sooner than the measured start-up time
 // alone would say: the JS thread can be busy right when the timer is due.
 const PRESTART_MARGIN = 0.05;
+// A clip that began while playback was starting (see loopStartTime) still
+// gets its early start if it began no longer ago than this.
+const LATE_PRESTART_MAX = 0.6;
 // Starting guesses for a player's start-up time after play(), per track.
 // Each early start measures the real value and updates it (kept between
 // plays). Measured on a real phone with the player parked on its first
@@ -79,6 +82,9 @@ const PRESTART_MARGIN = 0.05;
 const DEFAULT_START_LATENCY: Record<string, number> = {
   video: 0.15,
   audio: 0.2,
+  // A PIP video (picture + sound on one player) starts like a video, a bit
+  // slower (it's decoded next to the main video).
+  pip: 0.3,
   other: 0.2,
 };
 // How much a new measurement counts when updating the learned start-up
@@ -98,8 +104,23 @@ const LATENCY_LEARN_WEIGHT = 0.7;
 const CATCH_UP: Record<string, { rate: number; max: number }> = {
   video: { rate: 1.5, max: 0.45 },
   audio: { rate: 1.2, max: 0.2 },
+  // PIP: has sound, so gentler than video — but a seek there took ~1s to
+  // start (then 0.9s behind, resync, lag), so it catches up from further.
+  pip: { rate: 1.25, max: 0.45 },
   other: { rate: 1.2, max: 0.2 },
 };
+/**
+ * True when a player's rate is the clock running it faster to catch up
+ * (CATCH_UP) — the track sync must leave that rate alone: resetting it cut
+ * the catch-up short, the clip stayed ~0.3s behind and was pulled forward
+ * (an audible jump) a second later.
+ */
+export function isCatchUpRate(rate: number, speed: number): boolean {
+  return Object.values(CATCH_UP).some(
+    (c) => Math.abs(rate - speed * c.rate) < 0.01,
+  );
+}
+
 // Caught up once the player is within this of the playhead.
 const CATCH_UP_DONE = 0.03;
 // How much real time a single frame may count for when estimating "now"
@@ -124,6 +145,12 @@ const SEEK_LEAD: Record<string, number> = {
   audio: 0.1,
   other: 0.15,
 };
+// The PIP player takes much longer to get going again after a seek than the
+// main players (~0.6–0.8s on a phone: it's a second video decoder). A resync
+// aimed only 0.15s ahead landed it ~0.6s behind — then the drift fix seeked
+// it again, and again. So a PIP resync aims ahead by its measured start-up
+// time instead (at least this much).
+const PIP_MIN_SEEK_LEAD = 0.3;
 // A measured start-up time below this isn't real (the player had already
 // moved before play() took effect, or its position report was stale) —
 // learning from it dropped the video lead to 50ms and every following early
@@ -343,6 +370,10 @@ export function useTimelineClock({
     // Has the playhead really moved yet in this run? Only the very start of
     // playback holds the playhead (all players starting together).
     let hasMoved = false;
+    // Where this playback started. A clip that begins after this point but
+    // while the clock was still holding for the picture missed its early
+    // start (see LATE_PRESTART_MAX).
+    const loopStartTime = timeRef.current;
     // Players paused at the start of playback while the picture starts
     // (see HOLD_OTHERS_AFTER_MS), by clip label.
     const heldOthers: Record<string, ClockTrack> = {};
@@ -411,6 +442,12 @@ export function useTimelineClock({
       startLatencyRef.current[kindOf(trackKey)] ??
       DEFAULT_START_LATENCY[kindOf(trackKey)] ??
       DEFAULT_START_LATENCY.other;
+    // How far ahead of the playhead a resync (seek) aims — the time the
+    // player needs to start again after it (see PIP_MIN_SEEK_LEAD).
+    const seekLead = (trackKey: string) =>
+      kindOf(trackKey) === "pip"
+        ? Math.max(PIP_MIN_SEEK_LEAD, startLatency(trackKey))
+        : (SEEK_LEAD[kindOf(trackKey)] ?? SEEK_LEAD.other);
 
     // Does another clip on the same track start right where this one ends
     // (a split point)? Then its player keeps going.
@@ -420,6 +457,16 @@ export function useTimelineClock({
           o.trackKey === t.trackKey &&
           o.label !== t.label &&
           Math.abs(o.clipStart - t.clipEnd) < CONTINUOUS_EPSILON,
+      );
+
+    // ...and the other way round: does this clip start right where another
+    // clip of the same player ends?
+    const continuesFromSameTrack = (t: ClockTrack) =>
+      tracksRef.current.some(
+        (o) =>
+          o.trackKey === t.trackKey &&
+          o.label !== t.label &&
+          Math.abs(o.clipEnd - t.clipStart) < CONTINUOUS_EPSILON,
       );
 
     const pauseAtClipEnd = (t: ClockTrack, how: string) => {
@@ -657,8 +704,7 @@ export function useTimelineClock({
           // a second later (a visible jump mid-clip).
           if (runGap < -cfg.max && nowEst >= t.clipStart - CLIP_EPSILON) {
             if (cu) endCatchUp(label, "too far behind — seeking instead");
-            const lead = SEEK_LEAD[kindOf(t.trackKey)] ?? SEEK_LEAD.other;
-            const target = timelineToDecoder(t, nowEst + lead);
+            const target = timelineToDecoder(t, nowEst + seekLead(t.trackKey));
             if (__DEV__) {
               console.log(
                 `[timelineClock] ${label} started ${(-runGap).toFixed(2)}s behind — resync now to source ${target.toFixed(2)}s`,
@@ -753,11 +799,8 @@ export function useTimelineClock({
         const offFor = now - driftSince[t.label];
         const sinceFix = now - (lastDriftFix[t.label] ?? 0);
         if (offFor >= DRIFT_GRACE_MS && sinceFix >= DRIFT_COOLDOWN_MS) {
-          // Ahead of the playhead by the seek's own delay (SEEK_LEAD).
-          const target = timelineToDecoder(
-            t,
-            next + (SEEK_LEAD[kindOf(t.trackKey)] ?? SEEK_LEAD.other),
-          );
+          // Ahead of the playhead by the seek's own delay (seekLead).
+          const target = timelineToDecoder(t, next + seekLead(t.trackKey));
           if (__DEV__) {
             console.log(
               `[timelineClock] ${t.label} drifted ${err > 0 ? "ahead" : "behind"} by ${Math.abs(err).toFixed(2)}s for ${offFor}ms — resync to source ${target.toFixed(2)}s`,
@@ -777,13 +820,31 @@ export function useTimelineClock({
       // free (no clip of its track under the playhead).
       for (const t of tracksRef.current) {
         if (prestarted[t.label]) continue;
+        // A clip that just continues the previous one on the same player
+        // (the parts of a split): that player is already playing across
+        // the cut — "starting" it again seeked a running player back and
+        // forth (heard as a jump in the sound at every split).
+        if (continuesFromSameTrack(t)) continue;
         // Not while the clock is still holding for the picture at the start
         // of playback: the timer counts real time, but the playhead isn't
         // moving yet — it fired ~1s early and the next clip started far
         // ahead of the playhead.
         if (!hasMoved) continue;
         const until = t.clipStart - next;
-        if (until <= 0 || until > PRESTART_WINDOW) continue;
+        if (until > PRESTART_WINDOW) continue;
+        // Already begun: only a clip that began while the clock was holding
+        // at the start of playback (play pressed just before a cut) — its
+        // early start was skipped, and the track sync only started it on
+        // the next React render (~0.5s behind, then a drift resync). Start
+        // it now; the late-start handling below catches it up.
+        if (
+          until <= 0 &&
+          (t.clipStart <= loopStartTime + CLIP_EPSILON ||
+            -until > LATE_PRESTART_MAX ||
+            next >= t.clipEnd - CLIP_TAIL ||
+            moved[t.label])
+        )
+          continue;
         const busy = tracksRef.current.some(
           (o) =>
             o.trackKey === t.trackKey &&

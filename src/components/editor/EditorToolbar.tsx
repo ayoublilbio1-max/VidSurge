@@ -17,6 +17,8 @@ export interface EditorTool {
   key: string;
   icon: keyof typeof Ionicons.glyphMap;
   label: string;
+  /** Not in the demo build: a small purple lock on the button. */
+  demoOnly?: boolean;
 }
 
 /**
@@ -47,18 +49,30 @@ const BUSY_LABEL: Record<string, string> = {
 const PROJECT_TOOLS: EditorTool[] = [
   { key: "music", icon: "musical-notes-outline", label: "Music" },
   { key: "canvas", icon: "tablet-portrait-outline", label: "Canvas" },
+  { key: "crop", icon: "crop-outline", label: "Crop" },
   { key: "addText", icon: "text-outline", label: "Add text" },
   { key: "stickers", icon: "happy-outline", label: "Stickers" },
   { key: "pip", icon: "copy-outline", label: "PIP" },
-  { key: "voiceRecord", icon: "mic-outline", label: "Voice record" },
-  { key: "effects", icon: "sparkles-outline", label: "Effects" },
+  {
+    key: "voiceRecord",
+    icon: "mic-outline",
+    label: "Voice record",
+    demoOnly: true,
+  },
+  {
+    key: "effects",
+    icon: "sparkles-outline",
+    label: "Effects",
+    demoOnly: true,
+  },
 ];
 
 // A clip selected → clip tools (things you do TO that clip). Lock comes
 // first, before these. Which tools depend on what is selected:
 //   - both clips of a locked pair (they act as one): everything. Split,
 //     Delete and Speed apply to both clips, Volume to the audio, and the
-//     picture tools (Crop, Rotate, Filter, Opacity, Reverse) to the video.
+//     picture tools (Rotate, Filter, Opacity, Reverse) to the video. (Crop
+//     is a project tool: it cuts the whole video's frame.)
 //   - an unlocked video clip: no Volume (its sound lives on the audio clip)
 //   - an unlocked audio clip: no picture tools
 const SPLIT: EditorTool = { key: "split", icon: "cut-outline", label: "Split" };
@@ -78,11 +92,20 @@ const VOLUME: EditorTool = {
   label: "Volume",
 };
 const PICTURE_TOOLS: EditorTool[] = [
-  { key: "crop", icon: "crop-outline", label: "Crop" },
   { key: "rotate", icon: "refresh-outline", label: "Rotate" },
-  { key: "filter", icon: "color-filter-outline", label: "Filter" },
+  {
+    key: "filter",
+    icon: "color-filter-outline",
+    label: "Filter",
+    demoOnly: true,
+  },
   { key: "opacity", icon: "contrast-outline", label: "Opacity" },
-  { key: "reverse", icon: "play-back-outline", label: "Reverse" },
+  {
+    key: "reverse",
+    icon: "play-back-outline",
+    label: "Reverse",
+    demoOnly: true,
+  },
 ];
 
 // A text clip selected: Edit (words + style), Split, Delete, Duplicate.
@@ -93,8 +116,32 @@ const TEXT_TOOLS: EditorTool[] = [
   { key: "duplicate", icon: "duplicate-outline", label: "Duplicate" },
 ];
 
+// A sticker selected: Replace (another emoji), Split, Delete, Duplicate.
+const STICKER_TOOLS: EditorTool[] = [
+  { key: "replaceSticker", icon: "swap-horizontal-outline", label: "Replace" },
+  SPLIT,
+  DELETE,
+  { key: "duplicate", icon: "duplicate-outline", label: "Duplicate" },
+];
+
+// A PIP selected: it has its own picture and sound.
+const PIP_TOOLS: EditorTool[] = [
+  SPLIT,
+  DELETE,
+  { key: "speed", icon: "speedometer-outline", label: "Speed" },
+  // No Volume: PIP videos are silent.
+  { key: "opacity", icon: "contrast-outline", label: "Opacity" },
+];
+
 /** What is selected, for choosing the tools. */
-export type SelectionKind = "none" | "locked" | "video" | "audio" | "text";
+export type SelectionKind =
+  | "none"
+  | "locked"
+  | "video"
+  | "audio"
+  | "text"
+  | "sticker"
+  | "pip";
 
 const TOOLS_BY_SELECTION: Record<SelectionKind, EditorTool[]> = {
   none: PROJECT_TOOLS,
@@ -102,6 +149,8 @@ const TOOLS_BY_SELECTION: Record<SelectionKind, EditorTool[]> = {
   video: [SPLIT, DELETE, SPEED, ...PICTURE_TOOLS],
   audio: [SPLIT, DELETE, SPEED, VOLUME],
   text: TEXT_TOOLS,
+  sticker: STICKER_TOOLS,
+  pip: PIP_TOOLS,
 };
 
 interface EditorToolbarProps {
@@ -147,7 +196,11 @@ export default function EditorToolbar({
   const colors = useTheme();
   const lockActive = lockMode === "locked";
   // The Lock button is for video/audio pairs only — not shown for text.
-  const hasSelection = selectionKind !== "none" && selectionKind !== "text";
+  const hasSelection =
+    selectionKind !== "none" &&
+    selectionKind !== "text" &&
+    selectionKind !== "sticker" &&
+    selectionKind !== "pip";
   const scrollRef = useRef<ScrollView>(null);
 
   // A different tool set: start it from the first tool. Otherwise the old
@@ -317,6 +370,18 @@ export default function EditorToolbar({
                       color={pressed ? "#FFFFFF" : colors.textPrimary}
                     />
                   )}
+                  {tool.demoOnly && (
+                    // Not in the demo: small purple lock, top-right.
+                    <View
+                      pointerEvents="none"
+                      style={[
+                        styles.lockBadge,
+                        { backgroundColor: colors.accentPurple },
+                      ]}
+                    >
+                      <Ionicons name="lock-closed" size={9} color="#FFFFFF" />
+                    </View>
+                  )}
                 </View>
                 <AppText style={[styles.label, { color: colors.textMuted }]}>
                   {busy ? (BUSY_LABEL[tool.key] ?? tool.label) : tool.label}
@@ -341,5 +406,15 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   iconWrapPressed: { transform: [{ scale: 0.92 }] },
+  lockBadge: {
+    position: "absolute",
+    top: 3,
+    right: 3,
+    width: 15,
+    height: 15,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   label: { fontSize: 10, textAlign: "center" },
 });

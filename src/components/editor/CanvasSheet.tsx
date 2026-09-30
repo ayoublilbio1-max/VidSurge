@@ -59,11 +59,17 @@ export default function CanvasSheet({
   const [pickerStart, setPickerStart] = useState<string | null>(null);
   const pickerOpen = pickerStart !== null;
 
+  // Picking a ratio removes the Crop tool's crop (whole picture again, in
+  // that shape).
   const setRatio = (ratio: CanvasRatio) => {
-    if (__DEV__) console.log(`[CanvasSheet] ratio → ${ratio}`);
-    onChange({ ...value, ratio });
+    if (__DEV__)
+      console.log(
+        `[CanvasSheet] ratio → ${ratio}${value.crop ? " (crop removed)" : ""}`,
+      );
+    onChange({ ...value, ratio, crop: null });
   };
-  const setBackground = (background: string) => onChange({ ...value, background });
+  const setBackground = (background: string) =>
+    onChange({ ...value, background });
 
   const renderRatio = () => (
     <ScrollView
@@ -71,8 +77,22 @@ export default function CanvasSheet({
       showsHorizontalScrollIndicator={false}
       contentContainerStyle={styles.row}
     >
+      {value.crop && (
+        // The video is cropped: its frame is the crop's shape.
+        <View
+          style={[styles.ratioButton, { backgroundColor: colors.accentPurple }]}
+          accessibilityLabel="Frame from Crop"
+        >
+          <View style={styles.shapeBox}>
+            <Ionicons name="crop-outline" size={22} color="#FFFFFF" />
+          </View>
+          <AppText style={[styles.ratioLabel, { color: "#FFFFFF" }]}>
+            Crop
+          </AppText>
+        </View>
+      )}
       {CANVAS_RATIOS.map((r) => {
-        const active = r === value.ratio;
+        const active = !value.crop && r === value.ratio;
         const aspect = canvasAspect(r, videoAspect);
         const w = aspect >= 1 ? SHAPE_BOX : SHAPE_BOX * aspect;
         const h = aspect >= 1 ? SHAPE_BOX / aspect : SHAPE_BOX;
@@ -82,7 +102,9 @@ export default function CanvasSheet({
             onPress={() => setRatio(r)}
             style={[
               styles.ratioButton,
-              { backgroundColor: active ? colors.accentPurple : colors.surface },
+              {
+                backgroundColor: active ? colors.accentPurple : colors.surface,
+              },
             ]}
             accessibilityLabel={`Frame ${r}`}
           >
@@ -90,12 +112,19 @@ export default function CanvasSheet({
               <View
                 style={[
                   styles.shape,
-                  { width: w, height: h, borderColor: active ? "#FFFFFF" : colors.textPrimary },
+                  {
+                    width: w,
+                    height: h,
+                    borderColor: active ? "#FFFFFF" : colors.textPrimary,
+                  },
                 ]}
               />
             </View>
             <AppText
-              style={[styles.ratioLabel, { color: active ? "#FFFFFF" : colors.textPrimary }]}
+              style={[
+                styles.ratioLabel,
+                { color: active ? "#FFFFFF" : colors.textPrimary },
+              ]}
             >
               {r === "original" ? "Original" : r}
             </AppText>
@@ -111,7 +140,10 @@ export default function CanvasSheet({
         initial={value.background}
         onChange={setBackground}
         onDone={() => {
-          if (__DEV__) console.log(`[CanvasSheet] background → ${value.background} (picker)`);
+          if (__DEV__)
+            console.log(
+              `[CanvasSheet] background → ${value.background} (picker)`,
+            );
           setPickerStart(null);
         }}
         onCancel={() => {
@@ -133,7 +165,14 @@ export default function CanvasSheet({
           style={styles.rainbow}
           accessibilityLabel="Pick any colour"
         >
-          {["#FF3B30", "#FF9500", "#FFE600", "#34C759", "#0A84FF", "#AF52DE"].map((c) => (
+          {[
+            "#FF3B30",
+            "#FF9500",
+            "#FFE600",
+            "#34C759",
+            "#0A84FF",
+            "#AF52DE",
+          ].map((c) => (
             <View key={c} style={{ flex: 1, backgroundColor: c }} />
           ))}
         </TouchableOpacity>
@@ -150,7 +189,9 @@ export default function CanvasSheet({
                 styles.swatch,
                 {
                   backgroundColor: c,
-                  borderColor: active ? colors.textPrimary : "rgba(255,255,255,0.15)",
+                  borderColor: active
+                    ? colors.textPrimary
+                    : "rgba(255,255,255,0.15)",
                   borderWidth: active ? 3 : 1,
                 },
               ]}
@@ -164,11 +205,21 @@ export default function CanvasSheet({
   return (
     <View style={[styles.sheet, { backgroundColor: colors.background }]}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={onCancel} hitSlop={10} accessibilityLabel="Cancel">
+        <TouchableOpacity
+          onPress={onCancel}
+          hitSlop={10}
+          accessibilityLabel="Cancel"
+        >
           <Ionicons name="close" size={26} color={colors.textPrimary} />
         </TouchableOpacity>
-        <AppText style={[styles.title, { color: colors.textPrimary }]}>Canvas</AppText>
-        <TouchableOpacity onPress={onDone} hitSlop={10} accessibilityLabel="Apply">
+        <AppText style={[styles.title, { color: colors.textPrimary }]}>
+          Canvas
+        </AppText>
+        <TouchableOpacity
+          onPress={onDone}
+          hitSlop={10}
+          accessibilityLabel="Apply"
+        >
           <Ionicons name="checkmark" size={28} color={colors.textPrimary} />
         </TouchableOpacity>
       </View>
@@ -196,7 +247,11 @@ export default function CanvasSheet({
               <View
                 style={[
                   styles.tabUnderline,
-                  { backgroundColor: active ? colors.accentPurple : "transparent" },
+                  {
+                    backgroundColor: active
+                      ? colors.accentPurple
+                      : "transparent",
+                  },
                 ]}
               />
             </TouchableOpacity>
@@ -204,7 +259,9 @@ export default function CanvasSheet({
         })}
       </View>
 
-      <View style={styles.body}>{tab === "ratio" ? renderRatio() : renderBackground()}</View>
+      <View style={styles.body}>
+        {tab === "ratio" ? renderRatio() : renderBackground()}
+      </View>
     </View>
   );
 }

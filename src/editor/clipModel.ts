@@ -54,6 +54,28 @@ export interface CropRect {
   h: number;
 }
 
+/** The whole picture (no crop). */
+export const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
+/** Smallest crop side, as a fraction of the picture. */
+export const MIN_CROP = 0.1;
+
+/**
+ * A crop rect made valid: inside the picture, at least MIN_CROP on each
+ * side, rounded to 1/1000. The whole picture (or near enough) → null.
+ */
+export function normalizeCrop(c: CropRect | null): CropRect | null {
+  if (!c) return null;
+  const r = (v: number) => Math.round(v * 1000) / 1000;
+  const w = Math.min(1, Math.max(MIN_CROP, c.w));
+  const h = Math.min(1, Math.max(MIN_CROP, c.h));
+  const x = Math.min(1 - w, Math.max(0, c.x));
+  const y = Math.min(1 - h, Math.max(0, c.y));
+  const out = { x: r(x), y: r(y), w: r(w), h: r(h) };
+  if (out.x <= 0.002 && out.y <= 0.002 && out.w >= 0.998 && out.h >= 0.998)
+    return null;
+  return out;
+}
+
 export interface Clip {
   id: string;
   track: TrackId;
@@ -94,6 +116,98 @@ export interface Project {
   tracks: Record<TrackId, Clip[]>;
   /** Output frame shape + background (Canvas tool). Missing = defaults. */
   canvas?: CanvasSettings;
+  /** Export quality (the "1080P" button). Missing = defaults. */
+  export?: ExportSettings;
+}
+
+// ---- Export settings (resolution / frame rate) -------------------------------
+
+/** The short side of the exported video, in pixels. */
+export type ExportResolution = 480 | 720 | 1080 | 1440 | 2160;
+export type ExportFps = 24 | 30 | 60;
+
+export interface ExportSettings {
+  resolution: ExportResolution;
+  fps: ExportFps;
+}
+
+export const EXPORT_RESOLUTIONS: ExportResolution[] = [
+  480, 720, 1080, 1440, 2160,
+];
+export const EXPORT_FPS: ExportFps[] = [24, 30, 60];
+export const DEFAULT_EXPORT: ExportSettings = { resolution: 1080, fps: 30 };
+
+export function exportOf(project: Project): ExportSettings {
+  const e = project.export;
+  if (!e) return DEFAULT_EXPORT;
+  return {
+    resolution: EXPORT_RESOLUTIONS.includes(e.resolution)
+      ? e.resolution
+      : DEFAULT_EXPORT.resolution,
+    fps: EXPORT_FPS.includes(e.fps) ? e.fps : DEFAULT_EXPORT.fps,
+  };
+}
+
+/** "480P", "720P", "1080P", "2K", "4K". */
+export function resolutionLabel(r: ExportResolution): string {
+  return r === 1440 ? "2K" : r === 2160 ? "4K" : `${r}P`;
+}
+
+/**
+ * Pixel size of the exported video: the short side is the resolution, the
+ * long side follows the frame's shape (`aspect` = width ÷ height). Both
+ * even (video encoders need that).
+ */
+export function exportFrameSize(
+  settings: ExportSettings,
+  aspect: number,
+): { width: number; height: number } {
+  const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
+  const a = aspect > 0 ? aspect : 9 / 16;
+  const short = settings.resolution;
+  return a >= 1
+    ? { width: even(short * a), height: even(short) }
+    : { width: even(short), height: even(short / a) };
+}
+
+// Typical H.264 bitrates (Mbit/s) at 30 fps for a 16:9 / 9:16 frame.
+const BASE_MBPS: Record<ExportResolution, number> = {
+  480: 2.5,
+  720: 5,
+  1080: 10,
+  1440: 18,
+  2160: 40,
+};
+const FPS_FACTOR: Record<ExportFps, number> = { 24: 0.85, 30: 1, 60: 1.6 };
+
+/** Video bitrate (bits/s) the export asks the encoder for. */
+export function exportVideoBitrate(
+  settings: ExportSettings,
+  aspect: number,
+): number {
+  const { width, height } = exportFrameSize(settings, aspect);
+  const r = settings.resolution;
+  const areaFactor = (width * height) / (r * ((r * 16) / 9));
+  return Math.round(
+    BASE_MBPS[r] * FPS_FACTOR[settings.fps] * areaFactor * 1_000_000,
+  );
+}
+
+/** Rough size of the exported file (bytes): video bitrate + 128 kbit/s sound. */
+export function estimateExportBytes(
+  settings: ExportSettings,
+  aspect: number,
+  durationSec: number,
+): number {
+  const { width, height } = exportFrameSize(settings, aspect);
+  const r = settings.resolution;
+  const areaFactor = (width * height) / (r * ((r * 16) / 9));
+  const mbps = BASE_MBPS[r] * FPS_FACTOR[settings.fps] * areaFactor + 0.128;
+  return (mbps * 1_000_000 * Math.max(0, durationSec)) / 8;
+}
+
+export function describeExport(settings: ExportSettings): string {
+  return `${resolutionLabel(settings.resolution)} ${settings.fps}fps`;
 }
 
 // ---- Canvas (the output frame) --------------------------------------------
@@ -114,6 +228,13 @@ export interface CanvasSettings {
   ratio: CanvasRatio;
   /** Colour behind the pictures (hex). */
   background: string;
+  /**
+   * Crop tool (whole video): the part of the video picture to keep,
+   * normalized to the first video. When set, the frame takes exactly its
+   * shape (and `ratio` is ignored) and every video clip shows only that
+   * part, filling the frame. null / missing = no crop.
+   */
+  crop?: CropRect | null;
 }
 
 export const DEFAULT_CANVAS: CanvasSettings = {
@@ -123,6 +244,28 @@ export const DEFAULT_CANVAS: CanvasSettings = {
 
 export function canvasOf(project: Project): CanvasSettings {
   return project.canvas ?? DEFAULT_CANVAS;
+}
+
+/**
+ * Width ÷ height of the project's frame: the crop's shape when the video
+ * is cropped, otherwise the chosen ratio (see canvasAspect).
+ */
+export function frameAspect(
+  canvas: CanvasSettings,
+  videoAspect: number | null,
+): number {
+  if (canvas.crop && videoAspect && videoAspect > 0) {
+    return (canvas.crop.w * videoAspect) / canvas.crop.h;
+  }
+  return canvasAspect(canvas.ratio, videoAspect);
+}
+
+/** Short text for logs, e.g. "1:1 on #000000" or "crop 0.2,0.1 0.5×0.6 on #000000". */
+export function describeCanvas(canvas: CanvasSettings): string {
+  const shape = canvas.crop
+    ? `crop ${canvas.crop.x},${canvas.crop.y} ${canvas.crop.w}×${canvas.crop.h}`
+    : canvas.ratio;
+  return `${shape} on ${canvas.background}`;
 }
 
 /**
@@ -242,19 +385,36 @@ export function clipContains(clip: Clip, time: number): boolean {
 const CONTINUE_EPSILON = 0.02;
 
 /**
- * True when `next` plays on straight from `prev`: same file, same speed and
- * volume, `next` starts in the source where `prev` stops and on the
- * timeline where `prev` ends. One player can then simply keep playing
- * across the cut — no hand-over to another player, nothing to seek.
+ * True when `next` plays on straight from `prev`: same file, same speed,
+ * `next` starts in the source where `prev` stops and on the timeline where
+ * `prev` ends. One player can then simply keep playing across the cut — no
+ * hand-over to another player, nothing to seek.
+ *
+ * - "audio": the volume MAY differ — the clock sets the new clip's volume
+ *   on the player right at the cut (its `activate`), so a split where one
+ *   part is quieter still plays on one player.
+ * - "video": rotation, flip and opacity must match — those are drawn per
+ *   player and set on React's re-render, which comes a little after the
+ *   cut; a different look there would show late. (Video players are always
+ *   muted, so their volume doesn't matter.)
  */
-export function isContinuation(prev: Clip, next: Clip): boolean {
-  return (
+export function isContinuation(
+  prev: Clip,
+  next: Clip,
+  kind: "audio" | "video" = "audio",
+): boolean {
+  const sameMedia =
     prev.sourceUri === next.sourceUri &&
     prev.speed === next.speed &&
-    prev.volume === next.volume &&
     prev.reversed === next.reversed &&
     Math.abs(prev.trimOut - next.trimIn) < CONTINUE_EPSILON &&
-    Math.abs(clipEnd(prev) - next.start) < CONTINUE_EPSILON
+    Math.abs(clipEnd(prev) - next.start) < CONTINUE_EPSILON;
+  if (!sameMedia) return false;
+  if (kind === "audio") return true;
+  return (
+    prev.rotate === next.rotate &&
+    !!prev.flipX === !!next.flipX &&
+    prev.opacity === next.opacity
   );
 }
 
@@ -266,12 +426,15 @@ export function isContinuation(prev: Clip, next: Clip): boolean {
  * plays on across the cut, which is seamless even when the JS thread is
  * too busy to start another player on time.
  */
-export function splitIntoPlayerSlots(clips: Clip[]): [Clip[], Clip[]] {
+export function splitIntoPlayerSlots(
+  clips: Clip[],
+  kind: "audio" | "video" = "audio",
+): [Clip[], Clip[]] {
   const slots: [Clip[], Clip[]] = [[], []];
   let slot = 1;
   let prev: Clip | null = null;
   for (const clip of clips) {
-    slot = prev && isContinuation(prev, clip) ? slot : 1 - slot;
+    slot = prev && isContinuation(prev, clip, kind) ? slot : 1 - slot;
     slots[slot].push(clip);
     prev = clip;
   }
@@ -413,7 +576,17 @@ const PLACE_EPSILON = 0.001;
  * rules above.
  */
 export function allowsOverlap(track: TrackId): boolean {
-  return track === "text";
+  return track === "text" || track === "sticker";
+}
+
+/**
+ * Overlay tracks (text + stickers) share one set of timeline rows (lanes):
+ * the clips a new / moved overlay clip must find room among.
+ */
+export function laneClips(project: Project, track: TrackId): Clip[] {
+  return allowsOverlap(track)
+    ? [...project.tracks.text, ...project.tracks.sticker]
+    : project.tracks[track];
 }
 
 /**
@@ -546,11 +719,19 @@ export function splitClip(
 
 /** One-line summary of a clip, for [project] logs. */
 export function describeClip(clip: Clip): string {
+  if (clip.track === "pip") {
+    const d = pipDataOf(clip);
+    return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s PIP ${d.kind} ${clip.sourceUri.split("/").pop()} (src ${clip.trimIn.toFixed(2)}–${clip.trimOut.toFixed(2)}s, width ${d.width.toFixed(2)}×${d.scale.toFixed(2)}, at ${d.x.toFixed(2)},${d.y.toFixed(2)}, ${d.rotation}°${clip.volume !== 1 ? `, vol ${Math.round(clip.volume * 100)}%` : ""}${clip.opacity !== 1 ? `, opacity ${Math.round(clip.opacity * 100)}%` : ""})`;
+  }
+  if (clip.track === "sticker") {
+    const s = stickerDataOf(clip);
+    return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s ${s.emoji} (size ${s.size.toFixed(2)}×${s.scale.toFixed(2)}, at ${s.x.toFixed(2)},${s.y.toFixed(2)}, ${s.rotation}°, lane ${clip.lane ?? 0})`;
+  }
   if (clip.track === "text") {
     const t = textDataOf(clip);
     return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s "${t.text.replace(/\s+/g, " ").slice(0, 24)}" (${t.font}, ${t.color}, size ${t.size.toFixed(3)}, at ${t.x.toFixed(2)},${t.y.toFixed(2)})`;
   }
-  return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s (src ${clip.trimIn.toFixed(2)}–${clip.trimOut.toFixed(2)}s, x${clip.speed}${clip.volume !== 1 ? `, vol ${Math.round(clip.volume * 100)}%` : ""}${clip.opacity !== 1 ? `, opacity ${Math.round(clip.opacity * 100)}%` : ""}${clip.rotate ? `, rotate ${clip.rotate}°` : ""}${clip.flipX ? ", flipped" : ""}, ${clip.linkId ? `locked ${clip.linkId}` : "unlocked"})`;
+  return `${clip.id} @${clip.start.toFixed(2)}s–${clipEnd(clip).toFixed(2)}s (src ${clip.trimIn.toFixed(2)}–${clip.trimOut.toFixed(2)}s, x${clip.speed}${clip.volume !== 1 ? `, vol ${Math.round(clip.volume * 100)}%` : ""}${clip.opacity !== 1 ? `, opacity ${Math.round(clip.opacity * 100)}%` : ""}${clip.rotate ? `, rotate ${clip.rotate}°` : ""}${clip.crop ? `, crop ${clip.crop.x},${clip.crop.y} ${clip.crop.w}×${clip.crop.h}` : ""}${clip.flipX ? ", flipped" : ""}, ${clip.linkId ? `locked ${clip.linkId}` : "unlocked"})`;
 }
 
 // ---- Text clips -------------------------------------------------------------
@@ -579,7 +760,10 @@ export interface TextClipData {
   /** Text colour, "#RRGGBB", and how opaque the whole text is (0–1). */
   color: string;
   opacity: number;
-  /** Font size as a fraction of the video frame's height (0.05 = 5%). */
+  /**
+   * Font size as a fraction of the frame's size (see textSizeReference;
+   * 0.05 = 5% of a 9:16 frame's height).
+   */
   size: number;
   align: TextAlign;
   /** Outline (null = none); width as a fraction of the font size. */
@@ -710,4 +894,164 @@ export function textLanes(clips: Clip[]): {
   for (const clip of clips)
     laneOf[clip.id] = rowOfLane.get(clip.lane ?? 0) ?? 0;
   return { laneOf, count: Math.max(1, used.length) };
+}
+
+/**
+ * What a text's `size` is a fraction of, for a frame of w × h px: the
+ * frame's overall size (√(w·h)), scaled so a 9:16 frame gives exactly its
+ * height. Based on the frame's HEIGHT alone, a text looked tiny in a wide
+ * frame (a cropped banner) — then, made big there, it became huge when
+ * the frame went back to 9:16.
+ */
+export function textSizeReference(frameW: number, frameH: number): number {
+  return (Math.sqrt(Math.max(0, frameW * frameH)) * 4) / 3;
+}
+
+/** A text's font size (px) in a frame of w × h px. */
+export function textFontSize(
+  data: TextClipData,
+  frameW: number,
+  frameH: number,
+): number {
+  return Math.max(
+    6,
+    data.size * textSizeReference(frameW, frameH) * data.scale,
+  );
+}
+
+// ---- Sticker clips ------------------------------------------------------------
+//
+// A sticker is an emoji drawn over the video, placed / turned / resized on
+// the preview like a text. Like a text it has no media file: its look lives
+// in `data` and its time range uses the long empty "source" of text clips,
+// so both trim handles can extend it.
+
+export interface StickerClipData {
+  emoji: string;
+  /** Centre, as a fraction of the frame (0–1). */
+  x: number;
+  y: number;
+  /** Size as a fraction of the frame's size (see textSizeReference). */
+  size: number;
+  scale: number;
+  /** Degrees, clockwise. */
+  rotation: number;
+}
+
+export const STICKER_DEFAULT_LENGTH = 3;
+
+export const DEFAULT_STICKER_DATA: Omit<StickerClipData, "emoji"> = {
+  x: 0.5,
+  y: 0.5,
+  size: 0.14,
+  scale: 1,
+  rotation: 0,
+};
+
+export function stickerDataOf(clip: Clip): StickerClipData {
+  const d = (clip.data ?? {}) as Partial<StickerClipData>;
+  return { ...DEFAULT_STICKER_DATA, emoji: "⭐", ...d };
+}
+
+/** A new sticker clip at timeline time `start`. */
+export function createStickerClip(
+  id: string,
+  start: number,
+  data: StickerClipData,
+  length = STICKER_DEFAULT_LENGTH,
+): Clip {
+  return createClip({
+    id,
+    track: "sticker",
+    sourceUri: "",
+    sourceDuration: TEXT_SOURCE_LENGTH,
+    linkId: null,
+    start: Math.max(0, start),
+    trimIn: TEXT_SOURCE_ORIGIN,
+    trimOut: TEXT_SOURCE_ORIGIN + length,
+    data,
+  });
+}
+
+/** A sticker's emoji size (px) in a frame of w × h px. */
+export function stickerFontSize(
+  data: StickerClipData,
+  frameW: number,
+  frameH: number,
+): number {
+  return Math.max(
+    10,
+    data.size * textSizeReference(frameW, frameH) * data.scale,
+  );
+}
+
+// ---- PIP clips (picture-in-picture) ------------------------------------------
+//
+// A video or photo from the phone shown as a layer over the main video,
+// moved / turned / resized on the preview like a sticker. One PIP at a time
+// (the PIP track doesn't allow overlaps). A PIP video plays on its own
+// player, with its own sound. A photo has no length of its own: like a
+// text it uses the long empty "source", so it can be trimmed to any length.
+
+export interface PipClipData {
+  kind: "video" | "image";
+  /** Width ÷ height of the picture. */
+  aspect: number;
+  /** Centre, as a fraction of the frame (0–1). */
+  x: number;
+  y: number;
+  /** Width as a fraction of the frame's width (before `scale`). */
+  width: number;
+  scale: number;
+  /** Degrees, clockwise. */
+  rotation: number;
+  /** File name, for the timeline label. */
+  title?: string;
+}
+
+export const PIP_IMAGE_LENGTH = 3;
+
+export function pipDataOf(clip: Clip): PipClipData {
+  const d = (clip.data ?? {}) as Partial<PipClipData>;
+  return {
+    kind: "video",
+    aspect: 16 / 9,
+    x: 0.5,
+    y: 0.5,
+    width: 0.5,
+    scale: 1,
+    rotation: 0,
+    ...d,
+  };
+}
+
+/** A new PIP clip at timeline time `start`. `duration` = the video's length. */
+export function createPipClip(
+  id: string,
+  start: number,
+  uri: string,
+  data: PipClipData,
+  duration: number,
+): Clip {
+  const isImage = data.kind === "image";
+  return createClip({
+    id,
+    track: "pip",
+    sourceUri: uri,
+    sourceDuration: isImage ? TEXT_SOURCE_LENGTH : duration,
+    linkId: null,
+    start: Math.max(0, start),
+    trimIn: isImage ? TEXT_SOURCE_ORIGIN : 0,
+    trimOut: isImage ? TEXT_SOURCE_ORIGIN + PIP_IMAGE_LENGTH : duration,
+    data,
+  });
+}
+
+/** A PIP's size (px) in a frame of w × h px. */
+export function pipSize(
+  data: PipClipData,
+  frameW: number,
+): { w: number; h: number } {
+  const w = Math.max(20, data.width * data.scale * frameW);
+  return { w, h: w / (data.aspect > 0 ? data.aspect : 1) };
 }

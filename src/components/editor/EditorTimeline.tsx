@@ -8,6 +8,8 @@ import {
   StyleSheet,
   TouchableOpacity,
   View,
+  type StyleProp,
+  type TextStyle,
 } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
@@ -27,6 +29,8 @@ import Animated, {
 } from "react-native-reanimated";
 import {
   clipLength,
+  pipDataOf,
+  stickerDataOf,
   textDataOf,
   textLanes,
   type Clip,
@@ -51,6 +55,10 @@ const TRACK_HEIGHT = 56;
 // to the video thumbnails and audio waveforms.
 const TEXT_CLIP_COLOR = "#8A5516";
 const TEXT_CLIP_BORDER = "#B8772A";
+const STICKER_CLIP_COLOR = "#1F5E6B";
+const PIP_CLIP_COLOR = "#3E2A6B";
+const PIP_CLIP_BORDER = "#6B4FB0";
+const STICKER_CLIP_BORDER = "#2F8FA3";
 const TRACK_GAP = 4;
 const LEADING_WIDTH = 60;
 const RULER_HEIGHT = 16;
@@ -154,6 +162,12 @@ interface EditorTimelineProps {
   audioClips: Clip[];
   /** Text clips — they may overlap, and are stacked in lanes (rows). */
   textClips: Clip[];
+  /** Sticker clips — they share the text rows (lanes). */
+  stickerClips: Clip[];
+  /** PIP clips (videos / photos over the main video) — their own row. */
+  pipClips: Clip[];
+  /** The empty PIP row was tapped: pick a video / photo. */
+  onAddPipPress: () => void;
   selectedClipId: string | null;
   onMutePress: () => void;
   /** The audio track is muted (the mute button shows it). */
@@ -162,6 +176,8 @@ interface EditorTimelineProps {
   muteBusy?: boolean;
   onSelectClip: (clipId: string) => void;
   onAddTextPress: () => void;
+  /** The empty text / sticker row's "Add sticker" was tapped. */
+  onAddStickerPress: () => void;
   /** The empty audio row was tapped: add music from the phone. */
   onAddAudioPress: () => void;
   /** A picked song is being read: the "Add audio" row shows a spinner. */
@@ -332,12 +348,13 @@ function waveAmplitudeAtTime(t: number): number {
 const WAVE_MARGIN = 15;
 const WAVE_MARGIN_PX = 500;
 
-// Label of a video clip: the file name, plus the Rotate tool's settings
-// when they're used (e.g. "clip.mp4 · 90° · flipped").
+// Label of a video clip: the file name, plus the Rotate / Crop settings
+// when they're used (e.g. "clip.mp4 · 90° · flipped · cropped").
 function videoClipLabel(clip: Clip, name: string): string {
   const parts = [name];
   if (clip.rotate) parts.push(`${clip.rotate}°`);
   if (clip.flipX) parts.push("flipped");
+  if (clip.crop) parts.push("cropped");
   return parts.join(" · ");
 }
 
@@ -542,7 +559,7 @@ function ClipWaveform({
   );
 }
 
-export default function EditorTimeline({
+function EditorTimelineView({
   clipLabel,
   currentTime,
   isPlaying,
@@ -553,12 +570,16 @@ export default function EditorTimeline({
   videoClips,
   audioClips,
   textClips,
+  stickerClips,
+  pipClips,
+  onAddPipPress,
   selectedClipId,
   onMutePress,
   audioMuted,
   muteBusy = false,
   onSelectClip,
   onAddTextPress,
+  onAddStickerPress,
   onAddAudioPress,
   addingAudio,
   flash,
@@ -768,11 +789,23 @@ export default function EditorTimeline({
   // Selection. A clip locked to a partner (same linkId on the other track)
   // is highlighted, trimmed and moved together with it.
   const allClips = useMemo(
-    () => [...videoClips, ...audioClips, ...textClips],
-    [videoClips, audioClips, textClips],
+    () => [
+      ...videoClips,
+      ...audioClips,
+      ...pipClips,
+      ...textClips,
+      ...stickerClips,
+    ],
+    [videoClips, audioClips, pipClips, textClips, stickerClips],
   );
   // Text lanes: overlapping texts go on separate rows under the audio row.
-  const lanes = useMemo(() => textLanes(textClips), [textClips]);
+  // Texts and stickers share these rows ("overlay" clips).
+  const overlayClips = useMemo(
+    () => [...textClips, ...stickerClips],
+    [textClips, stickerClips],
+  );
+  const lanes = useMemo(() => textLanes(overlayClips), [overlayClips]);
+
   const textRowCount = lanes.count;
   const partnerOf = (clip: Clip): Clip | null => {
     if (clip.linkId === null) return null;
@@ -799,7 +832,15 @@ export default function EditorTimeline({
   useEffect(() => {
     dragBasesSV.value = {};
     dragDeltaSV.value = 0;
-  }, [videoClips, audioClips, textClips, dragBasesSV, dragDeltaSV]);
+  }, [
+    videoClips,
+    audioClips,
+    pipClips,
+    textClips,
+    stickerClips,
+    dragBasesSV,
+    dragDeltaSV,
+  ]);
 
   // NOTE: the zoom's source of truth is pixelsPerSecondSV (UI thread);
   // `pixelsPerSecond` state is only its mirror for rendering, updated via
@@ -1514,7 +1555,8 @@ export default function EditorTimeline({
 
   // Rows: video, audio, then one per text lane (at least one — the "Add
   // text" row when there's no text yet).
-  const rowCount = 2 + textRowCount;
+  // (Row 2 is the PIP row.)
+  const rowCount = 3 + textRowCount;
   const tracksBlockHeight =
     RULER_HEIGHT + TRACK_HEIGHT * rowCount + TRACK_GAP * rowCount;
 
@@ -1534,9 +1576,11 @@ export default function EditorTimeline({
   const rowTop = (clip: Clip) =>
     clip.track === "audio"
       ? trackPanelTops[1]
-      : clip.track === "text"
-        ? trackPanelTops[2 + (lanes.laneOf[clip.id] ?? 0)]
-        : trackPanelTops[0];
+      : clip.track === "pip"
+        ? trackPanelTops[2]
+        : clip.track === "text" || clip.track === "sticker"
+          ? trackPanelTops[3 + (lanes.laneOf[clip.id] ?? 0)]
+          : trackPanelTops[0];
   let handleTop = 0;
   let handleHeight = 0;
   if (selectedClip) {
@@ -1559,13 +1603,16 @@ export default function EditorTimeline({
   // that it can't overlap. Texts: only the ones in its own row (texts in
   // other rows may overlap it in time).
   const neighboursOf = (clip: Clip, exclude: Set<string>) =>
-    clip.track === "text"
-      ? textClips.filter(
+    clip.track === "text" || clip.track === "sticker"
+      ? overlayClips.filter(
           (c) => !exclude.has(c.id) && (c.lane ?? 0) === (clip.lane ?? 0),
         )
-      : (clip.track === "audio" ? audioClips : videoClips).filter(
-          (c) => !exclude.has(c.id),
-        );
+      : (clip.track === "audio"
+          ? audioClips
+          : clip.track === "pip"
+            ? pipClips
+            : videoClips
+        ).filter((c) => !exclude.has(c.id));
 
   // How far the selected clip's edges may go before touching a neighbour
   // (checked on its track and on its locked partner's track).
@@ -1682,12 +1729,14 @@ export default function EditorTimeline({
         trimDragBaseSV.value +
           (trimMinStartSV.value - offsetDragBaseSV.value) * speed,
       );
+      const upper = trimEndSV.value - MIN_TRIM_DURATION;
       const next = clampWorklet(
         trimDragBaseSV.value +
           (event.translationX / pixelsPerSecondSV.value) * speed,
         lowest,
-        trimEndSV.value - MIN_TRIM_DURATION,
+        upper,
       );
+
       const sourceDelta = next - trimDragBaseSV.value;
       trimStartSV.value = next;
       offsetSV.value = offsetDragBaseSV.value + sourceDelta / speed;
@@ -1718,10 +1767,11 @@ export default function EditorTimeline({
         trimStartSV.value +
           (trimMaxEndSV.value - offsetSV.value) * trimSpeedSV.value,
       );
+      const lower = trimStartSV.value + MIN_TRIM_DURATION;
       const next = clampWorklet(
         trimDragBaseSV.value +
           (event.translationX / pixelsPerSecondSV.value) * trimSpeedSV.value,
-        trimStartSV.value + MIN_TRIM_DURATION,
+        lower,
         highest,
       );
       trimEndSV.value = next;
@@ -1828,7 +1878,8 @@ export default function EditorTimeline({
     }
     // A text snaps to every other clip's edges (video, audio, text), so it
     // can be lined up with a cut.
-    const isText = clip.track === "text";
+    // (Stickers too.)
+    const isText = clip.track === "text" || clip.track === "sticker";
     if (isText) {
       for (const o of allClips) {
         if (o.id !== clip.id) snapPoints.push(o.start, o.start + clipLength(o));
@@ -1998,9 +2049,13 @@ export default function EditorTimeline({
       <View
         style={[styles.topControlRow, { backgroundColor: colors.background }]}
       >
-        <AppText style={[styles.counterText, { color: colors.textPrimary }]}>
-          {formatTime(currentTime)} / {formatTime(timelineDuration)}
-        </AppText>
+        <PlayTimeCounter
+          currentTime={currentTime}
+          isPlaying={isPlaying}
+          playhead={playhead}
+          duration={timelineDuration}
+          style={[styles.counterText, { color: colors.textPrimary }]}
+        />
 
         <View style={styles.zoomButtons}>
           <TouchableOpacity
@@ -2231,12 +2286,83 @@ export default function EditorTimeline({
                           </View>
                         )}
 
-                        {textClips.length === 0 ? (
+                        {pipClips.length === 0 ? (
                           <Animated.View
                             style={[styles.emptyTrackRow, trackWidthStyle]}
                           >
                             <TouchableOpacity
-                              style={styles.trackRowTouchable}
+                              style={styles.trackRowButton}
+                              onPress={() => {
+                                if (__DEV__)
+                                  console.log(
+                                    "[EditorTimeline] empty PIP row — add PIP",
+                                  );
+                                onAddPipPress();
+                              }}
+                            >
+                              <Ionicons
+                                name="copy-outline"
+                                size={16}
+                                color={colors.textMuted}
+                              />
+                              <AppText
+                                style={[
+                                  styles.trackLabelFixed,
+                                  { color: colors.textMuted },
+                                ]}
+                              >
+                                Add PIP (video or photo)
+                              </AppText>
+                            </TouchableOpacity>
+                          </Animated.View>
+                        ) : (
+                          <View style={styles.clipRow}>
+                            {pipClips.map((clip) => {
+                              const d = pipDataOf(clip);
+                              return (
+                                <TimelineClipBox
+                                  key={clip.id}
+                                  clipId={clip.id}
+                                  start={clip.start}
+                                  lengthSeconds={clipLength(clip)}
+                                  height={TRACK_HEIGHT}
+                                  pixelsPerSecondSV={pixelsPerSecondSV}
+                                  drag={drag}
+                                  selected={isClipHighlighted(clip)}
+                                  backgroundColor={PIP_CLIP_COLOR}
+                                  selectedBorderColor={colors.accentPurple}
+                                  inactiveBorderColor={PIP_CLIP_BORDER}
+                                  labelIcon={
+                                    d.kind === "video"
+                                      ? "film-outline"
+                                      : "image-outline"
+                                  }
+                                  labelText={`PIP · ${d.title ?? (d.kind === "video" ? "Video" : "Photo")}`}
+                                  onPress={() => onSelectClip(clip.id)}
+                                  moveGesture={moveGestures[clip.id]}
+                                  flashToken={
+                                    flash.ids.includes(clip.id)
+                                      ? flash.token
+                                      : 0
+                                  }
+                                  flashColor={colors.accentPurple}
+                                />
+                              );
+                            })}
+                          </View>
+                        )}
+
+                        {overlayClips.length === 0 ? (
+                          // No text / sticker yet: one row to add either.
+                          <Animated.View
+                            style={[
+                              styles.emptyTrackRow,
+                              styles.emptySplitRow,
+                              trackWidthStyle,
+                            ]}
+                          >
+                            <TouchableOpacity
+                              style={styles.trackRowButton}
                               onPress={onAddTextPress}
                             >
                               <Ionicons
@@ -2246,56 +2372,97 @@ export default function EditorTimeline({
                               />
                               <AppText
                                 style={[
-                                  styles.trackLabel,
+                                  styles.trackLabelFixed,
                                   { color: colors.textMuted },
                                 ]}
                               >
                                 Add text
                               </AppText>
                             </TouchableOpacity>
+                            <TouchableOpacity
+                              style={styles.trackRowButton}
+                              onPress={() => {
+                                if (__DEV__)
+                                  console.log(
+                                    "[EditorTimeline] empty overlay row — add sticker",
+                                  );
+                                onAddStickerPress();
+                              }}
+                            >
+                              <Ionicons
+                                name="happy-outline"
+                                size={16}
+                                color={colors.textMuted}
+                              />
+                              <AppText
+                                style={[
+                                  styles.trackLabelFixed,
+                                  { color: colors.textMuted },
+                                ]}
+                              >
+                                Add sticker
+                              </AppText>
+                            </TouchableOpacity>
                           </Animated.View>
                         ) : (
-                          // One row per text lane (texts that overlap in
-                          // time sit on separate rows).
+                          // One row per lane (texts / stickers that overlap
+                          // in time sit on separate rows).
                           Array.from({ length: textRowCount }, (_, lane) => (
                             <View
                               key={`text-lane-${lane}`}
                               style={styles.clipRow}
                             >
-                              {textClips
+                              {overlayClips
                                 .filter(
                                   (clip) =>
                                     (lanes.laneOf[clip.id] ?? 0) === lane,
                                 )
-                                .map((clip) => (
-                                  <TimelineClipBox
-                                    key={clip.id}
-                                    clipId={clip.id}
-                                    start={clip.start}
-                                    lengthSeconds={clipLength(clip)}
-                                    height={TRACK_HEIGHT}
-                                    pixelsPerSecondSV={pixelsPerSecondSV}
-                                    drag={drag}
-                                    selected={isClipHighlighted(clip)}
-                                    backgroundColor={TEXT_CLIP_COLOR}
-                                    selectedBorderColor={colors.accentPurple}
-                                    inactiveBorderColor={TEXT_CLIP_BORDER}
-                                    labelIcon="text-outline"
-                                    labelText={
-                                      textDataOf(clip)
-                                        .text.replace(/\s+/g, " ")
-                                        .trim() || "Text"
-                                    }
-                                    onPress={() => onSelectClip(clip.id)}
-                                    moveGesture={moveGestures[clip.id]}
-                                    flashToken={
-                                      flash.ids.includes(clip.id)
-                                        ? flash.token
-                                        : 0
-                                    }
-                                    flashColor={colors.accentPurple}
-                                  />
-                                ))}
+                                .map((clip) => {
+                                  const isSticker = clip.track === "sticker";
+                                  return (
+                                    <TimelineClipBox
+                                      key={clip.id}
+                                      clipId={clip.id}
+                                      start={clip.start}
+                                      lengthSeconds={clipLength(clip)}
+                                      height={TRACK_HEIGHT}
+                                      pixelsPerSecondSV={pixelsPerSecondSV}
+                                      drag={drag}
+                                      selected={isClipHighlighted(clip)}
+                                      backgroundColor={
+                                        isSticker
+                                          ? STICKER_CLIP_COLOR
+                                          : TEXT_CLIP_COLOR
+                                      }
+                                      selectedBorderColor={colors.accentPurple}
+                                      inactiveBorderColor={
+                                        isSticker
+                                          ? STICKER_CLIP_BORDER
+                                          : TEXT_CLIP_BORDER
+                                      }
+                                      labelIcon={
+                                        isSticker
+                                          ? "happy-outline"
+                                          : "text-outline"
+                                      }
+                                      labelText={
+                                        isSticker
+                                          ? `${stickerDataOf(clip).emoji} Sticker`
+                                          : textDataOf(clip)
+                                              .text.replace(/\s+/g, " ")
+                                              .trim() || "Text"
+                                      }
+                                      onPress={() => onSelectClip(clip.id)}
+                                      moveGesture={moveGestures[clip.id]}
+                                      flashToken={
+                                        flash.ids.includes(clip.id)
+                                          ? flash.token
+                                          : 0
+                                      }
+                                      flashColor={colors.accentPurple}
+                                    />
+                                  );
+                                })}
                             </View>
                           ))
                         )}
@@ -2477,6 +2644,16 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
   },
   trackLabel: { fontSize: 12, flex: 1 },
+  // The empty text / sticker row: two buttons side by side at the start.
+  emptySplitRow: { flexDirection: "row", alignItems: "center" },
+  trackRowButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 12,
+    height: "100%",
+  },
+  trackLabelFixed: { fontSize: 12 },
   playhead: { position: "absolute", top: 0, width: 2 },
   muteButton: { alignItems: "center", justifyContent: "center" },
   sideIconWrap: {
@@ -2487,3 +2664,65 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 });
+
+/**
+ * "00:05 / 00:11" above the timeline. While playing it follows the drawn
+ * playhead itself (a tiny re-render once per second) — the timeline around
+ * it no longer re-renders for every playhead update (see below).
+ */
+function PlayTimeCounter({
+  currentTime,
+  isPlaying,
+  playhead,
+  duration,
+  style,
+}: {
+  currentTime: number;
+  isPlaying: boolean;
+  playhead: PlayheadSync;
+  duration: number;
+  style: StyleProp<TextStyle>;
+}) {
+  const [playingSecond, setPlayingSecond] = useState(0);
+  useAnimatedReaction(
+    () => (playhead.playingSV.value ? Math.floor(playhead.uiTimeSV.value) : -1),
+    (second, previous) => {
+      if (second >= 0 && second !== previous) runOnJS(setPlayingSecond)(second);
+    },
+  );
+  return (
+    <AppText style={style}>
+      {formatTime(isPlaying ? playingSecond : currentTime)} /{" "}
+      {formatTime(duration)}
+    </AppText>
+  );
+}
+
+/**
+ * The timeline re-renders only when something it SHOWS changes. While
+ * playing, the editor passes a new `currentTime` ~5 times a second (and
+ * new handler functions with every render); re-rendering the whole timeline
+ * (every clip box, waveform and thumbnail) for that took most of the JS
+ * thread in the dev build — 2–6 frames/s while playing, 16–24 in fullscreen
+ * where the timeline is hidden. During playback the playhead and scroll are
+ * moved on the UI thread anyway, so those updates are skipped: the first
+ * render with `isPlaying` off (pause) brings everything up to date again.
+ */
+function sameWhilePlaying(
+  prev: EditorTimelineProps,
+  next: EditorTimelineProps,
+): boolean {
+  const playing = prev.isPlaying && next.isPlaying;
+  const keys = Object.keys(next) as (keyof EditorTimelineProps)[];
+  if (keys.length !== Object.keys(prev).length) return false;
+  for (const k of keys) {
+    if (prev[k] === next[k]) continue;
+    if (playing && (k === "currentTime" || typeof next[k] === "function"))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+const EditorTimeline = memo(EditorTimelineView, sameWhilePlaying);
+export default EditorTimeline;

@@ -1,13 +1,20 @@
 import { Ionicons } from "@expo/vector-icons";
+import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
-import { Pressable, StyleSheet, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
   runOnJS,
   useAnimatedStyle,
   useSharedValue,
 } from "react-native-reanimated";
-import type { TextClipData } from "../../editor/clipModel";
+import {
+  stickerFontSize,
+  textFontSize,
+  type PipClipData,
+  type StickerClipData,
+  type TextClipData,
+} from "../../editor/clipModel";
 import TextVisual from "./TextVisual";
 
 /** The video picture's rectangle inside the preview box (px). */
@@ -22,6 +29,26 @@ export type TextTransform = Pick<
   TextClipData,
   "x" | "y" | "scale" | "rotation"
 >;
+
+/** Something drawn over the video and moved on the preview: a text or a sticker. */
+export type OverlayItem =
+  | { id: string; kind: "text"; data: TextClipData }
+  | { id: string; kind: "sticker"; data: StickerClipData }
+  | {
+      id: string;
+      kind: "pip";
+      /** React key: the same for every PIP clip, so the video view stays mounted. */
+      layerKey?: string;
+      data: PipClipData;
+      /** The picture (video view / image), already sized. */
+      content: ReactNode;
+      /**
+       * Under the playhead. A PIP stays mounted a little before / after
+       * its clip (so its video view doesn't restart at the cut) — while
+       * not active it can't be touched or selected.
+       */
+      active: boolean;
+    };
 
 // Room around the selection frame for the ✕ and ↻ buttons (they must sit
 // inside the touchable area on Android).
@@ -77,7 +104,7 @@ function snapRotation(deg: number) {
  * and reported once, when the finger lifts.
  */
 export default function TextOverlay({
-  texts,
+  items,
   frame,
   selectedId,
   onSelect,
@@ -86,7 +113,8 @@ export default function TextOverlay({
   onTransform,
   onGestureActive,
 }: {
-  texts: { id: string; data: TextClipData }[];
+  /** Texts and stickers, bottom to top. */
+  items: OverlayItem[];
   frame: FrameRect | null;
   selectedId: string | null;
   onSelect: (id: string) => void;
@@ -99,14 +127,16 @@ export default function TextOverlay({
   if (!frame || frame.width <= 0 || frame.height <= 0) return null;
   return (
     <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
-      {texts.map(({ id, data }) =>
-        data.text.trim() ? (
+      {items.map((item) =>
+        item.kind !== "text" || item.data.text.trim() ? (
           <OverlayText
-            key={id}
-            id={id}
-            data={data}
+            key={item.kind === "pip" ? (item.layerKey ?? item.id) : item.id}
+            id={item.id}
+            item={item}
             frame={frame}
-            selected={id === selectedId}
+            selected={
+              item.id === selectedId && (item.kind !== "pip" || item.active)
+            }
             onSelect={onSelect}
             onEditSelected={onEditSelected}
             onDelete={onDelete}
@@ -121,7 +151,7 @@ export default function TextOverlay({
 
 function OverlayText({
   id,
-  data,
+  item,
   frame,
   selected,
   onSelect,
@@ -131,7 +161,7 @@ function OverlayText({
   onGestureActive,
 }: {
   id: string;
-  data: TextClipData;
+  item: OverlayItem;
   frame: FrameRect;
   selected: boolean;
   onSelect: (id: string) => void;
@@ -140,20 +170,43 @@ function OverlayText({
   onTransform: (id: string, t: TextTransform) => void;
   onGestureActive?: (active: boolean) => void;
 }) {
-  const fontSize = Math.max(6, data.size * frame.height * data.scale);
+  // Position / size / turn are the same fields for texts and stickers.
+  const data: TextTransform = item.data;
+  const fontSize =
+    item.kind === "text"
+      ? textFontSize(item.data, frame.width, frame.height)
+      : item.kind === "sticker"
+        ? stickerFontSize(item.data, frame.width, frame.height)
+        : 0;
+  const touchable = item.kind !== "pip" || item.active;
   // The text's measured size (unscaled by a live gesture). Used to keep the
   // whole text inside the frame even when it grew without being moved
   // (bigger size, another font, longer words, a narrower canvas): its
   // centre is pulled in just enough — the stored position is unchanged.
   const [box, setBox] = useState<{ w: number; h: number } | null>(null);
+  // A text bigger than the frame (e.g. made big in a small frame, then
+  // the frame changed) is shrunk to fit — never drawn past the frame.
+  let fit = 1;
   let shownX = data.x;
   let shownY = data.y;
   if (box) {
     const { hw, hh } = halfExtents(box.w, box.h, data.rotation);
-    shownX = clampCenter(data.x * frame.width, hw, frame.width) / frame.width;
+    if (hw > 0 && hh > 0) {
+      fit = Math.min(1, frame.width / (2 * hw), frame.height / (2 * hh));
+    }
+    shownX =
+      clampCenter(data.x * frame.width, hw * fit, frame.width) / frame.width;
     shownY =
-      clampCenter(data.y * frame.height, hh, frame.height) / frame.height;
+      clampCenter(data.y * frame.height, hh * fit, frame.height) / frame.height;
   }
+  const fitSV = useSharedValue(1);
+  useEffect(() => {
+    fitSV.set(fit);
+    if (__DEV__ && fit < 0.999)
+      console.log(
+        `[TextOverlay] ${id} bigger than the frame — shown at ${Math.round(fit * 100)}%`,
+      );
+  }, [fit, fitSV, id]);
   const cx = frame.left + shownX * frame.width;
   const cy = frame.top + shownY * frame.height;
 
@@ -206,7 +259,12 @@ function OverlayText({
     .onUpdate((e) => {
       // The whole text stays inside the frame (the exported picture):
       // the finger can go further, the text stops at the edge.
-      const { hw, hh } = halfExtents(boxWSV.value, boxHSV.value, baseRotation);
+      const f = fitSV.value;
+      const { hw, hh } = halfExtents(
+        boxWSV.value * f,
+        boxHSV.value * f,
+        baseRotation,
+      );
       const cx0 = baseX * fw;
       const cy0 = baseY * fh;
       txSV.value = clampCenter(cx0 + e.translationX, hw, fw) - cx0;
@@ -250,8 +308,23 @@ function OverlayText({
       );
     })
     .onEnd(() => {
-      const scale = clamp(baseScale * scaleSV.value, MIN_SCALE, MAX_SCALE);
       const rotation = snapRotation(baseRotation + rotSV.value);
+      // Never bigger than the frame: the largest scale at which the turned
+      // text still fits.
+      const { hw: hw1, hh: hh1 } = halfExtents(
+        boxWSV.value,
+        boxHSV.value,
+        rotation,
+      );
+      const maxK =
+        hw1 > 0 && hh1 > 0
+          ? Math.min(fw / (2 * hw1), fh / (2 * hh1))
+          : MAX_SCALE;
+      const scale = clamp(
+        baseScale * Math.min(scaleSV.value, maxK),
+        MIN_SCALE,
+        MAX_SCALE,
+      );
       // Bigger or turned, it may now stick out: move it back inside.
       const k = scale / baseScale;
       const { hw, hh } = halfExtents(
@@ -275,7 +348,7 @@ function OverlayText({
       { translateX: txSV.value },
       { translateY: tySV.value },
       { rotate: `${baseRotation + rotSV.value}deg` },
-      { scale: scaleSV.value },
+      { scale: scaleSV.value * fitSV.value },
     ],
   }));
 
@@ -292,7 +365,10 @@ function OverlayText({
         },
       ]}
     >
-      <Animated.View style={[styles.wrapper, liveStyle]}>
+      <Animated.View
+        style={[styles.wrapper, liveStyle]}
+        pointerEvents={touchable ? "auto" : "none"}
+      >
         <GestureDetector gesture={Gesture.Race(pan, tap)}>
           <View
             style={[styles.box, selected && styles.boxSelected]}
@@ -311,11 +387,25 @@ function OverlayText({
               }
             }}
           >
-            <TextVisual
-              data={data}
-              fontSize={fontSize}
-              maxWidth={frame.width * 0.92}
-            />
+            {item.kind === "pip" ? (
+              item.content
+            ) : item.kind === "text" ? (
+              <TextVisual
+                data={item.data}
+                fontSize={fontSize}
+                maxWidth={frame.width * 0.92}
+              />
+            ) : (
+              // An emoji: its own line box, no padding games needed.
+              <Text
+                style={[
+                  styles.sticker,
+                  { fontSize, lineHeight: fontSize * 1.2 },
+                ]}
+              >
+                {item.data.emoji}
+              </Text>
+            )}
           </View>
         </GestureDetector>
 
@@ -352,6 +442,7 @@ const styles = StyleSheet.create({
   },
   wrapper: { padding: BUTTON_ROOM },
   box: { borderWidth: 1, borderColor: "transparent" },
+  sticker: { textAlign: "center", paddingHorizontal: 2 },
   boxSelected: { borderColor: "#FFFFFF" },
   button: {
     position: "absolute",

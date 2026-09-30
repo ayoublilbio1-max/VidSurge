@@ -29,11 +29,16 @@ import {
   canvasOf,
   clipEnd,
   createClip,
+  createPipClip,
+  createStickerClip,
   createTextClip,
+  exportOf,
   findClip,
   findLinkedPartner,
   insertionPoint,
+  laneClips,
   newId,
+  normalizeCrop,
   normalizeRotation,
   pickLane,
   removeClips,
@@ -45,7 +50,11 @@ import {
   type CanvasSettings,
   type Clip,
   type ClipRange,
+  type CropRect,
+  type ExportSettings,
+  type PipClipData,
   type Project,
+  type StickerClipData,
   type TextClipData,
 } from "./clipModel";
 
@@ -155,9 +164,21 @@ export type ProjectAction =
       flipX: boolean;
     }
   | {
+      // Part of a video clip's picture to keep (normalized; null = all).
+      // Only this clip — a locked audio partner has no picture.
+      type: "SET_CLIP_CROP";
+      clipId: string;
+      crop: CropRect | null;
+    }
+  | {
       // Output frame shape + background (Canvas tool; whole project).
       type: "SET_CANVAS";
       canvas: CanvasSettings;
+    }
+  | {
+      // Export resolution / frame rate (the "1080P" button; whole project).
+      type: "SET_EXPORT_SETTINGS";
+      settings: ExportSettings;
     }
   | {
       // Opacity of a video clip's picture (0 = invisible, 1 = solid).
@@ -177,6 +198,30 @@ export function addTextClipAction(
   at: number,
 ): ProjectAction {
   return { type: "ADD_CLIP", clip: createTextClip(newId("text"), at, data) };
+}
+
+/** A new PIP (video or photo from the phone) at timeline time `at`. */
+export function addPipClipAction(
+  uri: string,
+  data: PipClipData,
+  duration: number,
+  at: number,
+): ProjectAction {
+  return {
+    type: "ADD_CLIP",
+    clip: createPipClip(newId("pip"), at, uri, data, duration),
+  };
+}
+
+/** A new sticker at timeline time `at` (STICKER_DEFAULT_LENGTH long). */
+export function addStickerClipAction(
+  data: StickerClipData,
+  at: number,
+): ProjectAction {
+  return {
+    type: "ADD_CLIP",
+    clip: createStickerClip(newId("sticker"), at, data),
+  };
 }
 
 /**
@@ -308,7 +353,11 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
         const start = Math.max(0, action.start);
         if (Math.abs(start - clip.start) < 1e-6) return state;
         const moved = { ...clip, start };
-        const lane = pickLane(state.tracks[clip.track], moved, clip.lane ?? 0);
+        const lane = pickLane(
+          laneClips(state, clip.track),
+          moved,
+          clip.lane ?? 0,
+        );
         return replaceClip(state, { ...moved, lane });
       }
       const partner = findLinkedPartner(state, clip);
@@ -374,7 +423,11 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
       // first row (lane) with room at that time.
       if (allowsOverlap(clip.track)) {
         const placed = { ...clip, start: Math.max(0, clip.start) };
-        const lane = pickLane(state.tracks[clip.track], placed, clip.lane ?? 0);
+        const lane = pickLane(
+          laneClips(state, clip.track),
+          placed,
+          clip.lane ?? 0,
+        );
         return addClips(state, [{ ...placed, lane }]);
       }
       const start = insertionPoint(
@@ -423,24 +476,42 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
       return replaceClip(state, { ...clip, rotate, flipX });
     }
 
+    case "SET_CLIP_CROP": {
+      const clip = findClip(state, action.clipId);
+      if (!clip || clip.track !== "video") return state;
+      const crop = normalizeCrop(action.crop);
+      if (JSON.stringify(crop) === JSON.stringify(clip.crop ?? null))
+        return state;
+      return replaceClip(state, { ...clip, crop });
+    }
+
     case "SET_CANVAS": {
       const current = canvasOf(state);
-      const next = {
+      const next: CanvasSettings = {
         ratio: action.canvas.ratio,
         background: action.canvas.background.toUpperCase(),
+        crop: normalizeCrop(action.canvas.crop ?? null),
       };
-      if (
+      const same =
         current.ratio === next.ratio &&
-        current.background.toUpperCase() === next.background
-      ) {
-        return state;
-      }
+        current.background.toUpperCase() === next.background &&
+        JSON.stringify(current.crop ?? null) === JSON.stringify(next.crop);
+      if (same) return state;
       return { ...state, canvas: next };
+    }
+
+    case "SET_EXPORT_SETTINGS": {
+      const current = exportOf(state);
+      const next = exportOf({ ...state, export: action.settings });
+      if (current.resolution === next.resolution && current.fps === next.fps)
+        return state;
+      return { ...state, export: next };
     }
 
     case "SET_CLIP_OPACITY": {
       const clip = findClip(state, action.clipId);
-      if (!clip || clip.track !== "video") return state;
+      if (!clip || (clip.track !== "video" && clip.track !== "pip"))
+        return state;
       const opacity =
         Math.round(Math.max(0, Math.min(1, action.opacity)) * 100) / 100;
       if (Math.abs(opacity - clip.opacity) < 1e-6) return state;

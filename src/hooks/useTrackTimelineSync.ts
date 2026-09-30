@@ -1,6 +1,7 @@
 import type { VideoPlayer } from "expo-video";
 import { useEffect, useRef } from "react";
 import { activeClipAt, timelineToSource, type Clip } from "../editor/clipModel";
+import { isCatchUpRate } from "./useTimelineClock";
 
 // How far ahead (timeline seconds) a gap's NEXT clip gets pre-seeked. While
 // the playhead crosses a gap, this track's player is idle, so it can be
@@ -15,14 +16,6 @@ const PREROLL_WINDOW = 1.5;
 // the parked frame is still much faster than a seek; the clock simply
 // holds the playhead until the picture catches up.
 const PREROLL_TOLERANCE = 0.3;
-// ...and how far AHEAD the player may be. While playing, `timelineTime`
-// (React) lags the real playhead by up to ~0.2s (more when the JS thread is
-// busy), and the clock starts an upcoming clip's player early — so on entry
-// the running player normally looks ahead of the stale target. Seeking it
-// back restarted the video and left it ~0.6s behind (then the drift fix
-// yanked it forward again). Within this window it's left alone; the clock,
-// which has the exact time, corrects any real difference.
-const ENTER_AHEAD_TOLERANCE = 1.0;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(value, max));
@@ -125,6 +118,8 @@ export function useTrackTimelineSync({
   const pendingSeekRef = useRef(false);
   // The clip the player was parked on during a gap (see PREROLL_WINDOW).
   const prerolledIdRef = useRef<string | null>(null);
+  // The clip + volume last applied to the player (see the volume code).
+  const lastVolumeKeyRef = useRef<string | null>(null);
   // The clip speed last applied to the player (see the rate code below).
   const appliedSpeedRef = useRef<number | null>(null);
 
@@ -162,7 +157,15 @@ export function useTrackTimelineSync({
       : volumeClip
         ? Math.max(0, Math.min(1, volumeClip.volume))
         : player.volume;
-    if (Math.abs(player.volume - volume) > 0.001) {
+    // Only when the clip (or its volume / the track mute) CHANGES — not
+    // every render. While playing, React's time is a moment behind: right
+    // after a cut, a render still sees the previous clip, and forcing its
+    // volume back undid the new clip's volume the clock had just set at the
+    // cut (100% ↔ 14% flip-flop, ~0.5s of the wrong loudness).
+    const volumeKey = `${volumeClip?.id ?? "-"}:${volume}`;
+    const volumeChanged = volumeKey !== lastVolumeKeyRef.current;
+    lastVolumeKeyRef.current = volumeKey;
+    if (volumeChanged && Math.abs(player.volume - volume) > 0.001) {
       player.volume = volume;
       if (__DEV__)
         console.log(
@@ -274,7 +277,13 @@ export function useTrackTimelineSync({
       !switchedSource &&
       (prerolled || continuing) &&
       offset >= -PREROLL_TOLERANCE &&
-      offset <= (isPlaying ? ENTER_AHEAD_TOLERANCE : PREROLL_TOLERANCE)
+      // While playing, no upper limit: `timelineTime` (React) can be 0.5s+
+      // stale on a busy dev JS thread, so a player the clock started early
+      // looks far "ahead" of it. Seeking it back to that stale time
+      // restarted it ~1s behind (PIP and music lagged 1.5–2.2s, then got
+      // yanked forward). The clock has the exact time and fixes any real
+      // difference itself.
+      (isPlaying || offset <= PREROLL_TOLERANCE)
     ) {
       wantsSeek = false;
       if (__DEV__) {
@@ -376,7 +385,13 @@ export function useTrackTimelineSync({
       // Some players forget the rate after a file switch or a seek while
       // paused (slow-motion music played at normal speed): set it again
       // right before playing.
-      if (Math.abs(player.playbackRate - active.speed) > 0.001) {
+      const rate = player.playbackRate;
+      if (player.playing && isCatchUpRate(rate, active.speed)) {
+        if (__DEV__)
+          console.log(
+            `[trackSync:${label}] rate x${rate.toFixed(2)} left alone — the clock is catching this player up`,
+          );
+      } else if (Math.abs(rate - active.speed) > 0.001) {
         if (__DEV__)
           console.log(
             `[trackSync:${label}] rate was x${player.playbackRate}, should be x${active.speed} — set again`,

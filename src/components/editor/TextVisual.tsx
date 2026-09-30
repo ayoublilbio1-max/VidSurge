@@ -71,6 +71,11 @@ export default function TextVisual({
 
   return (
     <View
+      // Draw the whole text first, then fade it as ONE picture. Without
+      // this, Android faded each layer on its own — the outline copies
+      // (and shadow) behind the letters showed through a see-through text.
+      needsOffscreenAlphaCompositing={data.opacity < 1}
+      renderToHardwareTextureAndroid={data.opacity < 1}
       style={{
         opacity: data.opacity,
         maxWidth,

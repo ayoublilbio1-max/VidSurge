@@ -182,6 +182,7 @@ export default function TextEditorSheet({
   panelHeight,
   onPatch,
   onDone,
+  onCancel,
   onHeight,
 }: {
   mode: "add" | "edit";
@@ -193,6 +194,8 @@ export default function TextEditorSheet({
   panelHeight: number;
   onPatch: (patch: Partial<TextClipData>) => void;
   onDone: () => void;
+  /** ✕ at the start of the input row: close without saving. */
+  onCancel: () => void;
   /**
    * The sheet's height WITHOUT its panel / the keyboard below it (input
    * row, tabs, paddings). The editor adds the panel height itself, which is
@@ -430,31 +433,6 @@ export default function TextEditorSheet({
           })}
         </ScrollView>
 
-        {/* Alignment (Text only) */}
-        {sub === "text" && (
-          <View style={styles.alignRow}>
-            {(["left", "center", "right"] as TextAlign[]).map((a) => (
-              <TouchableOpacity
-                key={a}
-                onPress={() => onPatch({ align: a })}
-                style={[
-                  styles.alignButton,
-                  {
-                    backgroundColor:
-                      value.align === a ? colors.accentPurple : colors.surface,
-                  },
-                ]}
-                accessibilityLabel={`Align ${a}`}
-              >
-                <AlignIcon
-                  align={a}
-                  color={value.align === a ? "#FFFFFF" : colors.textPrimary}
-                />
-              </TouchableOpacity>
-            ))}
-          </View>
-        )}
-
         {/* Sliders */}
         {subDef.sliders.map((sl) => {
           const disabled = sub !== "text" && currentColor === null;
@@ -479,6 +457,31 @@ export default function TextEditorSheet({
             </View>
           );
         })}
+
+        {/* Alignment (Text only) — below the sliders */}
+        {sub === "text" && (
+          <View style={styles.alignRow}>
+            {(["left", "center", "right"] as TextAlign[]).map((a) => (
+              <TouchableOpacity
+                key={a}
+                onPress={() => onPatch({ align: a })}
+                style={[
+                  styles.alignButton,
+                  {
+                    backgroundColor:
+                      value.align === a ? colors.accentPurple : colors.surface,
+                  },
+                ]}
+                accessibilityLabel={`Align ${a}`}
+              >
+                <AlignIcon
+                  align={a}
+                  color={value.align === a ? "#FFFFFF" : colors.textPrimary}
+                />
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
       </View>
     );
 
@@ -498,6 +501,20 @@ export default function TextEditorSheet({
       }
     >
       <View style={styles.inputRow}>
+        {/* ✕ closes without saving (a new text is dropped, an edited one
+            keeps its old words and style). */}
+        <TouchableOpacity
+          onPress={() => {
+            Keyboard.dismiss();
+            if (__DEV__) console.log("[TextEditorSheet] ✕ pressed — cancel");
+            onCancel();
+          }}
+          hitSlop={10}
+          accessibilityRole="button"
+          accessibilityLabel="Cancel"
+        >
+          <Ionicons name="close" size={28} color={colors.textPrimary} />
+        </TouchableOpacity>
         <TextInput
           value={value.text}
           onChangeText={(text: string) => onPatch({ text })}

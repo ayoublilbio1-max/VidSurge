@@ -1,7 +1,15 @@
 import { Ionicons } from "@expo/vector-icons";
-import { StyleSheet, TouchableOpacity, View } from "react-native";
+import {
+  ActivityIndicator,
+  StyleSheet,
+  TouchableOpacity,
+  View,
+} from "react-native";
 import { useTheme } from "../../hooks/useTheme";
 import AppText from "../AppText";
+
+/** The Save button's look: normal, saving (spinner), just saved (✓). */
+export type SaveState = "idle" | "saving" | "saved";
 
 interface EditorTopBarProps {
   resolution: string;
@@ -9,6 +17,8 @@ interface EditorTopBarProps {
   onHelp: () => void;
   onResolutionPress: () => void;
   onExportPress: () => void;
+  saveState: SaveState;
+  onSavePress: () => void;
 }
 
 export default function EditorTopBar({
@@ -17,6 +27,8 @@ export default function EditorTopBar({
   onHelp,
   onResolutionPress,
   onExportPress,
+  saveState,
+  onSavePress,
 }: EditorTopBarProps) {
   const colors = useTheme();
 
@@ -57,6 +69,25 @@ export default function EditorTopBar({
         </TouchableOpacity>
 
         <TouchableOpacity
+          onPress={onSavePress}
+          disabled={saveState === "saving"}
+          style={[styles.saveButton, { backgroundColor: colors.surface }]}
+          accessibilityLabel="Save project"
+        >
+          {saveState === "saving" ? (
+            <ActivityIndicator size="small" color={colors.textPrimary} />
+          ) : (
+            <Ionicons
+              name={saveState === "saved" ? "checkmark-circle" : "save-outline"}
+              size={19}
+              color={
+                saveState === "saved" ? colors.accentGreen : colors.textPrimary
+              }
+            />
+          )}
+        </TouchableOpacity>
+
+        <TouchableOpacity
           onPress={onExportPress}
           style={[
             styles.exportButton,
@@ -81,7 +112,7 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
   },
   left: { flexDirection: "row", gap: 10 },
-  right: { flexDirection: "row", alignItems: "center", gap: 10 },
+  right: { flexDirection: "row", alignItems: "center", gap: 8 },
   iconButton: {
     width: 36,
     height: 36,
@@ -94,16 +125,25 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 4,
     paddingVertical: 8,
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
     borderRadius: 12,
   },
   resolutionText: { fontSize: 13, fontFamily: "Poppins-Medium" },
+  // Icon only (save → spinner → green ✓): the bar has no room for a
+  // label on narrow phones.
+  saveButton: {
+    alignItems: "center",
+    justifyContent: "center",
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+  },
   exportButton: {
     flexDirection: "row",
     alignItems: "center",
     gap: 6,
     paddingVertical: 9,
-    paddingHorizontal: 16,
+    paddingHorizontal: 14,
     borderRadius: 12,
   },
   exportText: { color: "#FFFFFF", fontSize: 14, fontFamily: "Poppins-Bold" },
