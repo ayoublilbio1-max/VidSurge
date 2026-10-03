@@ -1,6 +1,10 @@
-// Turns the project into the export engine's plan (modules/vidsurge-engine).
+// Turns the project into the engine's plans (modules/vidsurge-engine):
+// the PREVIEW plan (what the native preview plays) and the EXPORT plan. Both
+// come from the same timeline builder below, and the native side builds
+// both with the same code (TimelineBuilder.kt) — so the export shows what
+// the preview showed.
 //
-// The plan has everything the exported video shows:
+// The export plan has everything the exported video shows:
 //   - the main video track (clips, gaps, speed, rotation, flip, crop,
 //     opacity) on the canvas colour,
 //   - the PIP clips (video or photo) with their place, size, turn and
@@ -15,6 +19,7 @@ import type {
   PlanAudioItem,
   PlanPipItem,
   PlanVideoItem,
+  PreviewPlan,
 } from "../../modules/vidsurge-engine";
 import type { OverlayItem } from "../components/editor/TextOverlay";
 import {
@@ -28,10 +33,12 @@ import {
   projectEnd,
   stickerDataOf,
   textDataOf,
+  type CanvasSettings,
   type Clip,
   type ExportSettings,
   type Project,
 } from "./clipModel";
+import { MAX_VOLUME } from "./projectReducer";
 
 const EPS = 0.01;
 
@@ -71,6 +78,125 @@ function pipLayout(clip: Clip, W: number, H: number) {
   };
 }
 
+/**
+ * Live values the preview shows before they're saved (a sheet is open):
+ * the Opacity sheet's draft, the Rotate sheet's draft, and "flat" while
+ * cropping (the whole picture, unturned, so the crop box fits it).
+ */
+export type PreviewDrafts = {
+  opacity?: { clipId: string; value: number } | null;
+  rotate?: { clipId: string; angle: number; flip: boolean } | null;
+  flat?: boolean;
+};
+
+/** The main video track: clips in order, gaps (and the tail) in the canvas colour. */
+function mainVideoItems(
+  project: Project,
+  duration: number,
+  drafts?: PreviewDrafts,
+): PlanVideoItem[] {
+  const video: PlanVideoItem[] = [];
+  let cursor = 0;
+  const clips = [...project.tracks.video].sort((a, b) => a.start - b.start);
+  for (const clip of clips) {
+    if (clip.start > cursor + EPS) {
+      video.push({ type: "gap", duration: clip.start - cursor });
+    }
+    const rotDraft =
+      drafts?.rotate && drafts.rotate.clipId === clip.id ? drafts.rotate : null;
+    const opacity =
+      drafts?.opacity && drafts.opacity.clipId === clip.id
+        ? drafts.opacity.value
+        : (clip.opacity ?? 1);
+    video.push({
+      type: "clip",
+      id: clip.id,
+      uri: clip.sourceUri,
+      sourceDuration: clip.sourceDuration,
+      trimIn: clip.trimIn,
+      trimOut: clip.trimOut,
+      speed: clip.speed,
+      rotate: drafts?.flat ? 0 : rotDraft ? rotDraft.angle : (clip.rotate ?? 0),
+      flipX: drafts?.flat ? false : rotDraft ? rotDraft.flip : !!clip.flipX,
+      opacity: Math.max(0, Math.min(1, opacity)),
+    });
+    cursor = Math.max(cursor, clipEnd(clip));
+  }
+  if (duration > cursor + EPS) {
+    video.push({ type: "gap", duration: duration - cursor });
+  }
+  return video;
+}
+
+/** Every audio clip (volume 0 too: its volume can change live in the preview). */
+function audioItems(project: Project): PlanAudioItem[] {
+  return project.tracks.audio.map((c) => ({
+    id: c.id,
+    uri: c.sourceUri,
+    sourceDuration: c.sourceDuration,
+    start: c.start,
+    trimIn: c.trimIn,
+    trimOut: c.trimOut,
+    speed: c.speed,
+    // Up to 200% (the Volume tool's maximum).
+    volume: Math.max(0, Math.min(MAX_VOLUME, c.volume)),
+  }));
+}
+
+// The preview's picture: a 720P frame (the preview view scales it to the
+// screen). Fixed, so entering / leaving fullscreen doesn't reload anything.
+const PREVIEW_SETTINGS: ExportSettings = { resolution: 720, fps: 30 };
+
+/**
+ * What the native preview plays (see PreviewPlan). `canvas` is the one on
+ * screen (with the Canvas sheet's draft, or flat while cropping). The mute
+ * button is NOT in the plan (the preview mutes live).
+ */
+export function buildPreviewPlan({
+  project,
+  canvas,
+  videoAspect,
+  drafts,
+}: {
+  project: Project;
+  canvas: CanvasSettings;
+  videoAspect: number | null;
+  drafts?: PreviewDrafts;
+}): PreviewPlan {
+  const aspect = frameAspect(canvas, videoAspect);
+  const { width, height } = exportFrameSize(PREVIEW_SETTINGS, aspect);
+  const duration = projectEnd(project);
+  return {
+    width,
+    height,
+    fps: PREVIEW_SETTINGS.fps,
+    background: canvas.background,
+    crop: canvas.crop ?? null,
+    video: mainVideoItems(project, duration, drafts),
+    // For the PIP view's sync: which clip, when, which part of the file.
+    // (Its place and size come from the app's PIP frame.)
+    pip: [...project.tracks.pip]
+      .sort((a, b) => a.start - b.start)
+      .map((c) => ({
+        id: c.id,
+        kind: pipDataOf(c).kind,
+        uri: c.sourceUri,
+        start: c.start,
+        trimIn: c.trimIn,
+        trimOut: c.trimOut,
+        speed: c.speed,
+        opacity: c.opacity,
+        cx: 0,
+        cy: 0,
+        w: 0,
+        h: 0,
+        rotation: 0,
+      })),
+    audio: audioItems(project),
+    duration,
+  };
+}
+
 export function buildExportPlan({
   project,
   settings,
@@ -91,31 +217,6 @@ export function buildExportPlan({
   const { width, height } = exportFrameSize(settings, aspect);
   const duration = projectEnd(project);
 
-  // Main video: clips in order, gaps (and the tail after the last clip, if
-  // something else goes on longer) show the canvas colour.
-  const video: PlanVideoItem[] = [];
-  let cursor = 0;
-  const clips = [...project.tracks.video].sort((a, b) => a.start - b.start);
-  for (const clip of clips) {
-    if (clip.start > cursor + EPS) {
-      video.push({ type: "gap", duration: clip.start - cursor });
-    }
-    video.push({
-      type: "clip",
-      uri: clip.sourceUri,
-      trimIn: clip.trimIn,
-      trimOut: clip.trimOut,
-      speed: clip.speed,
-      rotate: clip.rotate ?? 0,
-      flipX: !!clip.flipX,
-      opacity: Math.max(0, Math.min(1, clip.opacity ?? 1)),
-    });
-    cursor = Math.max(cursor, clipEnd(clip));
-  }
-  if (duration > cursor + EPS) {
-    video.push({ type: "gap", duration: duration - cursor });
-  }
-
   // PIP clips (silent, like in the preview).
   const pip: PlanPipItem[] = [...project.tracks.pip]
     .sort((a, b) => a.start - b.start)
@@ -123,6 +224,7 @@ export function buildExportPlan({
     .map((c) => {
       const l = pipLayout(c, width, height);
       return {
+        id: c.id,
         kind: l.kind,
         uri: c.sourceUri,
         start: c.start,
@@ -138,19 +240,6 @@ export function buildExportPlan({
       };
     });
 
-  const audio: PlanAudioItem[] = audioMuted
-    ? []
-    : project.tracks.audio
-        .filter((c) => c.volume > 0)
-        .map((c) => ({
-          uri: c.sourceUri,
-          start: c.start,
-          trimIn: c.trimIn,
-          trimOut: c.trimOut,
-          speed: c.speed,
-          volume: Math.max(0, Math.min(1, c.volume)),
-        }));
-
   return {
     outputPath,
     width,
@@ -159,11 +248,11 @@ export function buildExportPlan({
     videoBitrate: exportVideoBitrate(settings, aspect),
     background: canvas.background,
     crop: canvas.crop ?? null,
-    video,
+    video: mainVideoItems(project, duration),
     pip,
     // Filled in once the texts / stickers are drawn (OverlayRenderer).
     overlays: [],
-    audio,
+    audio: audioMuted ? [] : audioItems(project).filter((a) => a.volume > 0),
     duration,
   };
 }

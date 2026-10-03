@@ -13,6 +13,14 @@ import ColorPicker from "./ColorPicker";
 
 type Tab = "ratio" | "background";
 
+// Blur background strengths (light → strong), drawn as fainter → bolder
+// drops. Locked in the demo.
+const BLUR_LEVELS = [
+  { label: "light", size: 13, opacity: 0.55 },
+  { label: "medium", size: 16, opacity: 0.8 },
+  { label: "strong", size: 19, opacity: 1 },
+];
+
 const SWATCHES = [
   "#000000",
   "#FFFFFF",
@@ -45,6 +53,7 @@ export default function CanvasSheet({
   onChange,
   onCancel,
   onDone,
+  onLockedPress,
 }: {
   value: CanvasSettings;
   /** The video's own width ÷ height, for drawing the "Original" shape. */
@@ -52,6 +61,8 @@ export default function CanvasSheet({
   onChange: (c: CanvasSettings) => void;
   onCancel: () => void;
   onDone: () => void;
+  /** A tool that isn't in the demo (Blur background) was tapped. */
+  onLockedPress?: (label: string) => void;
 }) {
   const colors = useTheme();
   const [tab, setTab] = useState<Tab>("ratio");
@@ -157,6 +168,36 @@ export default function CanvasSheet({
         showsHorizontalScrollIndicator={false}
         contentContainerStyle={styles.row}
       >
+        {/* Blur background (a blurred copy of the video in the bars) —
+        not in the demo yet: shown locked. */}
+        {BLUR_LEVELS.map((b) => (
+          <TouchableOpacity
+            key={b.label}
+            onPress={() => {
+              if (__DEV__)
+                console.log(`[CanvasSheet] blur ${b.label} — not in the demo`);
+              onLockedPress?.("Blur background");
+            }}
+            style={[styles.blurChip, { backgroundColor: colors.surface }]}
+            accessibilityLabel={`Blur background ${b.label} (not in the demo)`}
+          >
+            <Ionicons
+              name="water"
+              size={b.size}
+              color={colors.textPrimary}
+              style={{ opacity: b.opacity }}
+            />
+            <View
+              style={[
+                styles.lockBadge,
+                { backgroundColor: colors.accentPurple },
+              ]}
+            >
+              <Ionicons name="lock-closed" size={8} color="#FFFFFF" />
+            </View>
+          </TouchableOpacity>
+        ))}
+        <View style={[styles.divider, { backgroundColor: colors.surface }]} />
         <TouchableOpacity
           onPress={() => {
             if (__DEV__) console.log("[CanvasSheet] colour picker open");
@@ -318,4 +359,22 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255,255,255,0.3)",
   },
   swatch: { width: 34, height: 34, borderRadius: 17 },
+  blurChip: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  lockBadge: {
+    position: "absolute",
+    top: -3,
+    right: -3,
+    width: 15,
+    height: 15,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  divider: { width: 1, height: 26, alignSelf: "center" },
 });

@@ -14,6 +14,8 @@
 //
 // Everything in this file is pure: no React, no players, no logging.
 
+import { defaultExport } from "../lib/appPrefs";
+
 export type TrackId =
   | "video"
   | "audio"
@@ -139,12 +141,14 @@ export const DEFAULT_EXPORT: ExportSettings = { resolution: 1080, fps: 30 };
 
 export function exportOf(project: Project): ExportSettings {
   const e = project.export;
-  if (!e) return DEFAULT_EXPORT;
+  // Not picked for this project: the app's default (Settings).
+  const fallback = defaultExport();
+  if (!e) return fallback;
   return {
     resolution: EXPORT_RESOLUTIONS.includes(e.resolution)
       ? e.resolution
-      : DEFAULT_EXPORT.resolution,
-    fps: EXPORT_FPS.includes(e.fps) ? e.fps : DEFAULT_EXPORT.fps,
+      : fallback.resolution,
+    fps: EXPORT_FPS.includes(e.fps) ? e.fps : fallback.fps,
   };
 }
 
@@ -164,7 +168,14 @@ export function exportFrameSize(
 ): { width: number; height: number } {
   const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
   const a = aspect > 0 ? aspect : 9 / 16;
-  const short = settings.resolution;
+  // The frame fits in the chosen quality's 16:9 box (1080P → 1920 × 1080,
+  // either way round): the short side is the resolution unless that makes
+  // the long side longer than the box — a thin crop (e.g. 5.4 : 1) would
+  // otherwise ask for 5840 × 1080, beyond what phone encoders can make.
+  let short: number = settings.resolution;
+  const maxLong = Math.round((settings.resolution * 16) / 9);
+  const longFor = (s: number) => (a >= 1 ? s * a : s / a);
+  if (longFor(short) > maxLong) short = a >= 1 ? maxLong / a : maxLong * a;
   return a >= 1
     ? { width: even(short * a), height: even(short) }
     : { width: even(short), height: even(short / a) };

@@ -71,6 +71,9 @@ const NO_THUMBNAILS: (string | null)[] = [];
 // The "+" (add a video at 0s) and mute buttons, stacked in the space left of
 // the ruler + video row.
 const SIDE_BUTTON = 32;
+// The "+" after the last video clip: its size and gap from the clip.
+const END_ADD_SIZE = 36;
+const END_ADD_GAP = 8;
 const LEADING_WIDTH = 60;
 const RULER_HEIGHT = 16;
 
@@ -184,6 +187,8 @@ interface EditorTimelineProps {
   onMoveClips?: (clipIds: string[], delta: number) => boolean;
   /** The "+" above the mute button: add a video from the phone at 0s. */
   onAddVideoAtStartPress?: () => void;
+  /** The "+" right after the last video clip: add a video at the end. */
+  onAddVideoAtEndPress?: () => void;
   /** A picked video is being read: the "+" shows a spinner. */
   addingVideo?: boolean;
   // The clips on each track row, sorted by start (from the project).
@@ -615,6 +620,7 @@ function EditorTimelineView({
   originalUri,
   thumbnailsBySource,
   onAddVideoAtStartPress,
+  onAddVideoAtEndPress,
   addingVideo = false,
   multiSelect = false,
   multiSelectedIds,
@@ -2195,8 +2201,17 @@ function EditorTimelineView({
   const outerRowStyle = useAnimatedStyle(() => ({
     width: totalScrollWidthSV.value,
   }));
+  // The end "+" sits just after the last video clip (follows the zoom).
+  const videoEndSV = useSyncedValue(
+    videoClips.reduce((m, c) => Math.max(m, c.start + clipLength(c)), 0),
+  );
+  const endAddStyle = useAnimatedStyle(() => ({
+    left: videoEndSV.value * pixelsPerSecondSV.value + END_ADD_GAP,
+  }));
+  // A bit wider than the timeline itself: the end "+" sits after the last
+  // video clip, and on Android a touch outside its parent never reaches it.
   const contentBlockStyle = useAnimatedStyle(() => ({
-    width: contentWidthSV.value,
+    width: contentWidthSV.value + END_ADD_GAP + END_ADD_SIZE + 8,
   }));
   const trackWidthStyle = useAnimatedStyle(() => ({
     width: contentWidthSV.value,
@@ -2457,6 +2472,43 @@ function EditorTimelineView({
                               />
                             </TimelineClipBox>
                           ))}
+                          {/* "+": a video from the phone, after the last video clip. */}
+                          {onAddVideoAtEndPress && (
+                            <Animated.View
+                              style={[styles.endAddWrap, endAddStyle]}
+                            >
+                              <TouchableOpacity
+                                onPress={() => {
+                                  if (__DEV__)
+                                    console.log(
+                                      "[EditorTimeline] end + tapped — add a video after the last clip",
+                                    );
+                                  onAddVideoAtEndPress();
+                                }}
+                                disabled={addingVideo}
+                                accessibilityRole="button"
+                                accessibilityLabel="Add a video at the end"
+                                hitSlop={6}
+                                style={[
+                                  styles.endAddButton,
+                                  { backgroundColor: colors.accentPurple },
+                                ]}
+                              >
+                                {addingVideo ? (
+                                  <ActivityIndicator
+                                    size="small"
+                                    color="#FFFFFF"
+                                  />
+                                ) : (
+                                  <Ionicons
+                                    name="add"
+                                    size={22}
+                                    color="#FFFFFF"
+                                  />
+                                )}
+                              </TouchableOpacity>
+                            </Animated.View>
+                          )}
                         </View>
 
                         {audioClips.length === 0 ? (
@@ -2849,6 +2901,18 @@ const styles = StyleSheet.create({
   clipRow: {
     height: TRACK_HEIGHT,
     marginTop: TRACK_GAP,
+  },
+  endAddWrap: {
+    position: "absolute",
+    top: (TRACK_HEIGHT - END_ADD_SIZE) / 2,
+    zIndex: 5,
+  },
+  endAddButton: {
+    width: END_ADD_SIZE,
+    height: END_ADD_SIZE,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
   },
   emptyTrackRow: {
     height: TRACK_HEIGHT,

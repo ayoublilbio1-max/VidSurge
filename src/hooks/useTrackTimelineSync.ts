@@ -212,9 +212,17 @@ export function useTrackTimelineSync({
       // In a gap while playing: park the player on the next clip's start.
       if (isPlaying && !holdSeeks) {
         const nextClip = clips.find((c) => c.start > timelineTime);
+        // A next clip from ANOTHER file is loaded right away (the player is
+        // idle anyway): switching files + the first seek took ~1.5s in the
+        // dev build, so loading it only 1.5s ahead started that clip ~1s
+        // late (videos from two files alternate on the two players).
+        const needsOtherFile =
+          nextClip !== undefined &&
+          !!nextClip.sourceUri &&
+          nextClip.sourceUri !== loadedUriRef.current;
         if (
           nextClip &&
-          nextClip.start - timelineTime <= PREROLL_WINDOW &&
+          (nextClip.start - timelineTime <= PREROLL_WINDOW || needsOtherFile) &&
           prerolledIdRef.current !== nextClip.id
         ) {
           prerolledIdRef.current = nextClip.id;

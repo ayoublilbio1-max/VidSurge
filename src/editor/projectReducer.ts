@@ -111,6 +111,22 @@ export type ProjectAction =
     }
   | {
       /**
+       * The "+" at the end of the video row: a new video from the phone goes
+       * right after the last video clip — with its sound in the audio row at
+       * the same time. Nothing already in the project moves. If music is
+       * already there, the music stays: the new sound is shortened to the
+       * free space (and then not locked to the picture), or left out when
+       * there's no room at all.
+       */
+      type: "INSERT_VIDEO_AT_END";
+      sourceUri: string;
+      sourceDuration: number;
+      videoClipId: string;
+      audioClipId: string;
+      linkId: string;
+    }
+  | {
+      /**
        * A trim or a move from the timeline. Carries the clip's full new
        * range (start + trim points), exactly what the gesture committed.
        * If the clip is linked, its partner gets the same range (locked
@@ -406,6 +422,36 @@ export function insertVideoAtStartAction(
   };
 }
 
+/** A video from the phone put after the last video clip (INSERT_VIDEO_AT_END). */
+export function insertVideoAtEndAction(
+  sourceUri: string,
+  sourceDuration: number,
+): ProjectAction {
+  return {
+    type: "INSERT_VIDEO_AT_END",
+    sourceUri,
+    sourceDuration,
+    videoClipId: newId("video"),
+    audioClipId: newId("audio"),
+    linkId: newId("link"),
+  };
+}
+
+/**
+ * Where the "+ at the end" video's sound goes in the audio row: its start
+ * and how long it can be there without touching another audio clip
+ * (0 = no room at its start).
+ */
+export function freeAudioRoom(project: Project, start: number): number {
+  let room = Infinity;
+  for (const c of project.tracks.audio) {
+    const end = clipEnd(c);
+    if (c.start <= start + 0.001 && end > start + 0.001) return 0;
+    if (c.start > start + 0.001) room = Math.min(room, c.start - start);
+  }
+  return room;
+}
+
 /** Split the clip at timeline time `at` (see SPLIT_CLIP). */
 export function splitClipAction(clipId: string, at: number): ProjectAction {
   return {
@@ -522,6 +568,65 @@ export function projectReducer(state: Project, action: ProjectAction): Project {
         createClip({ ...common, id: action.videoClipId, track: "video" }),
         createClip({ ...common, id: action.audioClipId, track: "audio" }),
       ]);
+    }
+
+    case "INSERT_VIDEO_AT_END": {
+      const length = action.sourceDuration;
+      if (!(length > 0) || findClip(state, action.videoClipId)) return state;
+      const start = state.tracks.video.reduce(
+        (m, c) => Math.max(m, clipEnd(c)),
+        0,
+      );
+      const common = {
+        sourceUri: action.sourceUri,
+        sourceDuration: action.sourceDuration,
+        start,
+        trimIn: 0,
+      };
+      const room = freeAudioRoom(state, start);
+      const added: Clip[] = [];
+      if (room >= length - 0.001) {
+        // The audio row is free: picture and sound locked together.
+        added.push(
+          createClip({
+            ...common,
+            id: action.videoClipId,
+            track: "video",
+            linkId: action.linkId,
+            trimOut: length,
+          }),
+          createClip({
+            ...common,
+            id: action.audioClipId,
+            track: "audio",
+            linkId: action.linkId,
+            trimOut: length,
+          }),
+        );
+      } else {
+        added.push(
+          createClip({
+            ...common,
+            id: action.videoClipId,
+            track: "video",
+            linkId: null,
+            trimOut: length,
+          }),
+        );
+        // Music already there: the sound only fills the free part.
+        if (room >= MIN_FIT_ROOM) {
+          added.push(
+            createClip({
+              ...common,
+              id: action.audioClipId,
+              track: "audio",
+              linkId: null,
+              trimOut: room,
+            }),
+          );
+        }
+      }
+      return addClips(state, added);
     }
 
     case "UPDATE_CLIP_RANGE": {

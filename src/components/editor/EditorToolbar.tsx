@@ -53,6 +53,7 @@ const PROJECT_TOOLS: EditorTool[] = [
   { key: "addText", icon: "text-outline", label: "Add text" },
   { key: "stickers", icon: "happy-outline", label: "Stickers" },
   { key: "pip", icon: "copy-outline", label: "PIP" },
+  { key: "blurArea", icon: "scan-outline", label: "Blur area", demoOnly: true },
   {
     key: "voiceRecord",
     icon: "mic-outline",
@@ -100,6 +101,7 @@ const PICTURE_TOOLS: EditorTool[] = [
     demoOnly: true,
   },
   { key: "opacity", icon: "contrast-outline", label: "Opacity" },
+  { key: "blur", icon: "water-outline", label: "Blur", demoOnly: true },
   {
     key: "reverse",
     icon: "play-back-outline",

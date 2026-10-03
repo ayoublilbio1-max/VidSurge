@@ -11,7 +11,7 @@ import {
   View,
 } from "react-native";
 import AppText from "../../components/AppText";
-import ComingSoonModal from "../../components/ComingSoonModal";
+import DemoFeatureModal from "../../components/editor/DemoFeatureModal";
 import EditScreenSkeleton from "../../components/EditScreenSkeleton";
 import GradientActionCard from "../../components/GradientActionCard";
 import ProjectOptionsModal from "../../components/ProjectOptionsModal";
@@ -77,7 +77,8 @@ function formatEdited(time: number): string {
 
 export default function EditScreen() {
   const colors = useTheme();
-  const [comingSoonVisible, setComingSoonVisible] = useState(false);
+  // Features not in the demo ("Edit photo", "Collage", "Convert video to MP3").
+  const [demoFeature, setDemoFeature] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [projects, setProjects] = useState<ProjectItem[]>([]);
   // The project whose Rename / Delete menu is open.
@@ -154,7 +155,7 @@ export default function EditScreen() {
   const handleConvertToMp3 = () => {
     if (__DEV__) console.log("[edit] convert video to MP3 pressed");
     // TODO: pick a video, extract audio, save as MP3 (needs native module).
-    setComingSoonVisible(true);
+    setDemoFeature("Convert video to MP3");
   };
 
   if (loading) {
@@ -190,12 +191,20 @@ export default function EditScreen() {
           <GradientActionCard
             icon="image-outline"
             label="Edit photo"
-            onPress={() => setComingSoonVisible(true)}
+            onPress={() => {
+              if (__DEV__)
+                console.log("[edit] Edit photo pressed — not in the demo");
+              setDemoFeature("Edit photo");
+            }}
           />
           <GradientActionCard
             icon="grid-outline"
             label="Collage"
-            onPress={() => setComingSoonVisible(true)}
+            onPress={() => {
+              if (__DEV__)
+                console.log("[edit] Collage pressed — not in the demo");
+              setDemoFeature("Collage");
+            }}
           />
         </View>
 
@@ -378,9 +387,9 @@ export default function EditScreen() {
         onClose={() => setSortOpen(false)}
       />
 
-      <ComingSoonModal
-        visible={comingSoonVisible}
-        onClose={() => setComingSoonVisible(false)}
+      <DemoFeatureModal
+        feature={demoFeature}
+        onClose={() => setDemoFeature(null)}
       />
     </View>
   );

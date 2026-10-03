@@ -27,6 +27,11 @@ const TAB_CONFIG: { [key: string]: TabConfigItem } = {
     stroke: require("../../assets/icons/edit_icon.webp"),
     label: "Edit",
   },
+  lib: {
+    solid: require("../../assets/icons/lib_solid_icon.webp"),
+    stroke: require("../../assets/icons/lib_stroke_icon.webp"),
+    label: "Lib",
+  },
   exports: {
     solid: require("../../assets/icons/export_solid_icon.webp"),
     stroke: require("../../assets/icons/export_stroke_icon.webp"),
@@ -46,6 +51,18 @@ const DOT_SIZE = 8;
 
 export default function CustomTabBar({ state, navigation }: CustomTabBarProps) {
   const colors = useTheme();
+
+  // A screen file in (tabs) without an entry in TAB_CONFIG would crash the bar
+  // (that's what happened when lib.tsx was added) — log it in dev instead.
+  if (__DEV__) {
+    for (const r of state.routes) {
+      if (!TAB_CONFIG[r.name])
+        console.log(
+          `[CustomTabBar] no TAB_CONFIG entry for route "${r.name}" — add one`,
+        );
+    }
+  }
+
   const slotWidth = BAR_WIDTH / state.routes.length;
 
   const dotPosition = useRef(new Animated.Value(state.index)).current;
@@ -84,6 +101,7 @@ export default function CustomTabBar({ state, navigation }: CustomTabBarProps) {
         {state.routes.map((route: any, index: number) => {
           const isActive = index === state.index;
           const config = TAB_CONFIG[route.name];
+          if (!config) return null;
           const tint = isActive ? colors.accentPurple : colors.textMuted;
           const source = isActive ? config.solid : config.stroke;
 

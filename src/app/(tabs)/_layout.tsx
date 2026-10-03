@@ -8,6 +8,7 @@ export default function TabsLayout() {
       screenOptions={{ headerShown: false }}
     >
       <Tabs.Screen name="edit" />
+      <Tabs.Screen name="lib" />
       <Tabs.Screen name="exports" />
       <Tabs.Screen name="settings" />
     </Tabs>

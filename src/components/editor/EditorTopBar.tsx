@@ -17,6 +17,8 @@ interface EditorTopBarProps {
   onHelp: () => void;
   onResolutionPress: () => void;
   onExportPress: () => void;
+  /** Long press on Export (dev builds): the engine test. */
+  onExportLongPress?: () => void;
   saveState: SaveState;
   onSavePress: () => void;
 }
@@ -27,6 +29,7 @@ export default function EditorTopBar({
   onHelp,
   onResolutionPress,
   onExportPress,
+  onExportLongPress,
   saveState,
   onSavePress,
 }: EditorTopBarProps) {
@@ -89,6 +92,7 @@ export default function EditorTopBar({
 
         <TouchableOpacity
           onPress={onExportPress}
+          onLongPress={onExportLongPress}
           style={[
             styles.exportButton,
             { backgroundColor: colors.accentPurple },

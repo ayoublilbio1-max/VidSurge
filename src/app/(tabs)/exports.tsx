@@ -16,6 +16,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import AppText from "../../components/AppText";
+import ConfirmModal from "../../components/ConfirmModal";
 import { useTheme } from "../../hooks/useTheme";
 import {
   deleteExport,
@@ -117,23 +118,13 @@ async function saveToGallery(item: ExportItem): Promise<boolean> {
   }
 }
 
+// Delete asks first, in the app's own modal (ConfirmModal, shown by the
+// Exports screen). The viewer and the ⋮ menu call confirmDelete.
+type DeleteRequest = { item: ExportItem; onDeleted?: () => void };
+let showDeleteConfirm: ((req: DeleteRequest) => void) | null = null;
+
 function confirmDelete(item: ExportItem, onDeleted?: () => void) {
-  Alert.alert(
-    "Delete this export?",
-    item.inGallery
-      ? "It's removed from Exports. The copy in your gallery stays."
-      : "It's removed from the app. It isn't in your gallery, so it will be gone.",
-    [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Delete",
-        style: "destructive",
-        onPress: () => {
-          void deleteExport(item.id).then(() => onDeleted?.());
-        },
-      },
-    ],
-  );
+  showDeleteConfirm?.({ item, onDeleted });
 }
 
 export default function ExportsScreen() {
@@ -143,6 +134,15 @@ export default function ExportsScreen() {
   // The export playing in the viewer / whose menu is open.
   const [playing, setPlaying] = useState<ExportItem | null>(null);
   const [optionsFor, setOptionsFor] = useState<ExportItem | null>(null);
+  const [deleteRequest, setDeleteRequest] = useState<DeleteRequest | null>(
+    null,
+  );
+  useEffect(() => {
+    showDeleteConfirm = setDeleteRequest;
+    return () => {
+      showDeleteConfirm = null;
+    };
+  }, []);
 
   const refresh = useCallback(async () => {
     const list = await loadExports();
@@ -317,6 +317,25 @@ export default function ExportsScreen() {
       )}
 
       <ExportOptions item={optionsFor} onClose={() => setOptionsFor(null)} />
+
+      <ConfirmModal
+        visible={deleteRequest !== null}
+        title="Delete this export?"
+        message={
+          deleteRequest?.item.inGallery
+            ? "It's removed from Exports. The copy in your gallery stays."
+            : "It's removed from the app. It isn't in your gallery, so it will be gone."
+        }
+        onCancel={() => setDeleteRequest(null)}
+        onConfirm={() => {
+          const req = deleteRequest;
+          setDeleteRequest(null);
+          if (!req) return;
+          if (__DEV__)
+            console.log(`[exports] delete ${req.item.id} (confirmed)`);
+          void deleteExport(req.item.id).then(() => req.onDeleted?.());
+        }}
+      />
     </View>
   );
 }

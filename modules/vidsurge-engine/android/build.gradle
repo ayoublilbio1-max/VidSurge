@@ -22,6 +22,8 @@ android {
 }
 
 dependencies {
+  // The preview player (PIP) — already in the app through expo-video.
+  implementation "androidx.media3:media3-exoplayer:$media3Version"
   implementation "androidx.media3:media3-transformer:$media3Version"
   implementation "androidx.media3:media3-effect:$media3Version"
   implementation "androidx.media3:media3-common:$media3Version"

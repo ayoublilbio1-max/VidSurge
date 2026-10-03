@@ -1,13 +1,12 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useEffect, useState } from "react";
 import {
-    Alert,
-    Modal,
-    Pressable,
-    StyleSheet,
-    TextInput,
-    TouchableOpacity,
-    View,
+  Modal,
+  Pressable,
+  StyleSheet,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { useTheme } from "../hooks/useTheme";
 import type { ProjectItem } from "../lib/projectsStorage";
@@ -15,7 +14,8 @@ import AppText from "./AppText";
 
 /**
  * Long press / ⋮ on a recent project: Rename or Delete it.
- * Rename switches the card to a text field; Delete asks first.
+ * Rename switches the card to a text field; Delete asks first, in the same
+ * card (the app's own look, not the phone's alert).
  */
 export default function ProjectOptionsModal({
   project,
@@ -30,30 +30,21 @@ export default function ProjectOptionsModal({
   onDelete: (id: string) => void;
 }) {
   const colors = useTheme();
-  const [renaming, setRenaming] = useState(false);
+  const [mode, setMode] = useState<"menu" | "rename" | "delete">("menu");
   const [name, setName] = useState("");
 
   // Fresh state every time it opens.
   useEffect(() => {
-    setRenaming(false);
+    setMode("menu");
     setName(project?.name ?? "");
   }, [project?.id]);
 
   if (!project) return null;
 
   const confirmDelete = () => {
-    Alert.alert(
-      "Delete project?",
-      `"${project.name}" will be deleted. This can't be undone.`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Delete",
-          style: "destructive",
-          onPress: () => onDelete(project.id),
-        },
-      ],
-    );
+    if (__DEV__)
+      console.log(`[ProjectOptionsModal] delete confirmed — ${project.id}`);
+    onDelete(project.id);
   };
 
   const submitRename = () => {
@@ -68,7 +59,56 @@ export default function ProjectOptionsModal({
         <Pressable
           style={[styles.card, { backgroundColor: colors.background }]}
         >
-          {renaming ? (
+          {mode === "delete" ? (
+            <>
+              <View
+                style={[
+                  styles.dangerIcon,
+                  { backgroundColor: "rgba(255,90,95,0.14)" },
+                ]}
+              >
+                <Ionicons name="trash-outline" size={24} color="#FF5A5F" />
+              </View>
+              <AppText
+                style={[
+                  styles.title,
+                  styles.centered,
+                  { color: colors.textPrimary },
+                ]}
+              >
+                Delete project?
+              </AppText>
+              <AppText
+                style={[
+                  styles.message,
+                  styles.centered,
+                  { color: colors.textMuted },
+                ]}
+              >
+                {`"${project.name}" will be deleted. This can't be undone.`}
+              </AppText>
+              <View style={styles.buttonsRow}>
+                <TouchableOpacity
+                  onPress={() => setMode("menu")}
+                  style={[styles.button, { backgroundColor: colors.surface }]}
+                >
+                  <AppText
+                    style={[styles.buttonText, { color: colors.textPrimary }]}
+                  >
+                    Cancel
+                  </AppText>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={confirmDelete}
+                  style={[styles.button, { backgroundColor: "#FF5A5F" }]}
+                >
+                  <AppText style={[styles.buttonText, { color: "#FFFFFF" }]}>
+                    Delete
+                  </AppText>
+                </TouchableOpacity>
+              </View>
+            </>
+          ) : mode === "rename" ? (
             <>
               <AppText style={[styles.title, { color: colors.textPrimary }]}>
                 Rename project
@@ -93,7 +133,7 @@ export default function ProjectOptionsModal({
               />
               <View style={styles.buttonsRow}>
                 <TouchableOpacity
-                  onPress={() => setRenaming(false)}
+                  onPress={() => setMode("menu")}
                   style={[styles.button, { backgroundColor: colors.surface }]}
                 >
                   <AppText
@@ -129,7 +169,7 @@ export default function ProjectOptionsModal({
               </AppText>
               <TouchableOpacity
                 style={[styles.option, { backgroundColor: colors.surface }]}
-                onPress={() => setRenaming(true)}
+                onPress={() => setMode("rename")}
               >
                 <Ionicons
                   name="create-outline"
@@ -144,7 +184,7 @@ export default function ProjectOptionsModal({
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.option, { backgroundColor: colors.surface }]}
-                onPress={confirmDelete}
+                onPress={() => setMode("delete")}
               >
                 <Ionicons name="trash-outline" size={20} color="#FF5A5F" />
                 <AppText style={[styles.optionText, { color: "#FF5A5F" }]}>
@@ -175,6 +215,16 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   title: { fontSize: 17, fontFamily: "Poppins-Bold", marginBottom: 4 },
+  centered: { textAlign: "center" },
+  message: { fontSize: 14, lineHeight: 20, marginBottom: 4 },
+  dangerIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    alignItems: "center",
+    justifyContent: "center",
+    alignSelf: "center",
+  },
   option: {
     flexDirection: "row",
     alignItems: "center",

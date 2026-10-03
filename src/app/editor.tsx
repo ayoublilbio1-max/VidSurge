@@ -3,9 +3,15 @@ import * as DocumentPicker from "expo-document-picker";
 import { File, Paths } from "expo-file-system";
 import * as ImagePicker from "expo-image-picker";
 import { router, useLocalSearchParams } from "expo-router";
-import { useVideoPlayer, VideoView } from "expo-video";
 import * as VideoThumbnails from "expo-video-thumbnails";
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -13,6 +19,7 @@ import {
   BackHandler,
   Image,
   Keyboard,
+  PixelRatio,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -26,8 +33,16 @@ import Animated, {
 } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import {
+  engineVersion,
+  getNativePipView,
+  getNativePreviewView,
   isEngineAvailable,
+  REQUIRED_ENGINE_VERSION,
+  unsupportedByEngine,
+  videoThumbnails,
   type ExportPlan,
+  type PipViewHandle,
+  type PreviewHandle,
 } from "../../modules/vidsurge-engine";
 import AppText from "../components/AppText";
 import ComingSoonModal from "../components/ComingSoonModal";
@@ -49,6 +64,7 @@ import EditorTopBar, {
 } from "../components/editor/EditorTopBar";
 import ExportModal from "../components/editor/ExportModal";
 import ExportSettingsSheet from "../components/editor/ExportSettingsSheet";
+import LibPickerSheet from "../components/editor/LibPickerSheet";
 import MultiSelectBar from "../components/editor/MultiSelectBar";
 import OverlayRenderer, {
   type OverlayJob,
@@ -88,7 +104,6 @@ import {
   pipSize,
   projectEnd,
   resolutionLabel,
-  splitIntoPlayerSlots,
   stickerDataOf,
   textDataOf,
   timelineToSource,
@@ -101,7 +116,11 @@ import {
   type Project,
   type TextClipData,
 } from "../editor/clipModel";
-import { buildExportPlan, overlaySegments } from "../editor/exportPlan";
+import {
+  buildExportPlan,
+  buildPreviewPlan,
+  overlaySegments,
+} from "../editor/exportPlan";
 import { preloadAllFonts, useFontsVersion } from "../editor/fonts";
 import { createHistory, historyReducer } from "../editor/history";
 import { probeDuration } from "../editor/mediaProbe";
@@ -112,19 +131,132 @@ import {
   addTextClipAction,
   duplicateClipAction,
   duplicateClipsAction,
+  freeAudioRoom,
   initSourceAction,
+  insertVideoAtEndAction,
   insertVideoAtStartAction,
   projectReducer,
   splitClipAction,
   type ProjectAction,
 } from "../editor/projectReducer";
+import { useNativeClock } from "../hooks/useNativeClock";
 import { useTheme } from "../hooks/useTheme";
-import { useTimelineClock, type ClockTrack } from "../hooks/useTimelineClock";
-import { useTrackTimelineSync } from "../hooks/useTrackTimelineSync";
+import { runEngineDiagnostics } from "../lib/engineDiagnostics";
+import { loadLibrary, type LibItem, type LibKind } from "../lib/libraryStorage";
 import { hasContent, loadProject, saveProject } from "../lib/projectsStorage";
 
 const THUMBNAIL_COUNT = 20;
 const THUMBNAIL_CONCURRENCY = 3;
+// Thumbnail height in pixels (the timeline's video row is 56 dp tall).
+const THUMBNAIL_HEIGHT_PX = Math.min(200, Math.round(56 * PixelRatio.get()));
+
+type ThumbSet = { uris: (string | null)[]; width: number; height: number };
+
+function thumbTimesMs(lengthSec: number): number[] {
+  return Array.from({ length: THUMBNAIL_COUNT }, (_, i) =>
+    Math.floor((((i + 0.5) * lengthSec) / THUMBNAIL_COUNT) * 1000),
+  );
+}
+
+/**
+ * The video's picture size (upright), right away: the engine reads ONE
+ * frame at 0 s (a keyframe — fast). null = not available (old app build).
+ */
+async function quickVideoSize(
+  uri: string,
+): Promise<{ width: number; height: number } | null> {
+  try {
+    const r = await videoThumbnails(uri, [0], THUMBNAIL_HEIGHT_PX);
+    if (r && r.width > 0 && r.height > 0)
+      return { width: r.width, height: r.height };
+  } catch {
+    // the thumbnails below give it too
+  }
+  return null;
+}
+
+/**
+ * Fast filmstrip (expo-video-thumbnails: nearest keyframe of each of the
+ * 20 pieces). Shown first.
+ */
+async function quickThumbnails(
+  uri: string,
+  lengthSec: number,
+): Promise<ThumbSet> {
+  const timesMs = thumbTimesMs(lengthSec);
+  const results: (string | null)[] = new Array(THUMBNAIL_COUNT).fill(null);
+  let width = 0;
+  let height = 0;
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= THUMBNAIL_COUNT) return;
+      try {
+        const shot = await VideoThumbnails.getThumbnailAsync(uri, {
+          time: timesMs[i],
+        });
+        results[i] = shot.uri;
+        if (i === 0) {
+          width = shot.width;
+          height = shot.height;
+        }
+      } catch {
+        results[i] = null;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: THUMBNAIL_CONCURRENCY }, () => worker()),
+  );
+  return { uris: results, width, height };
+}
+
+/**
+ * The EXACT frames (read by the engine; slower — each one is decoded from
+ * the keyframe before it). Swapped in after the fast filmstrip.
+ * null = not available (old app build) or failed.
+ */
+async function exactThumbnails(
+  uri: string,
+  lengthSec: number,
+): Promise<(string | null)[] | null> {
+  try {
+    const r = await videoThumbnails(
+      uri,
+      thumbTimesMs(lengthSec),
+      THUMBNAIL_HEIGHT_PX,
+    );
+    if (r && r.uris.some(Boolean)) return r.uris;
+  } catch (e) {
+    if (__DEV__)
+      console.log(
+        "[editor] exact thumbnails failed — keeping the fast ones",
+        e,
+      );
+  }
+  return null;
+}
+
+/** A Lib item in the shape of a picked gallery file (uri, ms length, size). */
+function libAsset(item: LibItem) {
+  return {
+    uri: item.uri,
+    type: item.kind === "image" ? ("image" as const) : ("video" as const),
+    duration: item.kind === "image" ? null : item.duration * 1000,
+    width: item.width,
+    height: item.height,
+    fileName: item.name,
+  };
+}
+
+/** The exact frames where they exist, the fast ones elsewhere. */
+function mergeThumbs(
+  fast: (string | null)[],
+  exact: (string | null)[],
+): (string | null)[] {
+  return fast.map((f, i) => exact[i] ?? f);
+}
 
 function clampJS(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(value, max));
@@ -138,41 +270,6 @@ function summarizeProject(project: Project): string {
     },
   );
   return `end ${projectEnd(project).toFixed(2)}s, canvas ${describeCanvas(canvasOf(project))}, export ${describeExport(exportOf(project))}\n${lines.join("\n")}`;
-}
-
-/**
- * Where a cropped picture goes in a canvas of cw × ch: the kept part (crop,
- * normalized) is fitted whole and centred — dw × dh at (left, top) — and
- * the whole picture is fw × fh, shifted by (ox, oy) inside that window.
- * No crop = the plain fitted picture. `va` = the video's width ÷ height.
- */
-function cropLayout(crop: CropRect, va: number, cw: number, ch: number) {
-  "worklet";
-  if (!(va > 0) || cw <= 0 || ch <= 0) {
-    return { dw: cw, dh: ch, left: 0, top: 0, fw: cw, fh: ch, ox: 0, oy: 0 };
-  }
-  const ca = (crop.w * va) / crop.h;
-  let dw: number;
-  let dh: number;
-  if (ca > cw / ch) {
-    dw = cw;
-    dh = cw / ca;
-  } else {
-    dh = ch;
-    dw = ch * ca;
-  }
-  const fw = dw / crop.w;
-  const fh = dh / crop.h;
-  return {
-    dw,
-    dh,
-    left: (cw - dw) / 2,
-    top: (ch - dh) / 2,
-    fw,
-    fh,
-    ox: -crop.x * fw,
-    oy: -crop.y * fh,
-  };
 }
 
 // Export resolutions not in the demo build (lock + "not in the demo").
@@ -194,25 +291,9 @@ const DEMO_ONLY_TOOLS: Record<string, string> = {
   effects: "Effects",
   filter: "Filter",
   reverse: "Reverse",
+  blur: "Blur",
+  blurArea: "Blur area",
 };
-
-/**
- * Run a call on a video player, ignoring "already released" errors. Leaving
- * the editor while playing releases the players; the timeline clock's
- * clean-up (and a late timer) still paused them → "Cannot use shared object
- * that was already released" red screen.
- */
-function safePlayer<T>(fn: () => T, fallback: T, what: string): T {
-  try {
-    return fn();
-  } catch (e) {
-    if (__DEV__)
-      console.log(
-        `[editor] player ${what} skipped — player already released (${String(e).slice(0, 80)})`,
-      );
-    return fallback;
-  }
-}
 
 /** Absolute position style for a rect inside the preview box. */
 function frameStyle(r: FrameRect) {
@@ -243,32 +324,6 @@ function containRect(box: FrameRect, aspect: number): FrameRect {
     width: w,
     height: box.height,
   };
-}
-
-/**
- * Transform for a rotated / flipped picture. It is turned about its centre
- * and shrunk just enough to stay whole inside the canvas — like CapCut,
- * nothing is cut off; the canvas background shows around it.
- */
-function pictureTransform(
-  deg: number,
-  flip: number,
-  w: number,
-  h: number,
-  cw: number,
-  ch: number,
-) {
-  "worklet";
-  // w × h = the picture (already fitted in the canvas), cw × ch = the
-  // canvas. Turned, its bounding box must still fit in the canvas.
-  let fit = 1;
-  if (deg !== 0 && w > 0 && h > 0 && cw > 0 && ch > 0) {
-    const rad = (deg * Math.PI) / 180;
-    const c = Math.abs(Math.cos(rad));
-    const sn = Math.abs(Math.sin(rad));
-    fit = Math.min(1, cw / (w * c + h * sn), ch / (w * sn + h * c));
-  }
-  return [{ rotate: `${deg}deg` }, { scaleX: fit * flip }, { scaleY: fit }];
 }
 
 // How long the mute button shows its spinner before the mute applies.
@@ -312,9 +367,8 @@ export default function EditorScreen() {
   const flashClips = (ids: string[]) =>
     setFlash((f) => ({ ids, token: f.token + 1 }));
   const [isPlaying, setIsPlaying] = useState(false);
-  // True while the user is dragging/flinging the timeline. The audio
-  // player's seeks are held back during this (see useTrackTimelineSync's
-  // `holdSeeks`) and done once, exactly, on release.
+  // True while the user is dragging/flinging the timeline (the preview is
+  // in scrubbing mode meanwhile).
   const [isScrubbing, setIsScrubbing] = useState(false);
   const [duration, setDuration] = useState(0);
   const [thumbnails, setThumbnails] = useState<(string | null)[]>([]);
@@ -362,21 +416,15 @@ export default function EditorScreen() {
   const lastSavedRef = useRef<Project | null>(null);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   // Capture in progress: the preview is briefly laid out for the picture
-  // (see handleCapture) — `shotHiddenSlot` is the video player that isn't
-  // on screen, moved out of the picture while it's taken.
+  // (see handleCapture).
   const [shotMode, setShotMode] = useState(false);
-  const [shotHiddenSlot, setShotHiddenSlot] = useState<number | null>(null);
   const captureFrameRef = useRef<any>(null);
-  // Capture, step 2: each video on screen replaced for a moment by a still
-  // picture of itself (see handleCapture). Uri per layer, or null.
+  // Capture, step 2: the native pictures (main video, PIP video) replaced
+  // for a moment by a still of themselves (see handleCapture).
   const [frozen, setFrozen] = useState<{
-    a?: string;
-    b?: string;
+    main?: string;
     pip?: string;
   } | null>(null);
-  const picARef = useRef<any>(null);
-  const picBRef = useRef<any>(null);
-  const pipPicRef = useRef<any>(null);
   // Resolves when the still pictures have loaded.
   const frozenLoadRef = useRef<{ left: number; done: (() => void) | null }>({
     left: 0,
@@ -518,166 +566,47 @@ export default function EditorScreen() {
     if (__DEV__) console.log(`[project] now: ${summarizeProject(project)}`);
   }, [project]);
 
-  // ---- Players -------------------------------------------------------
-  // Two players per track that take turns: consecutive clips on a track
-  // alternate between player A and player B. While one plays the current
-  // clip, the other is already parked on the next clip's first frame and
-  // started early, so a cut (a split point, reordered parts) needs no seek
-  // — we just switch which player you see / hear. With one player per
-  // track, every cut to a different part of the source was a 0.2–0.5s seek
-  // (a hitch, then drift corrections).
-  //
-  // Video players: their own embedded audio is muted permanently — sound
-  // only ever comes from the audio players, which is what lets the audio
-  // track sit at different timeline positions than the video.
-  const videoPlayerA = useVideoPlayer(videoUri ?? "", (p) => {
-    p.loop = false;
-    p.timeUpdateEventInterval = 0.2;
-    p.muted = true;
-  });
-  const videoPlayerB = useVideoPlayer(videoUri ?? "", (p) => {
-    p.loop = false;
-    p.timeUpdateEventInterval = 0.2;
-    p.muted = true;
-  });
-  // Audio-only instances of the same file (no <VideoView> attached —
-  // expo-video can decode/play just the audio).
-  const audioPlayerA = useVideoPlayer(videoUri ?? "", (p) => {
-    p.loop = false;
-    p.timeUpdateEventInterval = 0.2;
-  });
-  const audioPlayerB = useVideoPlayer(videoUri ?? "", (p) => {
-    p.loop = false;
-    p.timeUpdateEventInterval = 0.2;
-    p.muted = true;
-  });
-  // The PIP layer's own player (a video from the phone over the main
-  // video). Starts empty; each PIP clip's file is loaded into it. Muted
-  // until its clip begins (an early start mustn't be heard).
-  const pipPlayer = useVideoPlayer(null, (p) => {
-    p.loop = false;
-    p.timeUpdateEventInterval = 0.2;
-    p.muted = true;
-  });
-  const player = videoPlayerA;
-  const audioPlayers = [audioPlayerA, audioPlayerB] as const;
-
-  // Which video player is on screen (0 = A, 1 = B). Switched on the UI
-  // thread at the exact cut (by the clock), so no React re-render sits
-  // between the cut and the new picture.
-  const visibleVideoSV = useSharedValue(0);
-  // Each video player's picture opacity = the Opacity setting of the clip
-  // it is showing (or about to show). Set ahead of the cut (see the
-  // effect near the clip settings), so the UI-thread switch shows the new
-  // clip at its own opacity straight away.
-  const opacityASV = useSharedValue(1);
-  const opacityBSV = useSharedValue(1);
-  // Same for the Rotate tool: angle (degrees) and mirror (-1 = flipped).
-  const rotateASV = useSharedValue(0);
-  const rotateBSV = useSharedValue(0);
-  const flipASV = useSharedValue(1);
-  const flipBSV = useSharedValue(1);
-  // And for Crop: the part of the picture each player shows.
-  const cropASV = useSharedValue<CropRect>(FULL_CROP);
-  const cropBSV = useSharedValue<CropRect>(FULL_CROP);
-  // The canvas size in the preview (see `frame`) and the video's shape, for
-  // laying out a cropped / turned picture inside it.
-  const frameWSV = useSharedValue(0);
-  const frameHSV = useSharedValue(0);
-  const videoAspectSV = useSharedValue(0);
-  const videoAStyle = useAnimatedStyle(() => {
-    const l = cropLayout(
-      cropASV.value,
-      videoAspectSV.value,
-      frameWSV.value,
-      frameHSV.value,
-    );
-    return {
-      opacity: visibleVideoSV.value === 0 ? opacityASV.value : 0,
-      transform: pictureTransform(
-        rotateASV.value,
-        flipASV.value,
-        l.dw,
-        l.dh,
-        frameWSV.value,
-        frameHSV.value,
-      ),
-    };
-  });
-  const videoBStyle = useAnimatedStyle(() => {
-    const l = cropLayout(
-      cropBSV.value,
-      videoAspectSV.value,
-      frameWSV.value,
-      frameHSV.value,
-    );
-    return {
-      opacity: visibleVideoSV.value === 1 ? opacityBSV.value : 0,
-      transform: pictureTransform(
-        rotateBSV.value,
-        flipBSV.value,
-        l.dw,
-        l.dh,
-        frameWSV.value,
-        frameHSV.value,
-      ),
-    };
-  });
-  // The kept part, centred in the canvas (clips the rest)…
-  const cropWindowAStyle = useAnimatedStyle(() => {
-    const l = cropLayout(
-      cropASV.value,
-      videoAspectSV.value,
-      frameWSV.value,
-      frameHSV.value,
-    );
-    return { left: l.left, top: l.top, width: l.dw, height: l.dh };
-  });
-  const cropWindowBStyle = useAnimatedStyle(() => {
-    const l = cropLayout(
-      cropBSV.value,
-      videoAspectSV.value,
-      frameWSV.value,
-      frameHSV.value,
-    );
-    return { left: l.left, top: l.top, width: l.dw, height: l.dh };
-  });
-  // …and the whole picture behind it, enlarged and shifted so exactly the
-  // kept part shows through.
-  const cropPictureAStyle = useAnimatedStyle(() => {
-    const l = cropLayout(
-      cropASV.value,
-      videoAspectSV.value,
-      frameWSV.value,
-      frameHSV.value,
-    );
-    return { left: l.ox, top: l.oy, width: l.fw, height: l.fh };
-  });
-  const cropPictureBStyle = useAnimatedStyle(() => {
-    const l = cropLayout(
-      cropBSV.value,
-      videoAspectSV.value,
-      frameWSV.value,
-      frameHSV.value,
-    );
-    return { left: l.ox, top: l.oy, width: l.fw, height: l.fh };
-  });
-
-  // Note: there used to be two `useEvent(player, "timeUpdate")`
-  // subscriptions here. Their values were never read (the timeline clock
-  // reads `player.currentTime` directly every frame), but each event still
-  // re-rendered this whole screen ~5x/s per player — 10 wasted full
-  // re-renders per second during playback. Removed for smoother playback.
-
+  // ---- Native preview (engine v3) ------------------------------------
+  // The whole edit plays on ONE native player with its own clock (see
+  // modules/vidsurge-engine, VidsurgePreviewView.kt): main video (cuts,
+  // speed, crop, turn, mirror, opacity, canvas colour) and all the sound.
+  // The PIP video plays in its own native view (inside the PIP frame below)
+  // kept in step natively. JavaScript only sends the edit and play / pause /
+  // seek — it is not involved while the video plays.
+  const NativePreview = getNativePreviewView();
+  const NativePip = getNativePipView();
+  const previewRef = useRef<PreviewHandle | null>(null);
+  const pipViewRef = useRef<PipViewHandle | null>(null);
+  // The native view is on screen (its ref is set): the edit can be sent.
+  const [previewMounted, setPreviewMounted] = useState(false);
+  // Stable (a new function each render would make React detach / attach
+  // the ref on every render).
+  const setPreviewRef = useCallback((handle: PreviewHandle | null) => {
+    previewRef.current = handle;
+    setPreviewMounted(handle !== null);
+  }, []);
   useEffect(() => {
-    const id = setInterval(() => {
-      if (player.duration > 0) {
-        setDuration(player.duration);
-        clearInterval(id);
-      }
-    }, 200);
-    return () => clearInterval(id);
-  }, [player]);
+    if (__DEV__)
+      console.log(
+        NativePreview
+          ? "[editor] native preview (engine v3)"
+          : `[editor] this app build has no native preview (engine v${engineVersion()}) — rebuild the app`,
+      );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // The first video's length, read from the file (new project: its first
+  // clip; any project: its thumbnails on the timeline).
+  useEffect(() => {
+    if (!videoUri) return;
+    let alive = true;
+    void probeDuration(videoUri).then((d) => {
+      if (alive && d > 0) setDuration(d);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [videoUri]);
 
   // First load: one linked video + audio clip covering the whole file.
   // (The reducer ignores this if the project already has clips.)
@@ -694,38 +623,43 @@ export default function EditorScreen() {
     thumbnailsGeneratedRef.current = true;
 
     const generate = async () => {
-      const results: (string | null)[] = new Array(THUMBNAIL_COUNT).fill(null);
-      let nextIndex = 0;
-
-      const worker = async () => {
-        while (true) {
-          const i = nextIndex++;
-          if (i >= THUMBNAIL_COUNT) return;
-          const segmentMidpoint = ((i + 0.5) * duration) / THUMBNAIL_COUNT;
-          try {
-            const { uri, width, height } =
-              await VideoThumbnails.getThumbnailAsync(videoUri, {
-                time: Math.floor(segmentMidpoint * 1000),
-              });
-            results[i] = uri;
-            if (i === 0 && width > 0 && height > 0) {
-              setVideoSize({ width, height });
-              if (__DEV__)
-                console.log(`[editor] video picture size ${width}x${height}`);
-            }
-          } catch {
-            results[i] = null;
-          }
-        }
-      };
-
-      const workers = Array.from({ length: THUMBNAIL_CONCURRENCY }, () =>
-        worker(),
-      );
-      await Promise.all(workers);
-
-      setThumbnails(results);
+      const startedAt = Date.now();
+      const name = videoUri.split("/").pop();
+      // 1. The picture's shape, right away (the frame / preview need it).
+      let sizeKnown = false;
+      const size = await quickVideoSize(videoUri);
+      if (size) {
+        sizeKnown = true;
+        setVideoSize(size);
+        if (__DEV__)
+          console.log(
+            `[editor] video picture size ${size.width}x${size.height} (in ${Date.now() - startedAt}ms)`,
+          );
+      }
+      // 2. The fast filmstrip.
+      const fast = await quickThumbnails(videoUri, duration);
+      if (!sizeKnown && fast.width > 0 && fast.height > 0) {
+        setVideoSize({ width: fast.width, height: fast.height });
+        if (__DEV__)
+          console.log(
+            `[editor] video picture size ${fast.width}x${fast.height}`,
+          );
+      }
+      setThumbnails(fast.uris);
       setThumbnailsReady(true);
+      if (__DEV__)
+        console.log(
+          `[editor] thumbnails for ${name} — ${fast.uris.filter(Boolean).length}/${THUMBNAIL_COUNT} fast in ${Date.now() - startedAt}ms`,
+        );
+      // 3. The exact frames, swapped in when ready.
+      const exact = await exactThumbnails(videoUri, duration);
+      if (exact) {
+        setThumbnails(mergeThumbs(fast.uris, exact));
+        if (__DEV__)
+          console.log(
+            `[editor] thumbnails for ${name} — exact frames in after ${Date.now() - startedAt}ms`,
+          );
+      }
     };
 
     generate();
@@ -752,34 +686,24 @@ export default function EditorScreen() {
       thumbsStartedRef.current.add(uri);
       void (async () => {
         const startedAt = Date.now();
-        const results: (string | null)[] = new Array(THUMBNAIL_COUNT).fill(
-          null,
-        );
-        let next = 0;
-        const worker = async () => {
-          while (true) {
-            const i = next++;
-            if (i >= THUMBNAIL_COUNT) return;
-            try {
-              const shot = await VideoThumbnails.getThumbnailAsync(uri, {
-                time: Math.floor(
-                  (((i + 0.5) * length) / THUMBNAIL_COUNT) * 1000,
-                ),
-              });
-              results[i] = shot.uri;
-            } catch {
-              results[i] = null;
-            }
-          }
-        };
-        await Promise.all(
-          Array.from({ length: THUMBNAIL_CONCURRENCY }, () => worker()),
-        );
+        const results = (await quickThumbnails(uri, length)).uris;
         if (__DEV__)
           console.log(
             `[editor] thumbnails for ${uri.split("/").pop()} — ${results.filter(Boolean).length}/${THUMBNAIL_COUNT} in ${Date.now() - startedAt}ms`,
           );
         setThumbnailsBySource((m) => ({ ...m, [uri]: results }));
+        // The exact frames, swapped in when ready.
+        const exact = await exactThumbnails(uri, length);
+        if (exact) {
+          setThumbnailsBySource((m) => ({
+            ...m,
+            [uri]: mergeThumbs(results, exact),
+          }));
+          if (__DEV__)
+            console.log(
+              `[editor] thumbnails for ${uri.split("/").pop()} — exact frames in after ${Date.now() - startedAt}ms`,
+            );
+        }
       })();
     }
   }, [otherVideoSources]);
@@ -790,10 +714,6 @@ export default function EditorScreen() {
   const textClips = project.tracks.text;
   const stickerClips = project.tracks.sticker;
   const pipClips = project.tracks.pip;
-  const pipVideoClips = useMemo(
-    () => pipClips.filter((c) => pipDataOf(c).kind === "video"),
-    [pipClips],
-  );
 
   // The timeline ends where the last clip ends (after trimming everything
   // shorter, playback stops there instead of running on through black to
@@ -833,66 +753,6 @@ export default function EditorScreen() {
               ? "audio"
               : "video";
 
-  // ---- Clips per player -------------------------------------------------
-  // Consecutive clips on a track alternate between the track's two players
-  // (clip 0 → A, clip 1 → B, clip 2 → A...), so the next clip's player is
-  // free to get ready. Except a clip that simply continues the previous one
-  // (the parts of a split, same look): it stays on the same player, which
-  // plays straight on across the cut. Handing the picture to the other
-  // player there meant starting a second video decoder right at the cut —
-  // on the busy dev JS thread it started 0.3–1s late, then got seeked
-  // (~1s more), and the picture froze / jumped. See splitIntoPlayerSlots.
-  const videoClipsBySlot = useMemo(() => {
-    const slots = splitIntoPlayerSlots(videoClips, "video");
-    if (__DEV__)
-      console.log(
-        `[editor] video players — A: ${slots[0].map((c) => c.id).join(", ") || "-"} | B: ${slots[1].map((c) => c.id).join(", ") || "-"}`,
-      );
-    return slots;
-  }, [videoClips]);
-  // Audio: a clip that simply continues the previous one (e.g. the two
-  // halves of a split) stays on the same player, which plays on across the
-  // cut — handing the sound to the other player there could start late
-  // (busy JS thread), heard as a short silence, a sped-up catch-up or a
-  // lag. See splitIntoPlayerSlots.
-  const audioClipsBySlot = useMemo(() => {
-    const slots = splitIntoPlayerSlots(audioClips, "audio");
-    if (__DEV__)
-      console.log(
-        `[editor] audio players — A: ${slots[0].map((c) => c.id).join(", ") || "-"} | B: ${slots[1].map((c) => c.id).join(", ") || "-"}`,
-      );
-    return slots;
-  }, [audioClips]);
-
-  // Make a video player the one on screen.
-  const showVideoSlot = (slot: number, why: string) => {
-    if (visibleVideoSV.get() === slot) return;
-    visibleVideoSV.set(slot);
-    if (__DEV__)
-      console.log(
-        `[editor] showing video player ${slot === 0 ? "A" : "B"} (${why})`,
-      );
-  };
-  // Make an audio player the one you hear (the other is muted).
-  const hearAudioSlot = (slot: number, why: string) => {
-    const done = safePlayer(
-      () => {
-        if (!audioPlayers[slot].muted && audioPlayers[1 - slot].muted)
-          return true;
-        audioPlayers[slot].muted = false;
-        audioPlayers[1 - slot].muted = true;
-        return false;
-      },
-      true,
-      "hear",
-    );
-    if (done) return;
-    if (__DEV__)
-      console.log(
-        `[editor] hearing audio player ${slot === 0 ? "A" : "B"} (${why})`,
-      );
-  };
-
   // Timeline mute button: silences the whole audio track (both audio
   // players) without touching any clip's volume. Not an undo step.
   // The button shows a spinner first (same idea as Split/Delete): the
@@ -900,11 +760,6 @@ export default function EditorScreen() {
   // re-render takes a moment in the dev build, so the tap never looks
   // ignored.
   const [audioMuted, setAudioMuted] = useState(false);
-  // For the clock's clip-start callback (it runs outside React renders).
-  const audioMutedRef = useRef(audioMuted);
-  useEffect(() => {
-    audioMutedRef.current = audioMuted;
-  }, [audioMuted]);
   const [muteBusy, setMuteBusy] = useState(false);
   const toggleAudioMuted = () => {
     if (muteBusy) return;
@@ -920,180 +775,57 @@ export default function EditorScreen() {
     }, MUTE_SPINNER_MS);
   };
 
-  // ---- Shared clock + per-player sync -----------------------------------
-  // One clock entry per clip, reading the player that clip plays on.
-  const clockEntries = (
-    clips: Clip[],
-    p: typeof player,
-    slot: number,
-    priority: number,
-  ): ClockTrack[] =>
-    clips.map((clip) => ({
-      label: clip.id,
-      trackKey: `${clip.track}#${slot}`,
-      clipStart: clip.start,
-      clipEnd: clipEnd(clip),
-      trimStart: clip.trimIn,
-      speed: clip.speed,
-      priority,
-      getCurrentTime: () => safePlayer(() => p.currentTime, NaN, "currentTime"),
-      // Used when a player is stuck (ground truth, ~1.2s) or has drifted
-      // away from the playhead (the other tracks).
-      resyncTo: (sourceTime) => {
-        if (__DEV__)
-          console.log(
-            `[editor] clock pulled ${clip.track} player ${slot === 0 ? "A" : "B"} (${clip.id}) to ${sourceTime.toFixed(2)}s`,
-          );
-        safePlayer(
-          () => {
-            p.currentTime = sourceTime;
-          },
-          undefined,
-          "seek",
-        );
-      },
-      pause: () => safePlayer(() => p.pause(), undefined, "pause"),
-      play: () => safePlayer(() => p.play(), undefined, "play"),
-      setRate: (rate) =>
-        safePlayer(
-          () => {
-            p.playbackRate = rate;
-          },
-          undefined,
-          "rate",
-        ),
-      activate: () => {
-        if (clip.track === "video") {
-          showVideoSlot(slot, `${clip.id} begins`);
-          return;
-        }
-        // PIP videos are silent (their sound is not used at all).
-        if (clip.track === "pip") return;
-        // This clip's volume, right at the cut: a split part with another
-        // volume plays on the same player (splitIntoPlayerSlots), and
-        // React's re-render would only set it a moment later.
-        const volume =
-          clip.track === "audio" && audioMutedRef.current
-            ? 0
-            : Math.max(0, Math.min(1, clip.volume));
-        safePlayer(
-          () => {
-            if (Math.abs(p.volume - volume) > 0.001) {
-              p.volume = volume;
-              if (__DEV__)
-                console.log(
-                  `[editor] ${clip.track} player ${clip.track === "pip" ? "" : slot === 0 ? "A " : "B "}volume → ${Math.round(volume * 100)}% at the cut (${clip.id})`,
-                );
-            }
-          },
-          undefined,
-          "clip start",
-        );
-        if (clip.track === "audio") hearAudioSlot(slot, `${clip.id} begins`);
-      },
-      silence:
-        clip.track === "audio" || clip.track === "pip"
-          ? () =>
-              safePlayer(
-                () => {
-                  p.muted = true;
-                },
-                undefined,
-                "mute",
-              )
-          : undefined,
-    }));
-  // Video first (priority 0): the picture is what the playhead follows.
-  const clockTracks: ClockTrack[] = [
-    ...clockEntries(videoClipsBySlot[0], videoPlayerA, 0, 0),
-    ...clockEntries(videoClipsBySlot[1], videoPlayerB, 1, 0),
-    ...clockEntries(audioClipsBySlot[0], audioPlayerA, 0, 1),
-    ...clockEntries(audioClipsBySlot[1], audioPlayerB, 1, 1),
-    // PIP videos: one player, followed last (priority 2).
-    ...clockEntries(pipVideoClips, pipPlayer, 0, 2),
-  ];
+  // ---- Clock (the native player's time) -----------------------------------
+  // Every clip edge on every track: crossing one while playing updates the
+  // screen right away (texts, stickers, PIP frame, tools).
+  const clipEdges = useMemo(() => {
+    const out: number[] = [];
+    for (const track of ["video", "audio", "text", "sticker", "pip"] as const) {
+      for (const c of project.tracks[track]) out.push(c.start, clipEnd(c));
+    }
+    return out;
+  }, [project.tracks]);
 
-  const { timelineTime, seekVersion, seekTo, playhead, stopTimeRef, halt } =
-    useTimelineClock({
-      isPlaying,
-      timelineDuration,
-      tracks: clockTracks,
-      onReachEnd: () => {
-        if (__DEV__)
-          console.log("[editor] timeline reached end, stopping playback");
-        setIsPlaying(false);
-      },
-    });
+  const {
+    timelineTime,
+    seekTo,
+    playhead,
+    stopTimeRef,
+    halt,
+    getTime,
+    onTimeEvent,
+    onPlaybackEvent,
+    onEndedEvent,
+  } = useNativeClock({
+    previewRef,
+    isPlaying,
+    timelineDuration,
+    edges: clipEdges,
+    onReachEnd: () => {
+      if (__DEV__)
+        console.log("[editor] timeline reached end, stopping playback");
+      setIsPlaying(false);
+    },
+  });
 
-  // One sync per player, each with its own clips. Entering a clip (paused,
-  // scrubbing or playing) makes that player the one you see / hear.
-  useTrackTimelineSync({
-    label: "video A",
-    player: videoPlayerA,
-    isPlaying,
-    timelineTime,
-    seekVersion,
-    clips: videoClipsBySlot[0],
-    initialUri: videoUri ?? "",
-    onEnterClip: () => showVideoSlot(0, "playhead entered its clip"),
-  });
-  useTrackTimelineSync({
-    label: "video B",
-    player: videoPlayerB,
-    isPlaying,
-    timelineTime,
-    seekVersion,
-    clips: videoClipsBySlot[1],
-    initialUri: videoUri ?? "",
-    onEnterClip: () => showVideoSlot(1, "playhead entered its clip"),
-  });
-  useTrackTimelineSync({
-    label: "audio A",
-    player: audioPlayerA,
-    isPlaying,
-    timelineTime,
-    seekVersion,
-    clips: audioClipsBySlot[0],
-    trackMuted: audioMuted,
-    initialUri: videoUri ?? "",
-    holdSeeks: isScrubbing,
-    onEnterClip: () => hearAudioSlot(0, "playhead entered its clip"),
-  });
-  useTrackTimelineSync({
-    label: "pip",
-    player: pipPlayer,
-    isPlaying,
-    timelineTime,
-    seekVersion,
-    clips: pipVideoClips,
-    initialUri: "",
-    holdSeeks: isScrubbing,
-    // PIP videos have no sound: their player stays muted (it was created
-    // muted) and at volume 0. Their audio playing next to the main sound
-    // was confusing — and during a catch-up it played sped up.
-    trackMuted: true,
-  });
-  useTrackTimelineSync({
-    label: "audio B",
-    player: audioPlayerB,
-    isPlaying,
-    timelineTime,
-    seekVersion,
-    clips: audioClipsBySlot[1],
-    trackMuted: audioMuted,
-    initialUri: videoUri ?? "",
-    holdSeeks: isScrubbing,
-    onEnterClip: () => hearAudioSlot(1, "playhead entered its clip"),
-  });
+  // The native preview couldn't play something: stop, say so.
+  const handlePreviewError = (message: string) => {
+    if (__DEV__) console.log(`[editor] preview error — ${message}`);
+    setIsPlaying(false);
+    showToast("The preview couldn't play this part");
+  };
+
+  // The mute button silences the preview right away (no reload).
+  useEffect(() => {
+    if (previewMounted) void previewRef.current?.setMuted(audioMuted);
+  }, [audioMuted, previewMounted]);
 
   // ---- PIP layer ---------------------------------------------------------
   // The PIP clip under the playhead — or else the next one, or else the
-  // last one. The PIP layer (and its video view) stays mounted as long as
-  // the project has a PIP: mounting it just before the clip (as before)
-  // froze the app for ~1s right at the PIP's start — the PIP then started
-  // late, was pulled forward, and the main video stalled too. Shown /
-  // hidden on the UI thread from the drawn playhead (React comes ~0.2s
-  // late).
+  // last one. The PIP layer (and its native video view) stays mounted as
+  // long as the project has a PIP; the native preview plays the right clip
+  // into it, in step. Shown / hidden on the UI thread from the drawn
+  // playhead (React comes a moment late).
   const pipShown =
     activeClipAt(pipClips, timelineTime) ??
     pipClips.find((c) => c.start > timelineTime) ??
@@ -1101,8 +833,8 @@ export default function EditorScreen() {
     null;
   const pipStartSV = useSyncedValue(pipShown?.start ?? -1);
   const pipEndSV = useSyncedValue(pipShown ? clipEnd(pipShown) : -1);
-  // Its Opacity (live draft while the Opacity sheet is open) — set in the
-  // per-player effect near the clip settings.
+  // Its Opacity (live draft while the Opacity sheet is open) — set near the
+  // clip settings ("The PIP layer's opacity").
   const pipOpacitySV = useSharedValue(1);
   const pausedTimeSV = useSyncedValue(timelineTime);
   const pipVisibleStyle = useAnimatedStyle(() => {
@@ -1112,15 +844,6 @@ export default function EditorScreen() {
     const on = t >= pipStartSV.value - 0.001 && t < pipEndSV.value;
     return { opacity: on ? pipOpacitySV.value : 0 };
   });
-
-  // Black preview when no video clip is under the playhead. Clip ends count
-  // as covered (inclusive), so pausing exactly on the last frame of the
-  // timeline still shows it instead of going black.
-  const isVoidNow = !videoClips.some(
-    (clip) =>
-      timelineTime >= clip.start - 0.001 &&
-      timelineTime <= clipEnd(clip) + 0.001,
-  );
 
   // Split is usable when the playhead is inside the selected clip (and its
   // locked partner), at least MIN_SPLIT_PART from either edge.
@@ -1141,9 +864,8 @@ export default function EditorScreen() {
       selectedClip.track === "pip" ||
       clipCount - (selectedPartner ? 2 : 1) > 0);
 
-  // ---- Transport handlers (thin — the hooks above react to the state
-  // changes these make, so there's no manual player.play()/currentTime
-  // wiring here anymore) --------------------------------------------------
+  // ---- Transport handlers (thin — the clock reacts to the state changes
+  // these make and drives the native preview) ------------------------------
   const togglePlayback = () => {
     if (isPlaying) {
       setIsPlaying(false);
@@ -1154,12 +876,13 @@ export default function EditorScreen() {
       seekTo(0);
     }
 
-    // Safety net: if a scrub-end was somehow missed, never keep the audio
-    // seek on hold once playback starts.
+    // Safety net: if a scrub-end was somehow missed, never stay in
+    // scrubbing mode once playback starts (it holds the picture).
     if (isScrubbing) {
       if (__DEV__)
         console.log("[editor] play pressed while scrub flag set — clearing it");
       setIsScrubbing(false);
+      void previewRef.current?.setScrubbing(false);
     }
 
     // Play = watching, not editing: drop the clip selection (the toolbar
@@ -1199,13 +922,17 @@ export default function EditorScreen() {
 
   const handleScrubStart = () => {
     pauseForGesture("scrub");
-    if (__DEV__) console.log("[editor] scrub start — holding audio seeks");
+    if (__DEV__)
+      console.log("[editor] scrub start — preview in scrubbing mode");
     setIsScrubbing(true);
+    // Fast frequent seeks (Media3's scrubbing mode) while the finger moves.
+    void previewRef.current?.setScrubbing(true);
   };
 
   const handleScrubEnd = () => {
-    if (__DEV__) console.log("[editor] scrub end — releasing audio seek");
+    if (__DEV__) console.log("[editor] scrub end — preview back to normal");
     setIsScrubbing(false);
+    void previewRef.current?.setScrubbing(false);
   };
 
   const handleClipGestureStart = (kind: "move" | "trim") =>
@@ -1423,13 +1150,45 @@ export default function EditorScreen() {
     }
   };
 
+  // The Lib (the user's saved audio / videos / images): when it has
+  // something of the right kind, adding music / a video / a PIP first asks
+  // "from your Lib or from the phone?" (LibPickerSheet); otherwise the
+  // phone's picker opens right away, as before.
+  const [libChoice, setLibChoice] = useState<{
+    title: string;
+    items: LibItem[];
+    fromDevice: () => void;
+    fromLib: (item: LibItem) => void;
+  } | null>(null);
+  const offerLib = (
+    kinds: LibKind[],
+    title: string,
+    fromDevice: () => void,
+    fromLib: (item: LibItem) => void,
+  ) => {
+    void loadLibrary()
+      .then((all) => {
+        const items = all.filter((it) => kinds.includes(it.kind));
+        if (items.length === 0) {
+          fromDevice();
+          return;
+        }
+        if (__DEV__)
+          console.log(
+            `[editor] ${title} — ${items.length} Lib item(s) offered`,
+          );
+        setLibChoice({ title, items, fromDevice, fromLib });
+      })
+      .catch(() => fromDevice());
+  };
+
   // Add music from the phone (the empty audio row's "Add audio", or the
   // Music tool): opens the phone's file picker for audio files, reads the
   // file's length, and adds it as a new unlinked audio clip at the playhead
   // — full length, even past the end of the video. If the playhead is inside
   // another audio clip, it goes to that clip's nearer edge and later clips
   // move right (clips never overlap on a track).
-  const handleAddAudio = async (from: string) => {
+  const handleAddAudio = async (from: string, picked?: LibItem) => {
     if (addingAudioRef.current) return;
     addingAudioRef.current = true;
     pauseForGesture("add audio");
@@ -1440,22 +1199,31 @@ export default function EditorScreen() {
         `[editor] add audio (${from}) @ ${at.toFixed(2)}s — opening the file picker`,
       );
     try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: "audio/*",
-        copyToCacheDirectory: true,
-        multiple: false,
-      });
-      const asset = result.canceled ? null : result.assets?.[0];
+      // From the Lib: the file and its length are known already.
+      let asset: { uri: string; name: string; mimeType?: string } | null = null;
+      if (picked) {
+        asset = { uri: picked.uri, name: picked.name };
+      } else {
+        const result = await DocumentPicker.getDocumentAsync({
+          type: "audio/*",
+          copyToCacheDirectory: true,
+          multiple: false,
+        });
+        asset = result.canceled ? null : (result.assets?.[0] ?? null);
+      }
       if (!asset) {
         if (__DEV__) console.log("[editor] add audio — picker cancelled");
         return;
       }
       if (__DEV__)
         console.log(
-          `[editor] add audio — picked ${asset.name} (${asset.mimeType ?? "unknown type"})`,
+          `[editor] add audio — ${picked ? "from the Lib:" : "picked"} ${asset.name} (${asset.mimeType ?? (picked ? "lib" : "unknown type")})`,
         );
       setAddingAudio(true);
-      const duration = await probeDuration(asset.uri);
+      const duration =
+        picked && picked.duration > 0
+          ? picked.duration
+          : await probeDuration(asset.uri);
       if (duration <= 0) {
         Alert.alert(
           "Couldn't add audio",
@@ -1463,7 +1231,9 @@ export default function EditorScreen() {
         );
         return;
       }
-      const title = asset.name.replace(/\.[^.]+$/, "") || "Music";
+      const title = picked
+        ? picked.name
+        : asset.name.replace(/\.[^.]+$/, "") || "Music";
       const addAction = addAudioClipAction(asset.uri, duration, title, at);
       const next = commitProject(addAction, "add audio");
       if (addAction.type === "ADD_CLIP") flashClips([addAction.clip.id]);
@@ -1492,20 +1262,31 @@ export default function EditorScreen() {
   // length (INSERT_VIDEO_AT_START); the playhead goes to 0 to show it.
   const addingVideoRef = useRef(false);
   const [addingVideo, setAddingVideo] = useState(false);
-  const handleAddVideoAtStart = async () => {
+  // The timeline's two "+" buttons: "start" (above the mute button) puts
+  // the video FIRST, at 0s — everything already on the timeline moves right
+  // by its length (INSERT_VIDEO_AT_START); "end" (after the last video clip)
+  // puts it right after the last video clip — nothing moves
+  // (INSERT_VIDEO_AT_END). The playhead goes to the new clip's start.
+  const handleAddVideo = async (where: "start" | "end", picked?: LibItem) => {
     if (addingVideoRef.current) return;
     addingVideoRef.current = true;
-    pauseForGesture("add video at start");
-    if (__DEV__) console.log("[editor] add video at 0s — opening the gallery");
+    pauseForGesture(`add video at ${where}`);
+    if (__DEV__)
+      console.log(`[editor] add video at ${where} — opening the gallery`);
     try {
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ["videos"],
-        allowsEditing: false,
-        quality: 1,
-      });
-      const asset = result.canceled ? null : result.assets?.[0];
+      const asset = picked
+        ? libAsset(picked)
+        : await (async () => {
+            const result = await ImagePicker.launchImageLibraryAsync({
+              mediaTypes: ["videos"],
+              allowsEditing: false,
+              quality: 1,
+            });
+            return result.canceled ? null : (result.assets?.[0] ?? null);
+          })();
       if (!asset) {
-        if (__DEV__) console.log("[editor] add video at 0s — picker cancelled");
+        if (__DEV__)
+          console.log(`[editor] add video at ${where} — picker cancelled`);
         return;
       }
       setAddingVideo(true);
@@ -1518,19 +1299,45 @@ export default function EditorScreen() {
         );
         return;
       }
-      const action = insertVideoAtStartAction(asset.uri, length);
-      commitProject(action, "add video at start");
-      if (action.type === "INSERT_VIDEO_AT_START") {
-        flashClips([action.videoClipId, action.audioClipId]);
+      const name = asset.fileName ?? asset.uri.split("/").pop();
+      if (where === "start") {
+        const action = insertVideoAtStartAction(asset.uri, length);
+        commitProject(action, "add video at start");
+        if (action.type === "INSERT_VIDEO_AT_START") {
+          flashClips([action.videoClipId, action.audioClipId]);
+        }
+        setSelectedClipId(null);
+        seekTo(0);
+        if (__DEV__)
+          console.log(
+            `[editor] add video at 0s — ${name} (${length.toFixed(2)}s, ${asset.width}×${asset.height}); everything else moved right by ${length.toFixed(2)}s`,
+          );
+      } else {
+        const at = videoClips.reduce((m, c) => Math.max(m, clipEnd(c)), 0);
+        const room = freeAudioRoom(project, at);
+        const action = insertVideoAtEndAction(asset.uri, length);
+        const next = commitProject(action, "add video at end");
+        if (action.type === "INSERT_VIDEO_AT_END") {
+          const added = [action.videoClipId, action.audioClipId].filter(
+            (id) => findClip(next, id) !== null,
+          );
+          flashClips(added);
+        }
+        setSelectedClipId(null);
+        seekTo(at);
+        if (room < length - 0.001)
+          showToast(
+            room >= 0.5
+              ? "Video added — its sound was shortened (music is there)"
+              : "Video added — without its sound (music is there)",
+          );
+        if (__DEV__)
+          console.log(
+            `[editor] add video at the end (${at.toFixed(2)}s) — ${name} (${length.toFixed(2)}s, ${asset.width}×${asset.height}); sound: ${room >= length - 0.001 ? "full, locked" : room >= 0.5 ? `shortened to ${room.toFixed(2)}s (audio row busy)` : "left out (audio row busy)"}`,
+          );
       }
-      setSelectedClipId(null);
-      seekTo(0);
-      if (__DEV__)
-        console.log(
-          `[editor] add video at 0s — ${asset.fileName ?? asset.uri.split("/").pop()} (${length.toFixed(2)}s, ${asset.width}×${asset.height}); everything else moved right by ${length.toFixed(2)}s`,
-        );
     } catch (error) {
-      if (__DEV__) console.log("[editor] add video at 0s failed", error);
+      if (__DEV__) console.log(`[editor] add video at ${where} failed`, error);
       Alert.alert(
         "Couldn't add video",
         "Something went wrong opening the gallery.",
@@ -1544,7 +1351,7 @@ export default function EditorScreen() {
   // PIP tool: a video or photo from the phone, as a layer over the main
   // video at the playhead (half the frame's width, in the middle).
   const addingPipRef = useRef(false);
-  const handleAddPip = async (from: string) => {
+  const handleAddPip = async (from: string, picked?: LibItem) => {
     if (addingPipRef.current) return;
     addingPipRef.current = true;
     pauseForGesture("add PIP");
@@ -1555,12 +1362,16 @@ export default function EditorScreen() {
         `[editor] add PIP (${from}) @ ${at.toFixed(2)}s — opening the gallery`,
       );
     try {
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ["images", "videos"],
-        allowsEditing: false,
-        quality: 1,
-      });
-      const asset = result.canceled ? null : result.assets?.[0];
+      const asset = picked
+        ? libAsset(picked)
+        : await (async () => {
+            const result = await ImagePicker.launchImageLibraryAsync({
+              mediaTypes: ["images", "videos"],
+              allowsEditing: false,
+              quality: 1,
+            });
+            return result.canceled ? null : (result.assets?.[0] ?? null);
+          })();
       if (!asset) {
         if (__DEV__) console.log("[editor] add PIP — picker cancelled");
         return;
@@ -2065,7 +1876,6 @@ export default function EditorScreen() {
       active: clipContains(pipShown, timelineTime),
       content: (
         <Animated.View
-          ref={pipPicRef}
           collapsable={false}
           style={[
             { width: size.w, height: size.h },
@@ -2079,13 +1889,16 @@ export default function EditorScreen() {
         >
           {d.kind === "video" ? (
             <>
-              <VideoView
-                player={pipPlayer}
-                style={[styles.video, frozen?.pip ? styles.offCanvas : null]}
-                contentFit="cover"
-                nativeControls={false}
-                surfaceType="textureView"
-              />
+              {/* The PIP video: a native view the preview plays the PIP
+                  clip into, in step with the main video (see
+                  VidsurgePreviewView.kt). Moved / sized / turned / faded by
+                  this frame like before. */}
+              {NativePip && (
+                <NativePip
+                  ref={pipViewRef}
+                  style={[styles.video, frozen?.pip ? styles.offCanvas : null]}
+                />
+              )}
               {frozen?.pip && (
                 <Image
                   source={{ uri: frozen.pip }}
@@ -2169,7 +1982,34 @@ export default function EditorScreen() {
   const [overlayJob, setOverlayJob] = useState<{
     job: OverlayJob;
     plan: ExportPlan;
+    /** The engine test, not a real export (long press on Export). */
+    test?: boolean;
   } | null>(null);
+  // The engine test (dev): exports the project once per feature and says
+  // which one makes the engine fail (see src/lib/engineDiagnostics.ts).
+  const runEngineTest = async (plan: ExportPlan) => {
+    showToast("Engine test running — watch the Metro log");
+    const results = await runEngineDiagnostics(plan, (name, i, total) =>
+      showToast(`Engine test ${i + 1}/${total}: ${name}`),
+    );
+    for (const o of plan.overlays) {
+      try {
+        const f = new File(o.uri);
+        if (f.exists) f.delete();
+      } catch {
+        // left in the cache
+      }
+    }
+    Alert.alert(
+      "Engine test",
+      results
+        .map(
+          (r) =>
+            `${r.ok ? "✓" : "✗"} ${r.name}${r.ok ? "" : `\n   ${r.error}`}`,
+        )
+        .join("\n"),
+    );
+  };
   const handleOverlaysDone = (result: OverlayResult) => {
     const pending = overlayJob;
     if (!pending) return;
@@ -2190,13 +2030,17 @@ export default function EditorScreen() {
       console.log(
         `[editor] export — ${overlays.length} text/sticker picture(s) ready`,
       );
+    if (pending.test) {
+      void runEngineTest({ ...pending.plan, overlays });
+      return;
+    }
     setExportPlan({ ...pending.plan, overlays });
   };
   const closeExport = () => {
     setOverlayJob(null);
     setExportPlan(null);
   };
-  const handleExport = () => {
+  const handleExport = (test = false) => {
     if (
       textEditor ||
       stickerSheet ||
@@ -2242,12 +2086,38 @@ export default function EditorScreen() {
       outputPath,
     });
     const segments = overlaySegments(project, plan.duration);
+    // An app build with an older engine can't export everything: say so
+    // right away (before drawing the texts).
+    if (engineVersion() < REQUIRED_ENGINE_VERSION) {
+      const missing = unsupportedByEngine({
+        ...plan,
+        overlays: segments.map((sg) => ({
+          start: sg.start,
+          end: sg.end,
+          uri: "",
+        })),
+      });
+      if (missing.length > 0) {
+        if (__DEV__)
+          console.log(
+            `[editor] export — old engine v${engineVersion()} can't export: ${missing.join(", ")}`,
+          );
+        Alert.alert(
+          "Not in this app build yet",
+          `This app build's export engine (v${engineVersion()}) can't export ${missing.join(", ")} — the next app build fixes it. Until then, remove them from the video to export it.`,
+        );
+        return;
+      }
+    }
     if (__DEV__)
       console.log(
         `[editor] export start — ${plan.width}x${plan.height} ${plan.fps}fps, ${plan.pip.length} PIP, ${segments.length} text/sticker stretch(es)`,
       );
+    if (test && __DEV__)
+      console.log("[editor] Export long-pressed — engine test");
     if (segments.length === 0) {
-      setExportPlan(plan);
+      if (test) void runEngineTest(plan);
+      else setExportPlan(plan);
       return;
     }
     setOverlayJob({
@@ -2258,6 +2128,7 @@ export default function EditorScreen() {
         pixelHeight: plan.height,
       },
       plan,
+      test,
     });
   };
 
@@ -2512,101 +2383,79 @@ export default function EditorScreen() {
     ? findClip(project, clipSetting.clipId)
     : null;
 
-  // Picture opacity of each video player: the clip under the playhead on
-  // that player, or — in a gap — its next clip (the clock starts players
-  // early, before React knows the clip has begun). While the Opacity
-  // sheet is open, its draft value is shown live for that clip.
+  // ---- The edit → native preview ---------------------------------------------
+  // Live values while a sheet is open: the Opacity sheet's draft and the
+  // Rotate sheet's draft show on the preview right away; while cropping, the
+  // whole picture, unturned (the crop box is drawn over it).
   const opacityDraftId =
     clipSetting?.kind === "opacity" ? clipSetting.clipId : null;
   const opacityDraftValue =
     clipSetting?.kind === "opacity" ? clipSetting.value : null;
   const isCropping = cropSetting !== null;
-  // The whole video's crop (Crop tool), shown by every video clip.
-  const frameCrop = canvas.crop ?? null;
   const rotateDraftId = rotateSetting?.clipId ?? null;
   const rotateDraftAngle = rotateSetting?.angle ?? 0;
   const rotateDraftFlip = rotateSetting?.flip ?? false;
+  const previewPlanJson = useMemo(
+    () =>
+      JSON.stringify(
+        buildPreviewPlan({
+          project,
+          canvas,
+          videoAspect,
+          drafts: {
+            opacity:
+              opacityDraftId !== null && opacityDraftValue !== null
+                ? { clipId: opacityDraftId, value: opacityDraftValue }
+                : null,
+            rotate:
+              rotateDraftId !== null
+                ? {
+                    clipId: rotateDraftId,
+                    angle: rotateDraftAngle,
+                    flip: rotateDraftFlip,
+                  }
+                : null,
+            flat: isCropping,
+          },
+        }),
+      ),
+    [
+      project,
+      canvas,
+      videoAspect,
+      opacityDraftId,
+      opacityDraftValue,
+      rotateDraftId,
+      rotateDraftAngle,
+      rotateDraftFlip,
+      isCropping,
+    ],
+  );
+  // Sent whenever it changes. The native side only reloads the video when
+  // the timeline itself changed (cuts, clips, speed, crop, frame shape);
+  // looks (turn, mirror, opacity, volume, colour) change in place.
+  const lastSentPlanRef = useRef("");
+  // A new preview view (it was taken off screen) gets the edit again.
   useEffect(() => {
-    const svs = [opacityASV, opacityBSV];
-    const rotSVs = [rotateASV, rotateBSV];
-    const flipSVs = [flipASV, flipBSV];
-    const cropSVs = [cropASV, cropBSV];
-    for (const slot of [0, 1]) {
-      const clips = videoClipsBySlot[slot];
-      const clip =
-        activeClipAt(clips, timelineTime) ??
-        clips.find((c) => c.start > timelineTime) ??
-        null;
-      // The whole video's crop — the same for every clip, so it's set on
-      // both players even when one has no clip nearby (it was left stale
-      // there until React caught up, and could flash the old framing at the
-      // cut). While cropping: the whole picture (the crop box is drawn over).
-      const crop = isCropping ? FULL_CROP : (frameCrop ?? FULL_CROP);
-      const cur = cropSVs[slot].get();
-      if (
-        cur.x !== crop.x ||
-        cur.y !== crop.y ||
-        cur.w !== crop.w ||
-        cur.h !== crop.h
-      ) {
-        cropSVs[slot].set(crop);
-        if (__DEV__)
-          console.log(
-            `[editor] video player ${slot === 0 ? "A" : "B"} crop → ${crop === FULL_CROP ? "whole picture" : `${crop.x},${crop.y} ${crop.w}×${crop.h}`}${isCropping ? " (cropping)" : ""}`,
-          );
-      }
-      if (!clip) continue;
-      // Rotation / flip (draft while the Rotate sheet is open).
-      const isRotDraft = clip.id === rotateDraftId;
-      const angle = isCropping
-        ? 0
-        : isRotDraft
-          ? rotateDraftAngle
-          : clip.rotate;
-      const flip = (
-        isCropping ? false : isRotDraft ? rotateDraftFlip : !!clip.flipX
-      )
-        ? -1
-        : 1;
-      if (rotSVs[slot].get() !== angle || flipSVs[slot].get() !== flip) {
-        rotSVs[slot].set(angle);
-        flipSVs[slot].set(flip);
-        if (__DEV__)
-          console.log(
-            `[editor] video player ${slot === 0 ? "A" : "B"} rotate → ${angle}°${flip < 0 ? ", flipped" : ""} (${clip.id}${isRotDraft ? ", preview" : ""})`,
-          );
-      }
-      const opacity =
-        clip.id === opacityDraftId && opacityDraftValue !== null
-          ? opacityDraftValue
-          : clip.opacity;
-      if (Math.abs(svs[slot].get() - opacity) > 0.001) {
-        svs[slot].set(opacity);
-        if (__DEV__)
-          console.log(
-            `[editor] video player ${slot === 0 ? "A" : "B"} opacity → ${Math.round(opacity * 100)}% (${clip.id}${clip.id === opacityDraftId ? ", preview" : ""})`,
-          );
-      }
-    }
-  }, [
-    timelineTime,
-    videoClipsBySlot,
-    opacityDraftId,
-    opacityDraftValue,
-    opacityASV,
-    opacityBSV,
-    rotateDraftId,
-    rotateDraftAngle,
-    rotateDraftFlip,
-    isCropping,
-    frameCrop,
-    cropASV,
-    cropBSV,
-    rotateASV,
-    rotateBSV,
-    flipASV,
-    flipBSV,
-  ]);
+    if (!previewMounted) lastSentPlanRef.current = "";
+  }, [previewMounted]);
+  const hasVideo = project.tracks.video.length > 0;
+  useEffect(() => {
+    if (!previewMounted || !previewRef.current) return;
+    // Nothing to show yet (a new project's first video is still loading).
+    if (!hasVideo) return;
+    if (previewPlanJson === lastSentPlanRef.current) return;
+    lastSentPlanRef.current = previewPlanJson;
+    if (__DEV__)
+      console.log(
+        `[editor] preview ← edit (${previewPlanJson.length} chars) @ ${getTime().toFixed(2)}s`,
+      );
+    void previewRef.current
+      .setTimeline(previewPlanJson, getTime() * 1000)
+      .catch((e: unknown) => {
+        if (__DEV__) console.log("[editor] preview setTimeline failed", e);
+      });
+  }, [previewPlanJson, previewMounted, hasVideo, getTime]);
 
   // The PIP layer's opacity: its clip's, or the Opacity sheet's draft.
   const pipOpacity = pipShown
@@ -2617,15 +2466,6 @@ export default function EditorScreen() {
   useEffect(() => {
     pipOpacitySV.set(pipOpacity);
   }, [pipOpacity, pipOpacitySV]);
-
-  // Canvas size + video shape, for laying out a cropped / rotated picture.
-  const frameW = frame?.width ?? 0;
-  const frameH = frame?.height ?? 0;
-  useEffect(() => {
-    frameWSV.set(frameW);
-    frameHSV.set(frameH);
-    videoAspectSV.set(videoAspect ?? 0);
-  }, [frameW, frameH, videoAspect, frameWSV, frameHSV, videoAspectSV]);
 
   // Tools that aren't built yet (and the ones routed from here).
   const handleComingSoonTool = (key: string) => {
@@ -2642,7 +2482,12 @@ export default function EditorScreen() {
       return;
     }
     if (key === "pip") {
-      void handleAddPip("PIP tool");
+      offerLib(
+        ["video", "image"],
+        "Add PIP",
+        () => void handleAddPip("PIP tool"),
+        (item) => void handleAddPip("PIP tool, Lib", item),
+      );
       return;
     }
     if (key === "stickers") {
@@ -2658,7 +2503,12 @@ export default function EditorScreen() {
       return;
     }
     if (key === "music") {
-      void handleAddAudio("Music tool");
+      offerLib(
+        ["audio"],
+        "Add music",
+        () => void handleAddAudio("Music tool"),
+        (item) => void handleAddAudio("Music tool, Lib", item),
+      );
       return;
     }
     if (key === "addText") {
@@ -2742,32 +2592,34 @@ export default function EditorScreen() {
     try {
       if (viewShot && captureFrameRef.current) {
         const shot = viewShot;
-        const hidden = visibleVideoSV.get() === 0 ? 1 : 0;
-        setShotHiddenSlot(hidden);
         setShotMode(true);
         try {
           // Let the pause settle and the capture layout reach the screen.
           await new Promise((r) => setTimeout(r, 120));
           await nextFrame();
           await nextFrame();
-          // A video view can't be drawn into a picture properly (view-shot
-          // draws it on top of everything, and turned / scaled ones in the
-          // wrong place — the rotated video moved). So: take a still of
-          // each video on screen by itself (untransformed — exact), show
-          // the still in its place for a moment, then take the whole
-          // frame, where everything is now an ordinary view.
-          const still = async (ref: { current: unknown }) =>
-            ref.current
-              ? await shot.captureRef(ref, { format: "png", result: "tmpfile" })
-              : undefined;
-          const f: { a?: string; b?: string; pip?: string } = {};
-          if (activeClipAt(videoClips, t)) {
-            if (hidden === 1) f.a = await still(picARef);
-            else f.b = await still(picBRef);
+          // The native pictures (main video, PIP video) can't be drawn into
+          // a view picture. So: each gives a still of itself (exact), the
+          // still is shown in its place for a moment, then the whole frame
+          // is taken, where everything is now an ordinary view.
+          const f: { main?: string; pip?: string } = {};
+          try {
+            const main = await previewRef.current?.capture();
+            if (main) f.main = main;
+          } catch (e) {
+            if (__DEV__)
+              console.log("[editor] capture — main picture still failed", e);
           }
           const pipNow = activeClipAt(pipClips, t);
-          if (pipNow && pipDataOf(pipNow).kind === "video")
-            f.pip = await still(pipPicRef);
+          if (pipNow && pipDataOf(pipNow).kind === "video") {
+            try {
+              const pip = await pipViewRef.current?.capture();
+              if (pip) f.pip = pip;
+            } catch (e) {
+              if (__DEV__)
+                console.log("[editor] capture — PIP still failed", e);
+            }
+          }
           const count = Object.keys(f).length;
           if (count > 0) {
             await new Promise<void>((resolve) => {
@@ -2779,12 +2631,14 @@ export default function EditorScreen() {
             await nextFrame();
             await nextFrame();
           }
-          uri = await shot.captureRef(captureFrameRef, {
-            format: "jpg",
-            quality: 0.95,
-            result: "tmpfile",
-          });
-          how = `preview picture (${count} video still${count === 1 ? "" : "s"})`;
+          if (f.main) {
+            uri = await shot.captureRef(captureFrameRef, {
+              format: "jpg",
+              quality: 0.95,
+              result: "tmpfile",
+            });
+            how = `preview picture (${count} native still${count === 1 ? "" : "s"})`;
+          }
         } catch (e) {
           if (__DEV__)
             console.log(
@@ -2795,7 +2649,6 @@ export default function EditorScreen() {
           frozenLoadRef.current = { left: 0, done: null };
           setFrozen(null);
           setShotMode(false);
-          setShotHiddenSlot(null);
         }
       }
       if (!uri) {
@@ -2951,9 +2804,14 @@ export default function EditorScreen() {
         <EditorTopBar
           resolution={resolutionLabel(demoExportOf(project).resolution)}
           onBack={() => router.back()}
-          onHelp={() => setComingSoonVisible(true)}
+          onHelp={() => {
+            pauseForGesture("guide");
+            if (__DEV__) console.log("[editor] ? pressed — opening the guide");
+            router.push("/guide");
+          }}
           onResolutionPress={openExportSettings}
-          onExportPress={handleExport}
+          onExportPress={() => handleExport()}
+          onExportLongPress={__DEV__ ? () => handleExport(true) : undefined}
           saveState={saveState}
           onSavePress={handleSavePress}
         />
@@ -3035,9 +2893,7 @@ export default function EditorScreen() {
                   }
                 >
                   {/* The canvas: its background colour, where the exported
-                  frame is. Shows around a picture that doesn't fill it
-                  (other shape, rotated) and through lowered Opacity — as
-                  it will in the exported video. */}
+                  frame is (until the native picture is on screen). */}
                   {frame && (
                     <View
                       pointerEvents="none"
@@ -3048,95 +2904,43 @@ export default function EditorScreen() {
                       ]}
                     />
                   )}
-                  {/* Two stacked video views, one per video player; only the
-                  active one is visible. TextureView (not the default
-                  SurfaceView) so they can be layered and faded on Android. */}
-                  <Animated.View
-                    pointerEvents="none"
-                    style={[
-                      frame ? frameStyle(frame) : StyleSheet.absoluteFill,
-                      videoAStyle,
-                      shotMode && shotHiddenSlot === 0 && styles.offCanvas,
-                    ]}
-                  >
-                    <Animated.View
-                      style={[styles.cropWindow, cropWindowAStyle]}
-                    >
-                      <Animated.View
-                        ref={picARef}
-                        collapsable={false}
-                        style={[styles.cropPicture, cropPictureAStyle]}
-                      >
-                        {frozen?.a && (
-                          <Image
-                            source={{ uri: frozen.a }}
-                            style={StyleSheet.absoluteFill}
-                            resizeMode="stretch"
-                            fadeDuration={0}
-                            onLoad={onFrozenLoad}
-                            onError={onFrozenLoad}
-                          />
-                        )}
-                        <VideoView
-                          player={videoPlayerA}
-                          style={[
-                            styles.video,
-                            frozen?.a ? styles.offCanvas : null,
-                          ]}
-                          contentFit="contain"
-                          nativeControls={false}
-                          surfaceType="textureView"
-                        />
-                      </Animated.View>
-                    </Animated.View>
-                  </Animated.View>
-                  <Animated.View
-                    pointerEvents="none"
-                    style={[
-                      frame ? frameStyle(frame) : StyleSheet.absoluteFill,
-                      videoBStyle,
-                      shotMode && shotHiddenSlot === 1 && styles.offCanvas,
-                    ]}
-                  >
-                    <Animated.View
-                      style={[styles.cropWindow, cropWindowBStyle]}
-                    >
-                      <Animated.View
-                        ref={picBRef}
-                        collapsable={false}
-                        style={[styles.cropPicture, cropPictureBStyle]}
-                      >
-                        {frozen?.b && (
-                          <Image
-                            source={{ uri: frozen.b }}
-                            style={StyleSheet.absoluteFill}
-                            resizeMode="stretch"
-                            fadeDuration={0}
-                            onLoad={onFrozenLoad}
-                            onError={onFrozenLoad}
-                          />
-                        )}
-                        <VideoView
-                          player={videoPlayerB}
-                          style={[
-                            styles.video,
-                            frozen?.b ? styles.offCanvas : null,
-                          ]}
-                          contentFit="contain"
-                          nativeControls={false}
-                          surfaceType="textureView"
-                        />
-                      </Animated.View>
-                    </Animated.View>
-                  </Animated.View>
-                  {isVoidNow && (
+                  {/* The picture: the native preview, exactly the frame. It
+                  draws the whole edit (video, gaps and bars in the canvas
+                  colour, opacity, turn, crop) — the texts, stickers and the
+                  PIP frame are drawn over it below. */}
+                  {frame && NativePreview && (
+                    <NativePreview
+                      ref={setPreviewRef}
+                      pointerEvents="none"
+                      collapsable={false}
+                      style={frameStyle(frame)}
+                      onTime={onTimeEvent}
+                      onPlayback={onPlaybackEvent}
+                      onEnded={onEndedEvent}
+                      onError={(e) => handlePreviewError(e.nativeEvent.message)}
+                    />
+                  )}
+                  {frame && !NativePreview && (
                     <View
                       pointerEvents="none"
-                      style={[
-                        styles.voidOverlay,
-                        frame && frameStyle(frame),
-                        { backgroundColor: canvas.background },
-                      ]}
+                      style={[frameStyle(frame), styles.noPreview]}
+                    >
+                      <AppText style={styles.noPreviewText}>
+                        This app build has the old preview engine. Build the app
+                        again to see the new preview.
+                      </AppText>
+                    </View>
+                  )}
+                  {/* Capture: a still of the native picture in its place for
+                  a moment (see handleCapture). */}
+                  {frame && frozen?.main && (
+                    <Image
+                      source={{ uri: frozen.main }}
+                      style={frameStyle(frame)}
+                      resizeMode="stretch"
+                      fadeDuration={0}
+                      onLoad={onFrozenLoad}
+                      onError={onFrozenLoad}
                     />
                   )}
                   <TextOverlay
@@ -3297,7 +3101,22 @@ export default function EditorScreen() {
                 timelineDuration={timelineDuration}
                 thumbnails={thumbnails}
                 thumbnailsBySource={thumbnailsBySource}
-                onAddVideoAtStartPress={() => void handleAddVideoAtStart()}
+                onAddVideoAtStartPress={() =>
+                  offerLib(
+                    ["video"],
+                    "Add a video at the start",
+                    () => void handleAddVideo("start"),
+                    (item) => void handleAddVideo("start", item),
+                  )
+                }
+                onAddVideoAtEndPress={() =>
+                  offerLib(
+                    ["video"],
+                    "Add a video at the end",
+                    () => void handleAddVideo("end"),
+                    (item) => void handleAddVideo("end", item),
+                  )
+                }
                 multiSelect={multiSelect}
                 multiSelectedIds={liveMultiIds}
                 onToggleMultiSelect={toggleMultiSelect}
@@ -3308,7 +3127,14 @@ export default function EditorScreen() {
                 textClips={textClips}
                 stickerClips={stickerClips}
                 pipClips={pipClips}
-                onAddPipPress={() => void handleAddPip("empty PIP row")}
+                onAddPipPress={() =>
+                  offerLib(
+                    ["video", "image"],
+                    "Add PIP",
+                    () => void handleAddPip("empty PIP row"),
+                    (item) => void handleAddPip("empty PIP row, Lib", item),
+                  )
+                }
                 onAddStickerPress={() =>
                   openStickers("add", "empty overlay row")
                 }
@@ -3318,7 +3144,14 @@ export default function EditorScreen() {
                 muteBusy={muteBusy}
                 onSelectClip={handleSelectClip}
                 onAddTextPress={() => openAddText("empty text row")}
-                onAddAudioPress={() => void handleAddAudio("empty audio row")}
+                onAddAudioPress={() =>
+                  offerLib(
+                    ["audio"],
+                    "Add music",
+                    () => void handleAddAudio("empty audio row"),
+                    (item) => void handleAddAudio("empty audio row, Lib", item),
+                  )
+                }
                 addingAudio={addingAudio}
                 flash={flash}
                 originalUri={videoUri ?? ""}
@@ -3435,6 +3268,7 @@ export default function EditorScreen() {
           onChange={setCanvasDraft}
           onCancel={() => closeCanvas("cancelled")}
           onDone={applyCanvas}
+          onLockedPress={(label: string) => setDemoFeature(label)}
         />
       )}
 
@@ -3451,6 +3285,8 @@ export default function EditorScreen() {
           onDone={applyRotate}
         />
       )}
+
+      <LibPickerSheet choice={libChoice} onClose={() => setLibChoice(null)} />
 
       <DemoFeatureModal
         feature={demoFeature}
@@ -3583,17 +3419,14 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
   video: { width: "100%", height: "100%" },
-  cropWindow: { position: "absolute", overflow: "hidden" },
-  cropPicture: { position: "absolute" },
   pictureBackdrop: { position: "absolute", backgroundColor: "#000000" },
-  voidOverlay: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
+  noPreview: {
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 16,
     backgroundColor: "#000000",
   },
+  noPreviewText: { color: "#FFFFFF", textAlign: "center", fontSize: 13 },
   transportRow: {
     flexDirection: "row",
     alignItems: "center",
